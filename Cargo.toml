@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = ["core", "h2proxyd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/Shohruz7/Multi-Level-Proxy"
+
+# The committed dependency set (design doc §8; ADRs 0001, 0002, 0003, 0007, 0008).
+# Member crates inherit from here so every version is pinned in one place.
+[workspace.dependencies]
+h2proxy-core = { path = "core" }
+
+# Runtime (ADR 0001)
+tokio = { version = "1.52", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+    "signal",
+] }
+
+# TLS (ADR 0002)
+rustls = "0.23"
+tokio-rustls = "0.26"
+
+# Zero-copy payloads (ADR 0007)
+bytes = "1.12"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error model (ADR 0008): thiserror in the lib, anyhow in the bin
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Self-signed certs for local runs and tests
+rcgen = "0.14"
+
+# Test/bench only: differential-test oracle (ADR 0003), property tests, benches
+h2 = "0.4"
+proptest = "1.11"
+criterion = "0.8"
