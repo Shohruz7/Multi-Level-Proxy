@@ -1,0 +1,19 @@
+[package]
+name = "h2proxy-core"
+description = "Hand-built HTTP/2 protocol engine: framing, HPACK, streams, flow control, pooling, load balancing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+h2.workspace = true
+proptest.workspace = true
+criterion.workspace = true
