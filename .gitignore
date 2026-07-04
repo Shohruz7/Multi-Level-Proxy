@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+
+# Profiling outputs (cargo-flamegraph)
+flamegraph.svg
+perf.data*
+
+# macOS
+.DS_Store
+
+# Local-only planning and reference docs (kept out of git by request)
+/docs/
+/Documentation/Week3-8.md
