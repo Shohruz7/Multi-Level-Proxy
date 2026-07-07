@@ -1,9 +1,20 @@
 # Rust build artifacts
 /target
 
+# cargo-fuzz: build output and generated corpora/crashes (keep Cargo.toml,
+# Cargo.lock, and fuzz_targets/)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+
 # Profiling outputs (cargo-flamegraph)
 flamegraph.svg
 perf.data*
+
+# Benchmark run artifacts (timestamped CSVs + raw h2load logs). The promoted
+# reference number, bench/baseline.csv, IS tracked.
+/bench/results/
 
 # macOS
 .DS_Store

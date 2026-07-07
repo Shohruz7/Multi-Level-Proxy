@@ -1,0 +1,11 @@
+# Keep the build context small — images build from source, not artifacts.
+target/
+fuzz/
+.git/
+docs/
+Documentation/
+*.md
+.DS_Store
+flamegraph.svg
+perf.data*
+bench/results/

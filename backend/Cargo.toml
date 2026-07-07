@@ -1,0 +1,15 @@
+[package]
+name = "backend"
+description = "Tiny hyper HTTP/2 (h2c) upstream for local development and baselines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+bytes.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true

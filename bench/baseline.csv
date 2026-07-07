@@ -1,0 +1,3 @@
+profile,connections,streams_per_conn,requests,req_per_s,p99_request,mean_request,raw_log
+throughput,100,10,200000,161797.90,13.85ms,5.06ms,h2load-throughput-20260704T073958Z.txt
+concurrency,50,200,100000,246895.90,108.57ms,33.64ms,h2load-concurrency-20260704T073958Z.txt

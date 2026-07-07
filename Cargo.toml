@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "h2proxyd"]
+members = ["core", "h2proxyd", "backend"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,6 +35,16 @@ bytes = "1.12"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = [
+    "http-listener",
+] }
+
+# Local dev backend: a tiny hyper HTTP/2 (h2c) upstream to proxy to and to
+# baseline against. Test/dev-loop only — the proxy engine is hand-built.
+hyper = { version = "1", features = ["server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 # Error model (ADR 0008): thiserror in the lib, anyhow in the bin
 thiserror = "2.0"

@@ -5,17 +5,19 @@
 //! Errors here are `anyhow` — "log and exit", never "pick a frame to send"
 //! (ADR 0008).
 //!
-//! Current milestone (week 1): terminate TLS 1.3, negotiate ALPN to `h2`, log
-//! the result, and drop the connection. No frame parsing yet — the HTTP/2
-//! engine plugs into [`handle_connection`] from week 3. The accept loop and
-//! graceful-shutdown drain (week 2's §2.2 skeleton) are already here so the
-//! engine has a stable lifecycle to slot into.
+//! Current milestone (week 2): terminate TLS 1.3, negotiate ALPN to `h2`, and
+//! hand the byte stream to the protocol engine's connection skeleton
+//! ([`h2proxy_core::conn::Connection`]). The engine reads the connection and
+//! drains cleanly on shutdown or EOF; frame parsing plugs into its reader loop
+//! in week 5. The accept loop and graceful-shutdown drain (the §2.2 skeleton)
+//! give that engine a stable lifecycle to slot into.
 
 mod tls;
 
 use std::net::SocketAddr;
 
 use anyhow::Context;
+use h2proxy_core::conn::Connection;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
@@ -25,9 +27,13 @@ use tracing::{info, warn};
 /// Listen address; override with the `H2PROXYD_LISTEN` environment variable.
 const DEFAULT_LISTEN: &str = "127.0.0.1:8443";
 
+/// Prometheus scrape address; override with `H2PROXYD_METRICS`.
+const DEFAULT_METRICS: &str = "127.0.0.1:9090";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+    init_metrics();
 
     let listen: SocketAddr = std::env::var("H2PROXYD_LISTEN")
         .unwrap_or_else(|_| DEFAULT_LISTEN.to_string())
@@ -66,14 +72,8 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 let acceptor = acceptor.clone();
-                let mut shutdown = shutdown_tx.subscribe();
-                conns.spawn(async move {
-                    tokio::select! {
-                        _ = handle_connection(acceptor, stream, peer) => {}
-                        // Closed channel (Err) or a value both mean "shut down".
-                        _ = shutdown.recv() => {}
-                    }
-                });
+                let shutdown = shutdown_tx.subscribe();
+                conns.spawn(handle_connection(acceptor, stream, peer, shutdown));
             }
         }
     }
@@ -85,33 +85,54 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Terminate TLS for one accepted connection and report the negotiated ALPN
-/// protocol. Week 1 stops after the handshake; the frame layer takes over here
-/// once [`h2proxy_core`] lands.
-async fn handle_connection(acceptor: TlsAcceptor, stream: TcpStream, peer: SocketAddr) {
-    let tls_stream = match acceptor.accept(stream).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(%peer, error = %e, "TLS handshake failed");
-            return;
+/// Terminate TLS for one accepted connection, confirm ALPN negotiated `h2`, and
+/// hand the byte stream to the protocol engine ([`Connection`]). Week 2 wires
+/// the lifecycle; the engine's frame handling lands in week 5.
+async fn handle_connection(
+    acceptor: TlsAcceptor,
+    stream: TcpStream,
+    peer: SocketAddr,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    // Race the handshake against shutdown so a stalled TLS negotiation can't
+    // hold the drain open.
+    let tls_stream = tokio::select! {
+        biased;
+        _ = shutdown.recv() => return,
+        accepted = acceptor.accept(stream) => match accepted {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(%peer, error = %e, "TLS handshake failed");
+                return;
+            }
         }
     };
 
-    let (_io, conn) = tls_stream.get_ref();
-    match conn.alpn_protocol() {
+    // Copy the negotiated ALPN out so the borrow of `tls_stream` ends before it
+    // moves into the engine.
+    let alpn = tls_stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+    match alpn.as_deref() {
         Some(tls::ALPN_H2) => {
-            info!(%peer, alpn = "h2", "TLS 1.3 handshake complete; ALPN negotiated h2")
+            info!(%peer, alpn = "h2", "TLS 1.3 handshake complete; ALPN negotiated h2");
         }
-        Some(other) => warn!(
-            %peer,
-            alpn = %String::from_utf8_lossy(other),
-            "handshake complete but peer did not select h2",
-        ),
-        None => warn!(%peer, "handshake complete but no ALPN protocol was negotiated"),
+        Some(other) => {
+            warn!(
+                %peer,
+                alpn = %String::from_utf8_lossy(other),
+                "handshake complete but peer did not select h2",
+            );
+            return;
+        }
+        None => {
+            warn!(%peer, "handshake complete but no ALPN protocol was negotiated");
+            return;
+        }
     }
 
-    // No HTTP/2 frame handling yet (week 3). Dropping `tls_stream` closes the
-    // connection cleanly.
+    // Hand off to the protocol engine. Today it drains the connection and exits
+    // cleanly on shutdown or EOF; frame processing plugs in here in week 5.
+    Connection::new(tls_stream, shutdown).run().await;
+    info!(%peer, "connection closed");
 }
 
 /// Resolve when the process is asked to stop: SIGTERM (container stop) or
@@ -132,6 +153,46 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// Install the Prometheus `/metrics` exporter and seed the RED/gauge series so
+/// they exist before there is any traffic (design doc §7). The real values are
+/// wired as the engine lands (weeks 5–7); these are the stub hooks. A bind
+/// failure (e.g. the port is taken) is logged and skipped rather than fatal —
+/// the proxy must still serve without metrics.
+fn init_metrics() {
+    use std::net::SocketAddr;
+
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    let addr: SocketAddr = match std::env::var("H2PROXYD_METRICS")
+        .unwrap_or_else(|_| DEFAULT_METRICS.to_string())
+        .parse()
+    {
+        Ok(addr) => addr,
+        Err(e) => {
+            warn!(error = %e, "invalid H2PROXYD_METRICS; skipping metrics exporter");
+            return;
+        }
+    };
+
+    if let Err(e) = PrometheusBuilder::new().with_http_listener(addr).install() {
+        warn!(error = %e, %addr, "could not start metrics exporter; continuing without it");
+        return;
+    }
+
+    metrics::describe_gauge!("h2proxy_active_streams", "Currently open client streams");
+    metrics::describe_counter!("h2proxy_requests_total", "Client requests proxied");
+    metrics::describe_gauge!(
+        "h2proxy_upstream_pool_connections",
+        "Warm upstream connections in the pool"
+    );
+    // Seed each series at zero so a scrape returns them before any traffic.
+    metrics::gauge!("h2proxy_active_streams").set(0.0);
+    metrics::counter!("h2proxy_requests_total").increment(0);
+    metrics::gauge!("h2proxy_upstream_pool_connections").set(0.0);
+
+    info!(%addr, "metrics exporter listening at /metrics");
 }
 
 /// Initialize `tracing` with an env-filter, defaulting to info-level for the

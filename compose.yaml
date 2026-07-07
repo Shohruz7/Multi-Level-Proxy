@@ -1,0 +1,13 @@
+# `docker compose up` runs the dev h2c backend on a fixed host port (8080),
+# giving the proxy — and the no-proxy baseline — a stable upstream to develop
+# against. Tune the payload without a rebuild via BACKEND_BODY_SIZE.
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      BACKEND_LISTEN: "0.0.0.0:8080"
+      BACKEND_BODY_SIZE: "${BACKEND_BODY_SIZE:-1024}"
+    ports:
+      - "8080:8080"
