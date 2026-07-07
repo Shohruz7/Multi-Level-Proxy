@@ -1,0 +1,24 @@
+[package]
+name = "h2proxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+h2proxy-core = { path = "../core" }
+
+# Its own workspace so the sanitizer/nightly build never touches the main
+# workspace (and `cargo build --workspace` never touches the fuzz targets).
+[workspace]
+
+[[bin]]
+name = "frame_parser"
+path = "fuzz_targets/frame_parser.rs"
+test = false
+doc = false
+bench = false
