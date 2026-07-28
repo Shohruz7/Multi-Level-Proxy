@@ -129,10 +129,23 @@ async fn handle_connection(
         }
     }
 
-    // Hand off to the protocol engine. Today it drains the connection and exits
-    // cleanly on shutdown or EOF; frame processing plugs in here in week 5.
-    Connection::new(tls_stream, shutdown).run().await;
-    info!(%peer, "connection closed");
+    // Hand off to the protocol engine: it runs the preface + SETTINGS handshake
+    // and the frame loop. Per-stream dispatch (and therefore responses) lands in
+    // week 5, so a request currently establishes and then waits.
+    let summary = Connection::new(tls_stream, shutdown).run().await;
+
+    // The engine reports; the binary instruments (so `h2proxy-core` stays free
+    // of the metrics dependency).
+    if summary.handshake_completed {
+        metrics::counter!("h2proxy_handshakes_total").increment(1);
+    }
+    metrics::counter!("h2proxy_frames_received_total").increment(summary.frames_received);
+    info!(
+        %peer,
+        handshake = summary.handshake_completed,
+        frames = summary.frames_received,
+        "connection closed",
+    );
 }
 
 /// Resolve when the process is asked to stop: SIGTERM (container stop) or
@@ -187,10 +200,20 @@ fn init_metrics() {
         "h2proxy_upstream_pool_connections",
         "Warm upstream connections in the pool"
     );
+    metrics::describe_counter!(
+        "h2proxy_handshakes_total",
+        "Connections that completed the preface + SETTINGS exchange"
+    );
+    metrics::describe_counter!(
+        "h2proxy_frames_received_total",
+        "HTTP/2 frames decoded from clients"
+    );
     // Seed each series at zero so a scrape returns them before any traffic.
     metrics::gauge!("h2proxy_active_streams").set(0.0);
     metrics::counter!("h2proxy_requests_total").increment(0);
     metrics::gauge!("h2proxy_upstream_pool_connections").set(0.0);
+    metrics::counter!("h2proxy_handshakes_total").increment(0);
+    metrics::counter!("h2proxy_frames_received_total").increment(0);
 
     info!(%addr, "metrics exporter listening at /metrics");
 }
