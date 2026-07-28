@@ -53,7 +53,10 @@ anyhow = "1.0"
 # Self-signed certs for local runs and tests
 rcgen = "0.14"
 
-# Test/bench only: differential-test oracle (ADR 0003), property tests, benches
+# Test/bench only: differential-test oracle (ADR 0003), property tests, benches.
+# `http` comes with h2's public API — the differential harness builds real
+# requests to elicit HEADERS/DATA/CONTINUATION from the oracle.
 h2 = "0.4"
+http = "1"
 proptest = "1.11"
 criterion = "0.8"

@@ -516,6 +516,7 @@ dependencies = [
  "bytes",
  "criterion",
  "h2",
+ "http",
  "proptest",
  "thiserror",
  "tokio",

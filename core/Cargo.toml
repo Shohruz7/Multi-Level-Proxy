@@ -15,5 +15,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 h2.workspace = true
+http.workspace = true
 proptest.workspace = true
 criterion.workspace = true
