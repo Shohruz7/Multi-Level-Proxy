@@ -1,29 +1,25 @@
 //! Differential tests: our frame codec against the `h2` crate as oracle
 //! (ADR 0003).
 //!
-//! `h2` keeps its `frame`/`codec` modules private (not exposed even under its
-//! `unstable` feature), so we cannot call its encoder/decoder on a lone frame.
-//! Instead we oracle at the *connection boundary*: run a real `h2` client
-//! against a scripted server that speaks our own [`FrameCodec`], and assert
-//! that every frame the client puts on the wire decodes with our codec and
-//! **re-encodes to byte-identical octets**.
-//!
-//! That is a stronger claim than a self-round-trip: the bytes come from a
-//! mature implementation, and the session only progresses at all if the frames
-//! *we* synthesize (SETTINGS, ACKs, the response HEADERS/DATA) are ones `h2`
-//! accepts. Both directions are covered by one passing session.
+//! Every frame an `h2` client puts on the wire must decode with our codec and
+//! **re-encode to byte-identical octets**. The harness that makes that possible
+//! — our engine scripted as the server — lives in [`support`], and is shared
+//! with `hpack_differential.rs`, which makes the analogous (but necessarily
+//! weaker) claim one layer up.
+
+mod support;
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncReadExt, DuplexStream};
 
 use h2proxy_core::conn::{PREFACE, Settings};
-use h2proxy_core::frame::{FRAME_HEADER_LEN, Frame, FrameCodec, FrameType, MAX_ALLOWED_FRAME_SIZE};
+use h2proxy_core::frame::{FRAME_HEADER_LEN, Frame, FrameCodec, FrameType};
+use h2proxy_core::hpack::{Header, HpackEncoder};
 use h2proxy_core::stream::StreamId;
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+use support::{Oracle, TIMEOUT, assert_byte_exact};
 
 /// The client's advertised `MAX_FRAME_SIZE` (it sends the protocol default), so
 /// the scripted server must chunk its response body to fit.
@@ -117,102 +113,6 @@ async fn our_codec_round_trips_h2s_real_settings() {
 // The full session: every frame type, byte-exact.
 // ---------------------------------------------------------------------------
 
-/// The server side of the connection, speaking our own codec. Every frame the
-/// `h2` client sends is captured together with the exact octets it wrote.
-struct Oracle {
-    io: DuplexStream,
-    buf: BytesMut,
-    codec: FrameCodec,
-}
-
-impl Oracle {
-    fn new(io: DuplexStream) -> Self {
-        Oracle {
-            io,
-            buf: BytesMut::new(),
-            codec: FrameCodec::new(MAX_ALLOWED_FRAME_SIZE),
-        }
-    }
-
-    /// Read and verify the 24-octet client connection preface (§3.4).
-    async fn read_preface(&mut self) {
-        while self.buf.len() < PREFACE.len() {
-            let n = self.io.read_buf(&mut self.buf).await.expect("read preface");
-            assert!(n > 0, "client closed before sending the preface");
-        }
-        assert_eq!(
-            &self.buf[..PREFACE.len()],
-            &PREFACE[..],
-            "unexpected connection preface",
-        );
-        let _ = self.buf.split_to(PREFACE.len());
-    }
-
-    /// The next frame from the client, with h2's exact wire bytes alongside it.
-    /// `None` once the client closes.
-    async fn next_frame(&mut self) -> Option<(Frame, Bytes)> {
-        loop {
-            if let Some(total) = buffered_frame_len(&self.buf)
-                && self.buf.len() >= total
-            {
-                let raw = self.buf.split_to(total).freeze();
-
-                // Decode from a copy so `raw` stays exactly what h2 wrote.
-                let mut copy = BytesMut::from(&raw[..]);
-                let frame = self
-                    .codec
-                    .decode(&mut copy)
-                    .expect("our codec rejected a frame h2 considers valid")
-                    .expect("h2 sent a frame type we discard");
-                assert!(
-                    copy.is_empty(),
-                    "decoding {:?} left {} octets unconsumed",
-                    frame.kind(),
-                    copy.len(),
-                );
-                return Some((frame, raw));
-            }
-            let n = self.io.read_buf(&mut self.buf).await.expect("read");
-            if n == 0 {
-                return None;
-            }
-        }
-    }
-
-    async fn send(&mut self, frame: &Frame) {
-        let mut out = BytesMut::new();
-        self.codec.encode(frame, &mut out).expect("encode");
-        self.io.write_all(&out).await.expect("write");
-        self.io.flush().await.expect("flush");
-    }
-}
-
-/// Total length of the frame at the front of `buf`, once its header is present.
-fn buffered_frame_len(buf: &[u8]) -> Option<usize> {
-    if buf.len() < FRAME_HEADER_LEN {
-        return None;
-    }
-    let payload_len = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
-    Some(FRAME_HEADER_LEN + payload_len)
-}
-
-/// The guarantee under test: decoding h2's octets and re-encoding them must
-/// reproduce those octets exactly.
-fn assert_byte_exact(frame: &Frame, raw: &Bytes) {
-    let mut reencoded = BytesMut::new();
-    FrameCodec::new(MAX_ALLOWED_FRAME_SIZE)
-        .encode(frame, &mut reencoded)
-        .expect("re-encode");
-    assert_eq!(
-        &reencoded[..],
-        &raw[..],
-        "re-encoding {:?} did not reproduce h2's bytes\n  ours: {:02x?}\n  h2's: {:02x?}",
-        frame.kind(),
-        &reencoded[..],
-        &raw[..],
-    );
-}
-
 /// The client half of the scripted session: exercise every frame type an h2
 /// client can be made to emit.
 async fn h2_client_script(io: DuplexStream) {
@@ -230,9 +130,11 @@ async fn h2_client_script(io: DuplexStream) {
 
     let mut send_request = send_request.ready().await.expect("client ready");
 
-    // HEADERS + CONTINUATION: a header value far larger than one frame forces h2
-    // to split the block. DATA: the request body.
-    let oversized = "a".repeat(60_000);
+    // HEADERS + CONTINUATION: a header value larger than one frame forces h2 to
+    // split the block. DATA: the request body. (It only has to beat
+    // MAX_FRAME_SIZE; staying well under the 64 KiB MAX_HEADER_LIST_SIZE we
+    // advertise keeps this about framing rather than the §6 bomb guard.)
+    let oversized = "a".repeat(32_000);
     let request = http::Request::builder()
         .method("POST")
         .uri("https://example.com/upload")
@@ -289,6 +191,7 @@ async fn every_frame_type_round_trips_byte_exactly_against_h2() {
 
     let session = async {
         let mut oracle = Oracle::new(server_io);
+        let mut encoder = HpackEncoder::new(Settings::default().header_table_size as usize);
 
         // Our half of the preface, then theirs.
         oracle.send(&Settings::server().to_frame()).await;
@@ -324,13 +227,15 @@ async fn every_frame_type_round_trips_byte_exactly_against_h2() {
                     end_stream: true,
                     ..
                 } => {
-                    // `:status: 200` is static-table index 8, so a one-octet
-                    // indexed header field is a complete, valid HPACK block —
-                    // enough to reply before HPACK lands in week 4.
+                    // The response headers, compressed by our own encoder — if
+                    // h2 could not decode them the session would not get as far
+                    // as the WINDOW_UPDATEs this arm exists to elicit.
+                    let mut block = BytesMut::new();
+                    encoder.encode(&[Header::new(":status", "200")], &mut block);
                     oracle
                         .send(&Frame::Headers {
                             stream_id: *stream_id,
-                            block: Bytes::from_static(b"\x88"),
+                            block: block.freeze(),
                             end_stream: false,
                             end_headers: true,
                         })
