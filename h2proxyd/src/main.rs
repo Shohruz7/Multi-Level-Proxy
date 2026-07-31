@@ -140,10 +140,13 @@ async fn handle_connection(
         metrics::counter!("h2proxy_handshakes_total").increment(1);
     }
     metrics::counter!("h2proxy_frames_received_total").increment(summary.frames_received);
+    metrics::counter!("h2proxy_header_blocks_decoded_total")
+        .increment(summary.header_blocks_decoded);
     info!(
         %peer,
         handshake = summary.handshake_completed,
         frames = summary.frames_received,
+        header_blocks = summary.header_blocks_decoded,
         "connection closed",
     );
 }
@@ -208,12 +211,17 @@ fn init_metrics() {
         "h2proxy_frames_received_total",
         "HTTP/2 frames decoded from clients"
     );
+    metrics::describe_counter!(
+        "h2proxy_header_blocks_decoded_total",
+        "Complete HPACK header blocks decoded from clients"
+    );
     // Seed each series at zero so a scrape returns them before any traffic.
     metrics::gauge!("h2proxy_active_streams").set(0.0);
     metrics::counter!("h2proxy_requests_total").increment(0);
     metrics::gauge!("h2proxy_upstream_pool_connections").set(0.0);
     metrics::counter!("h2proxy_handshakes_total").increment(0);
     metrics::counter!("h2proxy_frames_received_total").increment(0);
+    metrics::counter!("h2proxy_header_blocks_decoded_total").increment(0);
 
     info!(%addr, "metrics exporter listening at /metrics");
 }
