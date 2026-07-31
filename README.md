@@ -7,18 +7,49 @@ protocol engine is hand-built against the wire format; the point of the
 project is the parts of HTTP/2 that are easy to gloss over and hard to get
 right.
 
-> Status: **week 4 of 8** — requests are now readable. On top of week 3's
-> streaming codec for all eight frame types and the preface + SETTINGS
-> handshake, HPACK is hand-built: integer and string primitives, the Appendix B
-> Huffman code decoded by a derived state machine, the 61-entry static table,
-> and the dynamic table with its eviction accounting and all four
-> representations. The daemon reassembles HEADERS + CONTINUATION and logs the
-> decoded header list. Ground truth is layered: RFC 7541's Appendix C sequences
-> pass byte-for-byte in **both** directions, a multi-request session against the
-> `h2` crate proves encoder and decoder stay in lockstep, and a property test
-> states that over arbitrary sequences. Requests are understood but not yet
-> answered — per-stream demux and responses are week 5. See the
-> [roadmap](#roadmap).
+## What it does
+
+A client opens one TLS connection and multiplexes many concurrent requests
+over it. h2proxy terminates that connection, decodes the HTTP/2 framing and
+compressed headers itself, and forwards each request onto a small pool of
+long-lived upstream connections — many streams in, few connections out.
+
+```
+                   ┌──────────────── h2proxy ────────────────┐
+  clients          │                                          │      upstreams
+  ───────          │  TLS 1.3 ─ ALPN h2                        │      ─────────
+  ~500 conns ─────▶│  frame codec ─ HPACK ─ stream machine     │──┐
+  10k+ streams     │  flow control ─ backpressure bridge       │  ├─▶ few warm
+                   │  connection pool ─ load balancer          │──┘   h2 conns
+                   └──────────────────────────────────────────┘
+```
+
+The parts that carry the weight:
+
+- **Framing** — a streaming codec over a reassembly buffer that advances only
+  on a complete frame, so a frame split across TCP segments is never
+  mis-parsed. All eight frame types the proxy uses, with their length,
+  stream-id and flag rules, and each violation mapped to the error code the
+  RFC mandates.
+- **HPACK** — the stateful one. Integer and string primitives, the Huffman
+  code as a derived state machine, the 61-entry static table, and the dynamic
+  table with its eviction accounting. Encoder and decoder tables must stay in
+  lockstep across a whole connection: a single desync corrupts every later
+  header block.
+- **Streams and flow control** — the lifecycle state machine, fair outbound
+  interleaving so one large response cannot starve small ones, and two-level
+  (connection + stream) windows.
+- **Backpressure bridging** — the centerpiece. The proxy withholds the
+  upstream's `WINDOW_UPDATE` until bytes have drained to the client, so a slow
+  client transitively throttles a fast upstream and proxy memory stays bounded
+  under any speed mismatch.
+- **Resilience** — connection pooling and coalescing, load balancing by
+  least-outstanding-streams, health checking with outlier ejection, and
+  mitigations for the HTTP/2 abuse patterns (Rapid Reset, control-frame and
+  empty-frame floods).
+
+Errors follow HTTP/2's own split: a connection error emits GOAWAY and takes
+the connection down; a stream error emits RST_STREAM and leaves it up.
 
 ## Why build it from scratch
 
@@ -52,6 +83,24 @@ aarch64-musl, the error model, and more — is recorded as
 [Architecture Decision Records](docs/adr/). Condensed notes on the relevant
 RFCs (9113, 7541, 9218) and the Rapid Reset CVE are in [docs/notes/](docs/notes/).
 
+## How it is tested
+
+Correctness here is not self-reported. The engine is checked in layers:
+
+- **Unit tests** for each frame type's size, stream-id, flag and padding rules.
+- **Differential tests** against the `h2` crate: a real `h2` client runs a full
+  session against our engine, and every frame it puts on the wire is decoded
+  and re-encoded to **byte-identical** octets.
+- **RFC vectors** — HPACK's Appendix C sequences pass byte-for-byte in both
+  directions, including the dynamic-table evictions they were designed to
+  provoke.
+- **Property tests** — encode/decode identity, in-order decoding of a frame
+  stream, byte-at-a-time reads never mis-parsing, and encoder/decoder tables
+  staying in lockstep over arbitrary header sequences.
+- **Fuzzing** — `cargo-fuzz` targets for the frame parser and the HPACK
+  decoder, both fed wholly unconstrained input. The contract is total: any
+  input yields `Err`, `Ok(None)` or a frame — never a panic.
+
 ## Goals and non-goals
 
 - **Goal** — a correct HTTP/2 intermediary that negotiates `h2` over TLS via
@@ -70,8 +119,10 @@ RFCs (9113, 7541, 9218) and the Rapid Reset CVE are in [docs/notes/](docs/notes/
 core/        h2proxy-core — the hand-built protocol engine (library)
   frame  hpack  stream  flow  conn  pool  lb  proxy   (one module per concern)
 h2proxyd/    the reverse-proxy daemon (binary): TLS, sockets, config, signals
+backend/     a tiny hyper h2c upstream, for the local dev loop and baselines
+bench/       load-test harness (h2load) and the committed reference baseline
 docs/notes/  condensed RFC 9113 / 7541 / 9218 + Rapid Reset notes
-docs/adr/    architecture decision records (0001–0011)
+docs/adr/    architecture decision records
 ```
 
 The library/binary split is what lets the differential tests target the engine
@@ -89,7 +140,7 @@ cargo nextest run --workspace      # or: cargo test --workspace
 # Run the daemon (defaults to 127.0.0.1:8443; override with H2PROXYD_LISTEN)
 cargo run -p h2proxyd
 
-# Prometheus metrics (stub series until the engine lands)
+# Prometheus metrics
 curl -s http://127.0.0.1:9090/metrics | grep h2proxy_
 ```
 
@@ -98,12 +149,9 @@ h2 backend plus the proxy; `just baseline` captures the no-proxy baseline (see
 [bench/README.md](bench/README.md)). Fuzzing: `just fuzz 60 frame_parser` or
 `just fuzz 60 hpack_decoder`.
 
-Verify the current milestone — a request decoded down to its header fields:
+Connect a real HTTP/2 client and watch a request get decoded to its fields:
 
 ```sh
-openssl s_client -alpn h2 -connect 127.0.0.1:8443 </dev/null | grep ALPN
-#   → ALPN protocol: h2
-
 RUST_LOG=h2proxy_core=debug cargo run -p h2proxyd
 curl -vk --http2 --max-time 3 https://127.0.0.1:8443/
 #   → * ALPN: server accepted h2 ... * using HTTP/2
@@ -111,23 +159,19 @@ curl -vk --http2 --max-time 3 https://127.0.0.1:8443/
 #     headers=[:method: GET, :path: /, :authority: 127.0.0.1:8443, ...]
 ```
 
-(The request then stalls — expected: streams get responses in week 5. The
-`/metrics` counters `h2proxy_handshakes_total`,
-`h2proxy_frames_received_total`, and `h2proxy_header_blocks_decoded_total`
-show the connection was real.)
+## Current state
 
-## Roadmap
+The client-facing half of the engine is built and tested: TLS 1.3 with ALPN,
+the connection preface and SETTINGS handshake, the full frame codec, HPACK, and
+the connection-control frames (SETTINGS, PING, GOAWAY) with the GOAWAY error
+path. A request is accepted, decompressed and understood down to its individual
+header fields.
 
-| Week | Deliverable |
-|------|-------------|
-| 1 | Toolchain, workspace, RFC notes + ADRs, TLS/ALPN handshake ✅ |
-| 2 | Connection skeleton, core types/traits, differential-test harness, dev loop, baseline ✅ |
-| 3 | Framing codec + preface + SETTINGS handshake ✅ |
-| 4 | HPACK (static/dynamic tables, Huffman) ✅ |
-| 5 | Stream state machine + multiplexing + flow control |
-| 6 | Backpressure bridging + upstream pool + load balancing — *it becomes a proxy* |
-| 7 | Resilience + security hardening (Rapid Reset, flood limits, health checks) |
-| 8 | Deploy to Graviton behind an NLB, load-test both profiles, tune, write up |
+It does not forward traffic yet. Per-stream demultiplexing and responses, flow
+control, the upstream pool and load balancer, and the backpressure bridge are
+the remaining work — so a request currently establishes, decodes, and then
+waits. The modules for each are in place with their types and contracts
+defined.
 
 ## License
 
