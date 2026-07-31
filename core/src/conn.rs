@@ -11,9 +11,12 @@
 //! (→ RST_STREAM, connection lives) distinction as types, carrying the RFC
 //! §7 error codes they must emit.
 //!
-//! Week 3 lands the handshake and the connection-control frames (SETTINGS,
-//! PING, GOAWAY); per-stream demux/mux is week 5, and the graceful GOAWAY drain
-//! and Rapid-Reset / flood accounting are week 7 (design doc §6).
+//! Week 3 landed the handshake and the connection-control frames (SETTINGS,
+//! PING, GOAWAY). Week 4 adds the HPACK seam: header blocks are reassembled
+//! across HEADERS + CONTINUATION and decoded through a *per-connection* codec,
+//! because the dynamic table spans every block the peer sends. Per-stream
+//! demux/mux is week 5, and the graceful GOAWAY drain and Rapid-Reset / flood
+//! accounting are week 7 (design doc §6).
 
 use std::collections::HashMap;
 
@@ -24,12 +27,27 @@ use tracing::{debug, trace, warn};
 
 use crate::flow::MAX_WINDOW_SIZE;
 use crate::frame::{DEFAULT_MAX_FRAME_SIZE, Frame, FrameCodec, MAX_ALLOWED_FRAME_SIZE};
+use crate::hpack::{HpackDecoder, HpackEncoder};
 use crate::stream::StreamId;
 
 /// The client connection preface (RFC 9113 §3.4). A client opens every HTTP/2
 /// connection by sending these 24 octets, immediately followed by its first
 /// SETTINGS frame.
 pub const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// The largest decoded header list we will accept, advertised as
+/// `SETTINGS_MAX_HEADER_LIST_SIZE` — the HPACK-bomb guard (design doc §6).
+pub const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+
+/// The largest *compressed* header block we will reassemble across HEADERS +
+/// CONTINUATION.
+///
+/// A separate bound from [`MAX_HEADER_LIST_SIZE`], and a necessary one: the
+/// decoded-size limit can only be applied once a block is complete, so without
+/// this a peer could stream CONTINUATION frames forever and grow the buffer
+/// without ever finishing a block. Week 7's CONTINUATION-flood mitigation
+/// builds on this.
+const MAX_HEADER_BLOCK_BYTES: usize = MAX_HEADER_LIST_SIZE as usize;
 
 /// HTTP/2 error codes (RFC 9113 §7), shared by connection errors (GOAWAY) and
 /// stream errors (RST_STREAM). The numeric values are the on-wire encoding.
@@ -160,10 +178,12 @@ impl Default for Settings {
 impl Settings {
     /// The settings this proxy advertises: protocol defaults with push turned
     /// off (the stated non-goal — see the README), which also makes any
-    /// PUSH_PROMISE we later receive a clean protocol error.
+    /// PUSH_PROMISE we later receive a clean protocol error, plus a bound on
+    /// how large a header list we will decode (design doc §6).
     pub fn server() -> Self {
         Settings {
             enable_push: false,
+            max_header_list_size: Some(MAX_HEADER_LIST_SIZE),
             ..Settings::default()
         }
     }
@@ -302,6 +322,9 @@ pub struct ConnectionSummary {
     pub handshake_completed: bool,
     /// Frames successfully decoded from the peer.
     pub frames_received: u64,
+    /// Complete header blocks decoded through HPACK — i.e. requests read off
+    /// this connection.
+    pub header_blocks_decoded: u64,
 }
 
 /// Why the reader loop stopped.
@@ -343,6 +366,18 @@ pub struct Connection<IO> {
     /// without END_HEADERS, so only a CONTINUATION on this stream may follow
     /// (§4.3).
     open_header_block: Option<StreamId>,
+    /// Partial header block, accumulated across CONTINUATION frames. Empty
+    /// whenever [`Self::open_header_block`] is `None`.
+    header_block: BytesMut,
+    /// Inbound HPACK state. One per connection, not per stream: the dynamic
+    /// table spans every header block the peer sends, which is why a header
+    /// block is indivisible and why a decode failure kills the connection
+    /// (design doc §3.3).
+    hpack_dec: HpackDecoder,
+    /// Outbound HPACK state. Nothing encodes responses until week 5, but the
+    /// peer's `HEADER_TABLE_SIZE` is negotiated now, at handshake, so the
+    /// encoder has to exist to receive it.
+    hpack_enc: HpackEncoder,
     /// Highest client-initiated stream seen, for GOAWAY's last-stream-id (§6.8).
     last_peer_stream_id: StreamId,
     summary: ConnectionSummary,
@@ -372,6 +407,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
             local_settings,
             peer_settings: Settings::default(),
             open_header_block: None,
+            header_block: BytesMut::new(),
+            hpack_dec: HpackDecoder::new(
+                local_settings.header_table_size as usize,
+                local_settings.max_header_list_size.map(|n| n as usize),
+            ),
+            hpack_enc: HpackEncoder::new(Settings::default().header_table_size as usize),
             last_peer_stream_id: StreamId::CONNECTION,
             summary: ConnectionSummary::default(),
         }
@@ -478,6 +519,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
         match &frame {
             Frame::Settings { ack: false, params } => {
                 self.peer_settings.apply(params)?;
+                // Their HEADER_TABLE_SIZE bounds *our* encoder's dynamic table;
+                // the change is announced back as a size update on our next
+                // header block (RFC 7541 §6.3).
+                self.hpack_enc
+                    .set_max_table_size(self.peer_settings.header_table_size as usize);
                 trace!(?self.peer_settings, "applied peer SETTINGS");
                 // Every SETTINGS frame must be acknowledged (§6.5.3). The first
                 // one completes the handshake.
@@ -529,13 +575,22 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
                 // Window accounting itself is week 5.
                 trace!(stream = stream_id.get(), increment, "WINDOW_UPDATE");
             }
-            Frame::Headers { stream_id, .. }
-            | Frame::Data { stream_id, .. }
-            | Frame::RstStream { stream_id, .. }
-            | Frame::Continuation { stream_id, .. } => {
-                if stream_id.is_client_initiated() && *stream_id > self.last_peer_stream_id {
-                    self.last_peer_stream_id = *stream_id;
-                }
+            Frame::Headers {
+                stream_id,
+                block,
+                end_headers,
+                ..
+            }
+            | Frame::Continuation {
+                stream_id,
+                block,
+                end_headers,
+            } => {
+                self.note_peer_stream(*stream_id);
+                self.read_header_block(*stream_id, block, *end_headers)?;
+            }
+            Frame::Data { stream_id, .. } | Frame::RstStream { stream_id, .. } => {
+                self.note_peer_stream(*stream_id);
                 // Week 5 dispatches these to per-stream handlers over the
                 // `Dispatcher`; for now the connection stays up and drops them.
                 trace!(
@@ -563,6 +618,69 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
         };
 
         Ok(Next::Continue)
+    }
+
+    /// Track the highest client-initiated stream seen, for GOAWAY's
+    /// last-stream-id (§6.8).
+    fn note_peer_stream(&mut self, stream_id: StreamId) {
+        if stream_id.is_client_initiated() && stream_id > self.last_peer_stream_id {
+            self.last_peer_stream_id = stream_id;
+        }
+    }
+
+    /// Take one fragment of a header block, decoding once END_HEADERS arrives.
+    ///
+    /// A header block is a single HPACK unit however many frames carry it, so
+    /// the fragments are reassembled before the decoder sees any of them. The
+    /// §4.3 rule that nothing may interleave is already enforced by the caller,
+    /// which is what makes plain concatenation correct here.
+    fn read_header_block(
+        &mut self,
+        stream_id: StreamId,
+        fragment: &Bytes,
+        end_headers: bool,
+    ) -> Result<(), ConnectionError> {
+        let pending = self.header_block.len();
+        if pending + fragment.len() > MAX_HEADER_BLOCK_BYTES {
+            self.header_block.clear();
+            return Err(ConnectionError::new(
+                ErrorCode::EnhanceYourCalm,
+                format!("header block exceeds {MAX_HEADER_BLOCK_BYTES} octets before END_HEADERS"),
+            ));
+        }
+
+        let block = if end_headers && pending == 0 {
+            // The common case: one frame carries the whole block, so it decodes
+            // straight out of the read buffer with no copy (ADR 0007).
+            fragment.clone()
+        } else {
+            self.header_block.extend_from_slice(fragment);
+            if !end_headers {
+                trace!(
+                    stream = stream_id.get(),
+                    buffered = self.header_block.len(),
+                    "header block continues",
+                );
+                return Ok(());
+            }
+            self.header_block.split().freeze()
+        };
+
+        // A failure here is fatal to the connection, not just this stream: the
+        // dynamic table is shared, so we can no longer decode anything the peer
+        // sends (design doc §3.3). `HpackError` converts to the GOAWAY-bearing
+        // `ConnectionError` accordingly.
+        let headers = self.hpack_dec.decode(&block)?;
+        self.summary.header_blocks_decoded += 1;
+        debug!(
+            stream = stream_id.get(),
+            fields = headers.len(),
+            headers = ?Redacted(&headers),
+            "decoded header block",
+        );
+        // Week 5 hands this list to the stream's handler; today it is proof the
+        // request was understood.
+        Ok(())
     }
 
     /// Acknowledge the peer's SETTINGS (§6.5.3).
@@ -622,6 +740,32 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
     }
 }
 
+/// A header list formatted for a log line, with never-indexed values withheld.
+///
+/// A peer marks a field never-indexed precisely because its value is a secret
+/// worth keeping out of a compression table (RFC 7541 §7.1.3) — writing it to a
+/// log instead would defeat the point. The flag is already decoded, so honoring
+/// it costs nothing.
+struct Redacted<'a>(&'a [crate::hpack::Header]);
+
+impl std::fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+        for header in self.0 {
+            let name = String::from_utf8_lossy(&header.name);
+            if header.sensitive {
+                list.entry(&format_args!("{name}: <redacted>"));
+            } else {
+                list.entry(&format_args!(
+                    "{name}: {}",
+                    String::from_utf8_lossy(&header.value)
+                ));
+            }
+        }
+        list.finish()
+    }
+}
+
 /// A failed write means the transport is gone; report it as an internal
 /// connection error so the caller unwinds the same way as a protocol fault.
 fn io_as_conn_error(e: std::io::Error) -> ConnectionError {
@@ -635,6 +779,7 @@ mod tests {
     use tokio::io::DuplexStream;
 
     use super::*;
+    use crate::hpack::Header;
 
     const TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1118,6 +1263,202 @@ mod tests {
                 }
             ),
             "expected GOAWAY(FRAME_SIZE_ERROR), got {goaway:?}",
+        );
+    }
+
+    // ---- HPACK on the connection --------------------------------------------
+
+    #[tokio::test]
+    async fn a_request_header_block_is_decoded() {
+        let (mut peer, _tx, handle) = TestPeer::connect();
+        peer.send_preface().await;
+        let _ = peer.recv().await; // our SETTINGS
+        let _ = peer.recv().await; // the ACK of theirs
+
+        let mut encoder = HpackEncoder::new(Settings::default().header_table_size as usize);
+        let mut block = BytesMut::new();
+        encoder.encode(
+            &[
+                Header::new(":method", "GET"),
+                Header::new(":scheme", "https"),
+                Header::new(":path", "/"),
+                Header::new(":authority", "example.com"),
+            ],
+            &mut block,
+        );
+        peer.send(&Frame::Headers {
+            stream_id: StreamId::new(1),
+            block: block.freeze(),
+            end_stream: true,
+            end_headers: true,
+        })
+        .await;
+
+        // Close the peer and read the tally back off the summary. It has to be
+        // EOF rather than the shutdown signal: the reader's select is biased
+        // toward shutdown, so signalling would race the buffered frame.
+        drop(peer);
+        let summary = tokio::time::timeout(TIMEOUT, handle)
+            .await
+            .expect("the connection did not finish")
+            .expect("the reader task panicked");
+        assert_eq!(summary.header_blocks_decoded, 1);
+    }
+
+    /// The block is one HPACK unit however many frames carry it, so a block
+    /// split across CONTINUATION must decode identically to an unsplit one.
+    #[tokio::test]
+    async fn a_header_block_split_across_continuation_decodes_once() {
+        let (mut peer, _tx, handle) = TestPeer::connect();
+        peer.send_preface().await;
+        let _ = peer.recv().await;
+        let _ = peer.recv().await;
+
+        let mut encoder = HpackEncoder::new(Settings::default().header_table_size as usize);
+        let mut block = BytesMut::new();
+        encoder.encode(
+            &[
+                Header::new(":method", "GET"),
+                Header::new(":path", "/split"),
+                Header::new("x-custom", "value"),
+            ],
+            &mut block,
+        );
+        let block = block.freeze();
+        // Cut the block mid-representation, which is legal: fragment
+        // boundaries have nothing to do with field boundaries (§4.3).
+        let (head, tail) = block.split_at(3);
+        peer.send(&Frame::Headers {
+            stream_id: StreamId::new(1),
+            block: Bytes::copy_from_slice(head),
+            end_stream: false,
+            end_headers: false,
+        })
+        .await;
+        peer.send(&Frame::Continuation {
+            stream_id: StreamId::new(1),
+            block: Bytes::copy_from_slice(tail),
+            end_headers: true,
+        })
+        .await;
+
+        drop(peer);
+        let summary = tokio::time::timeout(TIMEOUT, handle)
+            .await
+            .expect("the connection did not finish")
+            .expect("the reader task panicked");
+        assert_eq!(
+            summary.header_blocks_decoded, 1,
+            "the two fragments are one block",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_header_block_produces_a_compression_goaway() {
+        // Index 62 with an empty dynamic table: a reference to an entry that
+        // was never inserted, which means the tables have diverged.
+        let goaway = goaway_after(&[Frame::Headers {
+            stream_id: StreamId::new(1),
+            block: Bytes::from_static(&[0xbe]),
+            end_stream: true,
+            end_headers: true,
+        }])
+        .await;
+        assert!(
+            matches!(
+                goaway,
+                Frame::GoAway {
+                    error_code: ErrorCode::CompressionError,
+                    ..
+                }
+            ),
+            "expected GOAWAY(COMPRESSION_ERROR), got {goaway:?}",
+        );
+    }
+
+    /// The CONTINUATION-flood guard: a peer that never sets END_HEADERS must
+    /// not be able to grow our buffer without bound (design doc §6).
+    #[tokio::test]
+    async fn an_endless_header_block_is_cut_off() {
+        let (mut peer, _tx, _handle) = TestPeer::connect();
+        peer.send_preface().await;
+        let _ = peer.recv().await;
+        let _ = peer.recv().await;
+
+        peer.send(&Frame::Headers {
+            stream_id: StreamId::new(1),
+            block: Bytes::from(vec![0u8; 1024]),
+            end_stream: false,
+            end_headers: false,
+        })
+        .await;
+        // Keep going past the cap. The server stops reading once it errors, so
+        // ignore write failures rather than racing it.
+        for _ in 0..(MAX_HEADER_BLOCK_BYTES / 1024) {
+            let mut out = BytesMut::new();
+            peer.codec
+                .encode(
+                    &Frame::Continuation {
+                        stream_id: StreamId::new(1),
+                        block: Bytes::from(vec![0u8; 1024]),
+                        end_headers: false,
+                    },
+                    &mut out,
+                )
+                .expect("encode");
+            if peer.io.write_all(&out).await.is_err() {
+                break;
+            }
+        }
+
+        let goaway = peer
+            .drain()
+            .await
+            .into_iter()
+            .find(|f| matches!(f, Frame::GoAway { .. }))
+            .expect("the flood should have been cut off with a GOAWAY");
+        assert!(
+            matches!(
+                goaway,
+                Frame::GoAway {
+                    error_code: ErrorCode::EnhanceYourCalm,
+                    ..
+                }
+            ),
+            "expected GOAWAY(ENHANCE_YOUR_CALM), got {goaway:?}",
+        );
+    }
+
+    #[test]
+    fn a_sensitive_value_is_not_written_to_the_log() {
+        let headers = [
+            Header::new(":path", "/"),
+            Header::sensitive("authorization", "Bearer hunter2"),
+        ];
+        let rendered = format!("{:?}", Redacted(&headers));
+        assert!(rendered.contains(":path: /"), "{rendered}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "a never-indexed value must not reach the log: {rendered}",
+        );
+        assert!(rendered.contains("authorization: <redacted>"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn the_advertised_settings_bound_the_header_list() {
+        let settings = Settings::server();
+        assert_eq!(
+            settings.max_header_list_size,
+            Some(MAX_HEADER_LIST_SIZE),
+            "the bomb guard must be advertised, or a peer cannot respect it",
+        );
+        let params = match settings.to_frame() {
+            Frame::Settings { params, .. } => params,
+            other => panic!("expected SETTINGS, got {other:?}"),
+        };
+        assert!(
+            params.contains(&(setting_id::MAX_HEADER_LIST_SIZE, MAX_HEADER_LIST_SIZE)),
+            "MAX_HEADER_LIST_SIZE missing from {params:?}",
         );
     }
 
