@@ -51,13 +51,18 @@ fmt:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Build the fuzz target (needs the nightly toolchain + cargo-fuzz).
-fuzz-build:
-    cargo +nightly fuzz build frame_parser --target {{fuzz_triple}}
+# Build a fuzz target (needs the nightly toolchain + cargo-fuzz).
+fuzz-build target='frame_parser':
+    cargo +nightly fuzz build {{target}} --target {{fuzz_triple}}
 
-# Fuzz the frame parser for N seconds (default 30).
-fuzz seconds='30':
-    cargo +nightly fuzz run frame_parser --target {{fuzz_triple}} -- -max_total_time={{seconds}}
+# Fuzz a target for N seconds (default 30). Targets: frame_parser, hpack_decoder.
+fuzz seconds='30' target='frame_parser':
+    cargo +nightly fuzz run {{target}} --target {{fuzz_triple}} -- -max_total_time={{seconds}}
+
+# Build every fuzz target — the check CI could run without a nightly fuzz run.
+fuzz-build-all:
+    just fuzz-build frame_parser
+    just fuzz-build hpack_decoder
 
 # Capture the no-proxy baseline (client -> backend directly). See bench/README.md.
 baseline:

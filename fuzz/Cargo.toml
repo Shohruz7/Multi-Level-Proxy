@@ -22,3 +22,10 @@ path = "fuzz_targets/frame_parser.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "hpack_decoder"
+path = "fuzz_targets/hpack_decoder.rs"
+test = false
+doc = false
+bench = false
