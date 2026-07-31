@@ -19,6 +19,9 @@ perf.data*
 # macOS
 .DS_Store
 
-# Local-only planning and reference docs (kept out of git by request)
+# Local-only planning and reference docs (kept out of git by request).
+# The per-week plans stay local; Week-1/2-tasks.md predate the rule and are
+# already tracked.
 /docs/
 /Documentation/Week3-8.md
+/Documentation/*-plan.md
