@@ -67,3 +67,8 @@ fuzz-build-all:
 # Capture the no-proxy baseline (client -> backend directly). See bench/README.md.
 baseline:
     bench/baseline.sh
+
+# RFC 9113 conformance against a running daemon (`just run-proxy` in another
+# shell). Needs `brew install h2spec`; -t -k = TLS, skip cert verification.
+h2spec target='':
+    h2spec -t -k -h 127.0.0.1 -p 8443 {{target}}
