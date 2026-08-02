@@ -42,6 +42,11 @@ const PRIORITY_FIELD_LEN: usize = 5;
 /// violation (§8.4) rather than a frame worth modeling.
 const PUSH_PROMISE_TYPE: u8 = 0x5;
 
+/// PRIORITY's type code (§6.3). Also not a [`FrameType`] variant: the proxy
+/// models no dependency tree, so the frame is validated and discarded rather
+/// than represented. See [`Frame::validate_priority`].
+const PRIORITY_TYPE: u8 = 0x2;
+
 /// The frame types the proxy handles (RFC 9113 §6). PRIORITY and PUSH_PROMISE
 /// are not among them (no dependency tree; push disabled), so they — and any
 /// future/unknown type code — decode as [`FrameType::Unknown`], which §4.1
@@ -248,6 +253,8 @@ pub enum FrameError {
     PaddingOverflow { kind: FrameType },
     #[error("received PUSH_PROMISE, but this endpoint advertises ENABLE_PUSH = 0")]
     UnexpectedPushPromise,
+    #[error("{0:?} frame declares itself as its own dependency")]
+    SelfDependency(FrameType),
 }
 
 impl FrameError {
@@ -259,9 +266,28 @@ impl FrameError {
             }
             FrameError::BadStreamId(_)
             | FrameError::PaddingOverflow { .. }
-            | FrameError::UnexpectedPushPromise => ErrorCode::ProtocolError,
+            | FrameError::UnexpectedPushPromise
+            | FrameError::SelfDependency(_) => ErrorCode::ProtocolError,
         }
     }
+}
+
+/// One decoding step's result.
+///
+/// Most frames come back as [`Decoded::Frame`]. The rest are *consumed but not
+/// modeled*: unknown extension types, which §4.1 requires be ignored, and
+/// PRIORITY, whose dependency tree is a stated non-goal. Those still have to
+/// reach the caller rather than being swallowed inside the codec, because §4.3
+/// forbids **any** frame between a HEADERS and its CONTINUATION — including the
+/// ones we would otherwise discard. Silently skipping them is a conformance hole
+/// that no amount of testing above this layer can see.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Decoded {
+    Frame(Frame),
+    Ignored {
+        kind: FrameType,
+        stream_id: StreamId,
+    },
 }
 
 /// The framing seam: bytes ⇄ typed frames (design doc §3.2).
@@ -297,30 +323,38 @@ impl FrameCodec {
     /// a caller never sees them.
     pub fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Frame>, FrameError> {
         loop {
-            if buf.len() < FRAME_HEADER_LEN {
-                return Ok(None);
-            }
-            let header = FrameHeader::parse(&buf[..FRAME_HEADER_LEN]);
-            if header.length > self.max_frame_size {
-                return Err(FrameError::Oversized {
-                    len: header.length,
-                    max: self.max_frame_size,
-                });
-            }
-            let total = FRAME_HEADER_LEN + header.length as usize;
-            if buf.len() < total {
-                return Ok(None);
-            }
-            // A whole frame is present: consume it, then split header from payload.
-            let mut frame = buf.split_to(total);
-            let payload = frame.split_off(FRAME_HEADER_LEN).freeze();
-            match Frame::from_parts(header, payload)? {
-                Some(frame) => return Ok(Some(frame)),
-                // An ignorable type (§4.1): already consumed, so look at the
-                // next frame rather than reporting "need more bytes".
-                None => continue,
+            match self.decode_any(buf)? {
+                Some(Decoded::Frame(frame)) => return Ok(Some(frame)),
+                // An ignorable type: already consumed, so look at the next frame
+                // rather than reporting "need more bytes". Callers that must
+                // enforce §4.3 use `decode_any` instead.
+                Some(Decoded::Ignored { .. }) => continue,
+                None => return Ok(None),
             }
         }
+    }
+
+    /// Decode one frame, reporting the ignorable types rather than skipping
+    /// them. See [`Decoded`] for why the connection layer needs to see those.
+    pub fn decode_any(&mut self, buf: &mut BytesMut) -> Result<Option<Decoded>, FrameError> {
+        if buf.len() < FRAME_HEADER_LEN {
+            return Ok(None);
+        }
+        let header = FrameHeader::parse(&buf[..FRAME_HEADER_LEN]);
+        if header.length > self.max_frame_size {
+            return Err(FrameError::Oversized {
+                len: header.length,
+                max: self.max_frame_size,
+            });
+        }
+        let total = FRAME_HEADER_LEN + header.length as usize;
+        if buf.len() < total {
+            return Ok(None);
+        }
+        // A whole frame is present: consume it, then split header from payload.
+        let mut frame = buf.split_to(total);
+        let payload = frame.split_off(FRAME_HEADER_LEN).freeze();
+        Frame::from_parts(header, payload).map(Some)
     }
 
     /// Serialize `frame` onto `out`.
@@ -331,26 +365,60 @@ impl FrameCodec {
 
 impl Frame {
     /// Interpret a header + opaque payload as a typed frame.
-    ///
-    /// `Ok(None)` means "a well-formed frame of a type we ignore" (§4.1) — it
-    /// has been consumed and should be skipped.
-    fn from_parts(header: FrameHeader, payload: Bytes) -> Result<Option<Frame>, FrameError> {
+    fn from_parts(header: FrameHeader, payload: Bytes) -> Result<Decoded, FrameError> {
+        let framed = |r: Result<Frame, FrameError>| r.map(Decoded::Frame);
         match header.kind {
-            FrameType::Data => Self::data_from_parts(header, payload).map(Some),
-            FrameType::Headers => Self::headers_from_parts(header, payload).map(Some),
-            FrameType::RstStream => Self::rst_stream_from_parts(header, payload).map(Some),
-            FrameType::Settings => Self::settings_from_parts(header, payload).map(Some),
-            FrameType::Ping => Self::ping_from_parts(header, payload).map(Some),
-            FrameType::GoAway => Self::go_away_from_parts(header, payload).map(Some),
-            FrameType::WindowUpdate => Self::window_update_from_parts(header, payload).map(Some),
-            FrameType::Continuation => Self::continuation_from_parts(header, payload).map(Some),
+            FrameType::Data => framed(Self::data_from_parts(header, payload)),
+            FrameType::Headers => framed(Self::headers_from_parts(header, payload)),
+            FrameType::RstStream => framed(Self::rst_stream_from_parts(header, payload)),
+            FrameType::Settings => framed(Self::settings_from_parts(header, payload)),
+            FrameType::Ping => framed(Self::ping_from_parts(header, payload)),
+            FrameType::GoAway => framed(Self::go_away_from_parts(header, payload)),
+            FrameType::WindowUpdate => framed(Self::window_update_from_parts(header, payload)),
+            FrameType::Continuation => framed(Self::continuation_from_parts(header, payload)),
             // Push is disabled, so a PUSH_PROMISE is a violation to report, not
             // a frame to ignore (§8.4).
             FrameType::Unknown(PUSH_PROMISE_TYPE) => Err(FrameError::UnexpectedPushPromise),
-            // Everything else — including the deprecated PRIORITY (0x2) — must
-            // be discarded rather than rejected (§4.1).
-            FrameType::Unknown(_) => Ok(None),
+            // PRIORITY's *scheme* is a non-goal, but its *framing* is not: the
+            // size and placement rules still apply and a peer is entitled to
+            // have them enforced. Validate, then discard.
+            FrameType::Unknown(PRIORITY_TYPE) => Self::validate_priority(header, &payload),
+            // Everything else must be discarded rather than rejected (§4.1) —
+            // that is what lets the protocol add frame types later.
+            FrameType::Unknown(kind) => Ok(Decoded::Ignored {
+                kind: FrameType::Unknown(kind),
+                stream_id: header.stream_id,
+            }),
         }
+    }
+
+    /// Check a PRIORITY frame's framing (§6.3) without modeling what it asks
+    /// for.
+    fn validate_priority(header: FrameHeader, payload: &Bytes) -> Result<Decoded, FrameError> {
+        if header.stream_id.is_connection() {
+            return Err(FrameError::BadStreamId(FrameType::Unknown(PRIORITY_TYPE)));
+        }
+        if payload.len() != PRIORITY_FIELD_LEN {
+            return Err(FrameError::BadLength {
+                kind: FrameType::Unknown(PRIORITY_TYPE),
+                len: payload.len() as u32,
+            });
+        }
+        if Self::depends_on(payload) == header.stream_id {
+            return Err(FrameError::SelfDependency(FrameType::Unknown(
+                PRIORITY_TYPE,
+            )));
+        }
+        Ok(Decoded::Ignored {
+            kind: FrameType::Unknown(PRIORITY_TYPE),
+            stream_id: header.stream_id,
+        })
+    }
+
+    /// The stream dependency out of a 5-octet priority field: one exclusive bit
+    /// then a 31-bit stream id.
+    fn depends_on(field: &[u8]) -> StreamId {
+        StreamId::new(u32::from_be_bytes([field[0], field[1], field[2], field[3]]))
     }
 
     /// Validate and strip the optional padding shared by DATA and HEADERS
@@ -397,13 +465,18 @@ impl Frame {
         }
         let mut block = Self::strip_padding(FrameType::Headers, header.flags, payload)?;
         // The priority fields are read only to be discarded: RFC 9113 deprecates
-        // the priority scheme and the proxy models no dependency tree.
+        // the priority scheme and the proxy models no dependency tree. The one
+        // thing still worth checking is that the frame is not self-referential,
+        // which is a protocol error however little we care about the tree.
         if header.flags.contains(Flags::PRIORITY) {
             if block.len() < PRIORITY_FIELD_LEN {
                 return Err(FrameError::BadLength {
                     kind: FrameType::Headers,
                     len: block.len() as u32,
                 });
+            }
+            if Self::depends_on(&block) == header.stream_id {
+                return Err(FrameError::SelfDependency(FrameType::Headers));
             }
             block = block.slice(PRIORITY_FIELD_LEN..);
         }
