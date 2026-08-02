@@ -1,9 +1,8 @@
 //! Connection layer: one HTTP/2 connection, owned by one task.
 //!
 //! Owns the preface + SETTINGS handshake and ack lifecycle (RFC 9113 §3.4,
-//! §6.5), the frame-reader task that demuxes inbound frames to per-stream
-//! handlers over bounded mpsc channels (the §2.2 concurrency model — the
-//! channel bound is the backpressure mechanism), the outbound mux, PING, and
+//! §6.5), the frame loop that demuxes inbound frames onto a table of live
+//! streams, the outbound scheduler that interleaves their responses, PING, and
 //! GOAWAY handling.
 //!
 //! Also home of the error model's protocol side (ADR 0008): the
@@ -12,23 +11,56 @@
 //! §7 error codes they must emit.
 //!
 //! Week 3 landed the handshake and the connection-control frames (SETTINGS,
-//! PING, GOAWAY). Week 4 adds the HPACK seam: header blocks are reassembled
+//! PING, GOAWAY). Week 4 added the HPACK seam: header blocks are reassembled
 //! across HEADERS + CONTINUATION and decoded through a *per-connection* codec,
-//! because the dynamic table spans every block the peer sends. Per-stream
-//! demux/mux is week 5, and the graceful GOAWAY drain and Rapid-Reset / flood
-//! accounting are week 7 (design doc §6).
+//! because the dynamic table spans every block the peer sends. Week 5 makes it
+//! a server — streams, flow control, and responses. The graceful GOAWAY drain
+//! and the Rapid-Reset / flood accounting are week 7 (design doc §6).
+//!
+//! # One task, three phases (ADR 0013)
+//!
+//! ADR 0009 planned a reader task, a writer task, and a spawned handler task per
+//! stream. Week 5 amends that to **one task per connection**, because a stream's
+//! state machine advances on both `Send*` and `Recv*` events: splitting reader
+//! from writer would split the one piece of state that has to see both
+//! directions, and re-introduce the locking the actor shape exists to avoid.
+//! The loop is instead three phases:
+//!
+//! ```text
+//! loop {
+//!     while let Some(frame) = codec.decode(&mut read_buf)? { handle_frame(frame)? }
+//!     self.pump_outbound().await?;    // write what the windows allow
+//!     if !self.fill().await { break } // park for more input
+//! }
+//! ```
+//!
+//! When every window is exhausted `pump_outbound` writes nothing and the loop
+//! parks in `fill` — which is exactly what "the sender is blocked" means. The
+//! peer's WINDOW_UPDATE wakes it, credits the window, and the next pass resumes.
+//! Reading is never what blocks, so there is no deadlock.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tracing::{debug, trace, warn};
 
-use crate::flow::MAX_WINDOW_SIZE;
-use crate::frame::{DEFAULT_MAX_FRAME_SIZE, Frame, FrameCodec, MAX_ALLOWED_FRAME_SIZE};
-use crate::hpack::{HpackDecoder, HpackEncoder};
-use crate::stream::StreamId;
+use crate::flow::{
+    CONNECTION_WINDOW, CONNECTION_WINDOW_BOOTSTRAP, MAX_WINDOW_SIZE, RecvWindow, SEND_BUDGET,
+    STREAM_INITIAL_WINDOW, Window,
+};
+use crate::frame::{
+    DEFAULT_MAX_FRAME_SIZE, Decoded, Frame, FrameCodec, FrameType, MAX_ALLOWED_FRAME_SIZE,
+};
+use crate::hpack::{HpackDecoder, HpackEncoder, HpackError};
+use crate::service::{Body, Echo, RequestHead, Response, Service};
+use crate::stream::{Lookup, OpenRejection, StreamEvent, StreamId, StreamTable};
+
+/// How many streams a peer may have open or half-closed at once, advertised as
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` (§5.1.2). An abuse guard as much as a
+/// resource one: unlimited concurrency is what makes Rapid Reset cheap.
+pub const MAX_CONCURRENT_STREAMS: u32 = 256;
 
 /// The client connection preface (RFC 9113 §3.4). A client opens every HTTP/2
 /// connection by sending these 24 octets, immediately followed by its first
@@ -179,10 +211,18 @@ impl Settings {
     /// The settings this proxy advertises: protocol defaults with push turned
     /// off (the stated non-goal — see the README), which also makes any
     /// PUSH_PROMISE we later receive a clean protocol error, plus a bound on
-    /// how large a header list we will decode (design doc §6).
+    /// how large a header list we will decode (design doc §6), a concurrency
+    /// cap, and a raised per-stream receive window.
+    ///
+    /// Note what is *not* here: the connection-level receive window. §6.9.1
+    /// scopes `INITIAL_WINDOW_SIZE` to streams only, so raising the connection
+    /// window takes an explicit WINDOW_UPDATE on stream 0 at handshake — see
+    /// [`CONNECTION_WINDOW_BOOTSTRAP`].
     pub fn server() -> Self {
         Settings {
             enable_push: false,
+            max_concurrent_streams: Some(MAX_CONCURRENT_STREAMS),
+            initial_window_size: STREAM_INITIAL_WINDOW as u32,
             max_header_list_size: Some(MAX_HEADER_LIST_SIZE),
             ..Settings::default()
         }
@@ -270,48 +310,21 @@ impl Settings {
 }
 
 // ---------------------------------------------------------------------------
-// Task topology (§2.2) — prototyped in week 2, populated in week 5.
+// Task topology (§2.2) — prototyped in week 2, decided in week 5.
 //
-// One connection is owned by one task. A single *reader* owns the read half,
-// decodes frames, and dispatches each to the matching per-stream handler over a
-// bounded mpsc channel keyed by `StreamId` (a `Dispatcher`). Handlers send
-// outbound frames back over one shared channel to a *writer* that owns the write
-// half and serializes the mux. Connection-control frames (SETTINGS/PING/GOAWAY
-// on stream 0) are handled by the reader directly.
+// Week 2 sketched `ToStream` / `FromStream` / `Dispatcher` / `STREAM_CHANNEL_BOUND`
+// for the reader → per-stream-task → writer pipeline of ADR 0009. Week 5 removed
+// them rather than populate them; see ADR 0013 and this module's header for the
+// reasoning. Two points survive from the sketch and are worth keeping visible:
 //
-// The channel bound is the backpressure mechanism (design doc §4.2): once a
-// stream's handler falls `STREAM_CHANNEL_BOUND` frames behind, the reader's
-// send blocks, so it stops pulling from the socket, so the peer stalls — which
-// in week 6 is coupled to the upstream's flow-control window. See
-// docs/adr/0009 for the choice of this topology over the alternatives.
+//   - The channel bound would have counted *messages*, not octets. Sixty-four
+//     DATA frames at MAX_FRAME_SIZE is ~1 MiB per stream, so at 256 streams it
+//     bounded nothing useful. The real memory bound is the connection receive
+//     window (`flow::CONNECTION_WINDOW`), which caps in-flight octets no matter
+//     how many streams are open.
+//   - Per-stream tasks exist to keep a slow *upstream* from blocking the reader.
+//     That problem arrives in week 6, and so should they.
 // ---------------------------------------------------------------------------
-
-/// Bound on each per-stream inbound channel — the backpressure knob (§4.2).
-pub const STREAM_CHANNEL_BOUND: usize = 64;
-
-/// A message from the connection reader to a single stream's handler (inbound
-/// demux).
-#[derive(Debug)]
-pub enum ToStream {
-    /// A frame addressed to this stream.
-    Frame(Frame),
-    /// The stream is being torn down (RST_STREAM received or connection going
-    /// away); the handler should finish and drop.
-    Reset(ErrorCode),
-}
-
-/// A message from a stream's handler back to the connection writer (outbound
-/// mux).
-#[derive(Debug)]
-pub enum FromStream {
-    /// A frame to serialize onto the connection.
-    Frame(Frame),
-}
-
-/// The reader task's routing table: which bounded channel feeds each live
-/// stream's handler. Entries are added as streams open and removed as they
-/// close (week 5).
-pub type Dispatcher = HashMap<StreamId, mpsc::Sender<ToStream>>;
 
 /// What a finished connection did, for the daemon's logs and metrics. Keeps the
 /// `metrics` crate out of the engine: the binary owns instrumentation, the
@@ -325,6 +338,19 @@ pub struct ConnectionSummary {
     /// Complete header blocks decoded through HPACK — i.e. requests read off
     /// this connection.
     pub header_blocks_decoded: u64,
+    /// Streams the peer opened over this connection's lifetime.
+    pub streams_opened: u64,
+    /// Streams that ended in a RST_STREAM, in either direction.
+    pub streams_reset: u64,
+    /// The most streams live at once — how much of [`MAX_CONCURRENT_STREAMS`]
+    /// the peer actually used.
+    pub peak_concurrent_streams: u32,
+    /// DATA payload octets written to the peer.
+    pub data_bytes_sent: u64,
+    /// Times the scheduler had queued octets but no window to send them in.
+    /// A nonzero count under load is the observable proof that flow control is
+    /// doing something.
+    pub flow_control_stalls: u64,
 }
 
 /// Why the reader loop stopped.
@@ -342,15 +368,26 @@ enum Next {
     Close,
 }
 
-/// One HTTP/2 connection, driven by its reader task.
+/// What one round-robin visit did, which is what decides where the stream sits
+/// in the ring for the next lap.
+enum Visit {
+    /// Octets queued, no window to send them in. Keeps its place at the front.
+    Stalled,
+    /// Wrote a frame; `more` says whether anything is still queued.
+    Wrote { more: bool },
+    /// Nothing left to send, or the stream is gone. Leaves the ring.
+    Finished,
+}
+
+/// One HTTP/2 connection, driven by a single task.
 ///
-/// Week 3 brings the connection up: it sends the server's SETTINGS, validates
-/// the client preface, and runs the frame loop, answering the connection-control
-/// frames (SETTINGS/ACK, PING, GOAWAY) itself. Stream-addressed frames decode
-/// and are counted, but dispatch to per-stream handlers over a [`Dispatcher`] is
-/// week 5, and the graceful GOAWAY drain is week 7 — both slot into the loop
-/// below without disturbing this lifecycle.
-pub struct Connection<IO> {
+/// Week 3 brings the connection up: server SETTINGS, client preface, and the
+/// frame loop answering the connection-control frames (SETTINGS/ACK, PING,
+/// GOAWAY). Week 5 adds the streams: inbound frames land on a [`StreamTable`],
+/// requests are answered by an `S: Service`, and outbound DATA is metered by two
+/// levels of flow-control window and interleaved by a round-robin scheduler. The
+/// graceful GOAWAY drain is week 7 and slots into this lifecycle unchanged.
+pub struct Connection<IO, S = Echo> {
     io: IO,
     shutdown: broadcast::Receiver<()>,
     read_buf: BytesMut,
@@ -359,13 +396,16 @@ pub struct Connection<IO> {
     /// What we advertised. Our `MAX_FRAME_SIZE` is what bounds the *decoder*:
     /// it is the limit we imposed on the peer.
     local_settings: Settings,
-    /// The peer's settings as applied. Bounds what we may *send* (week 5, when
-    /// there is an outbound path to bound).
+    /// The peer's settings as applied. Bounds what we may send.
     peer_settings: Settings,
     /// Set while a header block is open — a HEADERS or CONTINUATION arrived
     /// without END_HEADERS, so only a CONTINUATION on this stream may follow
     /// (§4.3).
     open_header_block: Option<StreamId>,
+    /// The END_STREAM flag of the HEADERS that opened the block being
+    /// reassembled. It rides on the first frame but only takes effect once
+    /// END_HEADERS arrives, possibly several CONTINUATIONs later.
+    open_header_end_stream: bool,
     /// Partial header block, accumulated across CONTINUATION frames. Empty
     /// whenever [`Self::open_header_block`] is `None`.
     header_block: BytesMut,
@@ -374,16 +414,30 @@ pub struct Connection<IO> {
     /// block is indivisible and why a decode failure kills the connection
     /// (design doc §3.3).
     hpack_dec: HpackDecoder,
-    /// Outbound HPACK state. Nothing encodes responses until week 5, but the
-    /// peer's `HEADER_TABLE_SIZE` is negotiated now, at handshake, so the
-    /// encoder has to exist to receive it.
+    /// Outbound HPACK state, bounded by the peer's `HEADER_TABLE_SIZE`.
     hpack_enc: HpackEncoder,
-    /// Highest client-initiated stream seen, for GOAWAY's last-stream-id (§6.8).
-    last_peer_stream_id: StreamId,
+    /// Every live stream, plus the §5.1.1 id rules and the §5.1.2 concurrency
+    /// budget.
+    streams: StreamTable,
+    /// Connection-level credit the peer gave us: the ceiling on DATA in flight
+    /// across *all* streams, and therefore the real memory bound.
+    conn_send_window: Window,
+    /// Connection-level credit we gave the peer.
+    conn_recv_window: RecvWindow,
+    /// Round-robin ring of streams with something to send. A stream appears at
+    /// most once (`Stream::queued` guards that) and rotates to the back after
+    /// each visit, whether or not it finished.
+    ready: VecDeque<StreamId>,
+    /// RST_STREAMs owed to the peer. The state machine is driven from places
+    /// that cannot also write (they already hold a borrow of the stream table),
+    /// so the frame is queued here and flushed on the way out.
+    pending_reset: Vec<StreamError>,
+    /// What answers a request.
+    service: S,
     summary: ConnectionSummary,
 }
 
-impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
+impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO, Echo> {
     /// Build a connection over an established (TLS-terminated) byte stream.
     /// `shutdown` fires — as a value or by the sender being dropped — when the
     /// daemon is draining.
@@ -398,6 +452,20 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
         shutdown: broadcast::Receiver<()>,
         local_settings: Settings,
     ) -> Self {
+        Self::with_service(io, shutdown, local_settings, Echo::default())
+    }
+}
+
+impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
+    /// Build a connection answered by a specific [`Service`]. Week 6 passes the
+    /// proxy here; week 5 uses it for tests that need a scripted responder.
+    pub fn with_service(
+        io: IO,
+        shutdown: broadcast::Receiver<()>,
+        local_settings: Settings,
+        service: S,
+    ) -> Self {
+        let defaults = Settings::default();
         Connection {
             io,
             shutdown,
@@ -405,15 +473,30 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
             write_buf: BytesMut::with_capacity(1024),
             codec: FrameCodec::new(local_settings.max_frame_size),
             local_settings,
-            peer_settings: Settings::default(),
+            peer_settings: defaults,
             open_header_block: None,
+            open_header_end_stream: false,
             header_block: BytesMut::new(),
             hpack_dec: HpackDecoder::new(
                 local_settings.header_table_size as usize,
                 local_settings.max_header_list_size.map(|n| n as usize),
             ),
-            hpack_enc: HpackEncoder::new(Settings::default().header_table_size as usize),
-            last_peer_stream_id: StreamId::CONNECTION,
+            hpack_enc: HpackEncoder::new(defaults.header_table_size as usize),
+            streams: StreamTable::new(
+                local_settings
+                    .max_concurrent_streams
+                    .unwrap_or(MAX_CONCURRENT_STREAMS),
+                // Until the peer's SETTINGS arrives, their initial window is the
+                // protocol default — not ours. Getting this backwards is a way
+                // to overrun a peer's window on the very first response.
+                defaults.initial_window_size as i32,
+                local_settings.initial_window_size as i32,
+            ),
+            conn_send_window: Window::new(defaults.initial_window_size as i32),
+            conn_recv_window: RecvWindow::new(CONNECTION_WINDOW),
+            ready: VecDeque::new(),
+            pending_reset: Vec::new(),
+            service,
             summary: ConnectionSummary::default(),
         }
     }
@@ -424,10 +507,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
     /// A connection error is reported to the peer as GOAWAY before the socket
     /// closes — the ADR-0008 error model in practice.
     pub async fn run(mut self) -> ConnectionSummary {
-        if let Stop::Failed(err) = self.drive().await {
+        let stop = self.drive().await;
+        self.summary.peak_concurrent_streams = self.streams.peak_concurrent();
+        self.summary.streams_opened = self.streams.opened();
+        if let Stop::Failed(err) = stop {
             warn!(code = ?err.code, reason = %err.debug, "connection error; sending GOAWAY");
             let go_away = Frame::GoAway {
-                last_stream_id: self.last_peer_stream_id,
+                last_stream_id: self.streams.highest_peer_id(),
                 error_code: err.code,
                 debug_data: Bytes::from(err.debug.into_bytes()),
             };
@@ -444,6 +530,20 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
         let settings = self.local_settings.to_frame();
         if let Err(e) = self.write_frame(&settings).await {
             debug!(error = %e, "could not send server SETTINGS");
+            return Stop::Quiet;
+        }
+
+        // The connection-level receive window is *not* covered by
+        // INITIAL_WINDOW_SIZE (§6.9.1) — SETTINGS can only move stream windows.
+        // Raising it takes an explicit stream-0 WINDOW_UPDATE, and forgetting it
+        // caps throughput at the 64 KiB default with nothing in the logs to say
+        // why. `flow.rs` owns the arithmetic; this is the one place it is sent.
+        let bootstrap = Frame::WindowUpdate {
+            stream_id: StreamId::CONNECTION,
+            increment: CONNECTION_WINDOW_BOOTSTRAP,
+        };
+        if let Err(e) = self.write_frame(&bootstrap).await {
+            debug!(error = %e, "could not raise the connection window");
             return Stop::Quiet;
         }
 
@@ -465,9 +565,19 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
             // Drain every frame the buffer already holds before reading again:
             // one read can carry many frames.
             loop {
-                let decoded = self.codec.decode(&mut self.read_buf);
+                let decoded = self.codec.decode_any(&mut self.read_buf);
                 match decoded {
-                    Ok(Some(frame)) => {
+                    Ok(Some(Decoded::Ignored { kind, stream_id })) => {
+                        // A frame we model no state for still counts against
+                        // §4.3: nothing at all may come between a HEADERS and its
+                        // CONTINUATION, not even a frame we are about to throw
+                        // away. Checking it here is why `decode_any` exists.
+                        if let Err(e) = self.reject_if_mid_header_block(kind, stream_id) {
+                            return Stop::Failed(e);
+                        }
+                        trace!(?kind, stream = stream_id.get(), "ignoring frame");
+                    }
+                    Ok(Some(Decoded::Frame(frame))) => {
                         self.summary.frames_received += 1;
                         match self.handle_frame(frame).await {
                             Ok(Next::Continue) => {}
@@ -483,6 +593,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
                 }
             }
 
+            // Write whatever the flow-control windows now allow. When they allow
+            // nothing this is a no-op and we park below — which is exactly what
+            // a blocked sender looks like. The peer's WINDOW_UPDATE is what wakes
+            // us, so reading is never what blocks and there is no deadlock.
+            if let Err(e) = self.pump_outbound().await {
+                return Stop::Failed(e);
+            }
+
             if !self.fill().await {
                 return Stop::Quiet;
             }
@@ -491,39 +609,71 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
 
     /// Act on one decoded frame.
     ///
-    /// Connection-control frames are answered here. Stream-addressed frames are
-    /// validated and counted; routing them to per-stream handlers is week 5.
+    /// Connection-control frames are answered here; stream-addressed frames are
+    /// routed onto the stream table, which is where the §5.1 state machine and
+    /// the per-stream windows live.
     async fn handle_frame(&mut self, frame: Frame) -> Result<Next, ConnectionError> {
         // A header block is atomic: once HEADERS or CONTINUATION arrives without
         // END_HEADERS, nothing but a CONTINUATION on that same stream may follow
         // (§4.3). Interleaving anything else corrupts the shared HPACK state, so
         // it is a connection error even though only one stream looks affected.
-        if let Some(open) = self.open_header_block {
-            let continues_block = matches!(
-                &frame,
-                Frame::Continuation { stream_id, .. } if *stream_id == open
-            );
-            if !continues_block {
+        match self.open_header_block {
+            Some(open) => {
+                let continues_block = matches!(
+                    &frame,
+                    Frame::Continuation { stream_id, .. } if *stream_id == open
+                );
+                if !continues_block {
+                    return Err(ConnectionError::new(
+                        ErrorCode::ProtocolError,
+                        format!(
+                            "expected CONTINUATION on stream {}, got {:?} on stream {}",
+                            open.get(),
+                            frame.kind(),
+                            frame.stream_id().get(),
+                        ),
+                    ));
+                }
+            }
+            // The mirror-image rule, and the one easier to miss: a CONTINUATION
+            // with no open block continues nothing. Accepting it would feed the
+            // shared HPACK decoder a fragment with no context.
+            None if matches!(frame, Frame::Continuation { .. }) => {
                 return Err(ConnectionError::new(
                     ErrorCode::ProtocolError,
                     format!(
-                        "expected CONTINUATION on stream {}, got {:?} on stream {}",
-                        open.get(),
-                        frame.kind(),
+                        "CONTINUATION on stream {} with no header block open",
                         frame.stream_id().get(),
                     ),
                 ));
             }
+            None => {}
         }
 
         match &frame {
             Frame::Settings { ack: false, params } => {
+                let previous_window = self.peer_settings.initial_window_size;
                 self.peer_settings.apply(params)?;
                 // Their HEADER_TABLE_SIZE bounds *our* encoder's dynamic table;
                 // the change is announced back as a size update on our next
                 // header block (RFC 7541 §6.3).
                 self.hpack_enc
                     .set_max_table_size(self.peer_settings.header_table_size as usize);
+                // A change to INITIAL_WINDOW_SIZE applies retroactively to every
+                // stream already open (§6.9.2), by the *delta* rather than as an
+                // assignment — a stream that has already spent credit must not
+                // have it silently restored.
+                let delta = self.peer_settings.initial_window_size as i64 - previous_window as i64;
+                if delta != 0 {
+                    self.streams
+                        .apply_initial_window_delta(delta as i32)
+                        .map_err(|code| {
+                            ConnectionError::new(
+                                code,
+                                "INITIAL_WINDOW_SIZE change overflows a stream window",
+                            )
+                        })?;
+                }
                 trace!(?self.peer_settings, "applied peer SETTINGS");
                 // Every SETTINGS frame must be acknowledged (§6.5.3). The first
                 // one completes the handshake.
@@ -562,42 +712,40 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
                 stream_id,
                 increment,
             } => {
-                // §6.9: a zero increment is a protocol violation, scoped to the
-                // connection on stream 0 and to the stream otherwise. Only the
-                // connection-level half is actionable before week 5's per-stream
-                // state exists.
-                if *increment == 0 && stream_id.is_connection() {
-                    return Err(ConnectionError::new(
-                        ErrorCode::ProtocolError,
-                        "WINDOW_UPDATE with a zero increment on stream 0",
-                    ));
-                }
-                // Window accounting itself is week 5.
-                trace!(stream = stream_id.get(), increment, "WINDOW_UPDATE");
+                self.recv_window_update(*stream_id, *increment).await?;
             }
             Frame::Headers {
                 stream_id,
                 block,
+                end_stream,
                 end_headers,
-                ..
+            } => {
+                if self.open_header_block.is_none() {
+                    self.open_header_end_stream = *end_stream;
+                }
+                self.read_header_block(*stream_id, block, *end_headers)
+                    .await?;
             }
-            | Frame::Continuation {
+            Frame::Continuation {
                 stream_id,
                 block,
                 end_headers,
             } => {
-                self.note_peer_stream(*stream_id);
-                self.read_header_block(*stream_id, block, *end_headers)?;
+                self.read_header_block(*stream_id, block, *end_headers)
+                    .await?;
             }
-            Frame::Data { stream_id, .. } | Frame::RstStream { stream_id, .. } => {
-                self.note_peer_stream(*stream_id);
-                // Week 5 dispatches these to per-stream handlers over the
-                // `Dispatcher`; for now the connection stays up and drops them.
-                trace!(
-                    stream = stream_id.get(),
-                    kind = ?frame.kind(),
-                    "stream frame received (dispatch lands in week 5)",
-                );
+            Frame::Data {
+                stream_id,
+                data,
+                end_stream,
+            } => {
+                self.recv_data(*stream_id, data, *end_stream).await?;
+            }
+            Frame::RstStream {
+                stream_id,
+                error_code,
+            } => {
+                self.recv_rst_stream(*stream_id, *error_code)?;
             }
         }
 
@@ -620,11 +768,23 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
         Ok(Next::Continue)
     }
 
-    /// Track the highest client-initiated stream seen, for GOAWAY's
-    /// last-stream-id (§6.8).
-    fn note_peer_stream(&mut self, stream_id: StreamId) {
-        if stream_id.is_client_initiated() && stream_id > self.last_peer_stream_id {
-            self.last_peer_stream_id = stream_id;
+    /// §4.3 for the frames the codec discards: an ignorable type is still a
+    /// frame, and no frame may sit between a HEADERS and its CONTINUATION.
+    fn reject_if_mid_header_block(
+        &self,
+        kind: FrameType,
+        stream_id: StreamId,
+    ) -> Result<(), ConnectionError> {
+        match self.open_header_block {
+            Some(open) => Err(ConnectionError::new(
+                ErrorCode::ProtocolError,
+                format!(
+                    "expected CONTINUATION on stream {}, got {kind:?} on stream {}",
+                    open.get(),
+                    stream_id.get(),
+                ),
+            )),
+            None => Ok(()),
         }
     }
 
@@ -634,7 +794,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
     /// the fragments are reassembled before the decoder sees any of them. The
     /// §4.3 rule that nothing may interleave is already enforced by the caller,
     /// which is what makes plain concatenation correct here.
-    fn read_header_block(
+    async fn read_header_block(
         &mut self,
         stream_id: StreamId,
         fragment: &Bytes,
@@ -666,11 +826,23 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
             self.header_block.split().freeze()
         };
 
-        // A failure here is fatal to the connection, not just this stream: the
-        // dynamic table is shared, so we can no longer decode anything the peer
-        // sends (design doc §3.3). `HpackError` converts to the GOAWAY-bearing
-        // `ConnectionError` accordingly.
-        let headers = self.hpack_dec.decode(&block)?;
+        // Two HPACK failures, two blast radii (the split week 4 built for this).
+        // A malformed block poisons the shared dynamic table and is fatal to the
+        // connection; a block that merely decodes to *too much* leaves the table
+        // sound, because the decoder deliberately ran to the end. That one is a
+        // 431 on this stream and nothing more.
+        let headers = match self.hpack_dec.decode(&block) {
+            Ok(headers) => headers,
+            Err(HpackError::HeaderListTooLarge { size, limit }) => {
+                debug!(
+                    stream = stream_id.get(),
+                    size, limit, "header list too large; answering 431",
+                );
+                self.summary.header_blocks_decoded += 1;
+                return self.reject_stream(stream_id, 431).await;
+            }
+            Err(e @ HpackError::Compression(_)) => return Err(e.into()),
+        };
         self.summary.header_blocks_decoded += 1;
         debug!(
             stream = stream_id.get(),
@@ -678,9 +850,574 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
             headers = ?Redacted(&headers),
             "decoded header block",
         );
-        // Week 5 hands this list to the stream's handler; today it is proof the
-        // request was understood.
+
+        let end_stream = self.open_header_end_stream;
+        self.recv_request(stream_id, &headers, end_stream).await
+    }
+
+    /// A complete request has arrived: open the stream, validate the message,
+    /// and queue whatever the service answers with.
+    async fn recv_request(
+        &mut self,
+        stream_id: StreamId,
+        headers: &[crate::hpack::Header],
+        end_stream: bool,
+    ) -> Result<(), ConnectionError> {
+        // A HEADERS on a stream that is already live is a trailer section, not a
+        // new request. Nothing forwards trailers until week 6, so the fields are
+        // dropped — but they are still validated first, because "we ignore it"
+        // is not the same as "anything goes".
+        if self.streams.get_mut(stream_id).is_some() {
+            // §8.1: a trailer section ends the stream. A second HEADERS without
+            // END_STREAM is a third field section, which HTTP/2 has no room for.
+            if !end_stream {
+                return self
+                    .write_rst_stream(stream_id, ErrorCode::ProtocolError)
+                    .await;
+            }
+            if let Err(code) = crate::service::validate_trailers(headers) {
+                debug!(stream = stream_id.get(), ?code, "malformed trailers");
+                return self.write_rst_stream(stream_id, code).await;
+            }
+            // The body has ended, so `content-length` can finally be judged —
+            // and it must be, before the terminal transition retires the stream
+            // and takes the counters with it.
+            if let Some(code) = self.request_body_error(stream_id) {
+                return self.write_rst_stream(stream_id, code).await;
+            }
+            return self.apply_stream_event(
+                stream_id,
+                StreamEvent::RecvHeaders { end_stream },
+                "trailers",
+            );
+        }
+
+        match self.streams.open_peer(stream_id) {
+            Ok(_) => {}
+            Err(OpenRejection::Protocol(why)) => {
+                return Err(ConnectionError::new(
+                    ErrorCode::ProtocolError,
+                    format!("stream {}: {why}", stream_id.get()),
+                ));
+            }
+            Err(OpenRejection::Refused) => {
+                // §5.1.2. REFUSED_STREAM specifically, because it promises the
+                // client nothing was processed and the request is safe to retry.
+                debug!(
+                    stream = stream_id.get(),
+                    live = self.streams.live_count(),
+                    "at MAX_CONCURRENT_STREAMS; refusing",
+                );
+                return self
+                    .write_rst_stream(stream_id, ErrorCode::RefusedStream)
+                    .await;
+            }
+        }
+        self.apply_stream_event(
+            stream_id,
+            StreamEvent::RecvHeaders { end_stream },
+            "request",
+        )?;
+
+        let request = match RequestHead::from_headers(headers) {
+            Ok(request) => request,
+            Err(code) => {
+                // §8.3: a malformed message is a *stream* error. One bad request
+                // must not take down the other streams sharing this connection.
+                debug!(stream = stream_id.get(), ?code, "malformed request");
+                return self.write_rst_stream(stream_id, code).await;
+            }
+        };
+
+        // Remember what the request promised, so the DATA that follows can be
+        // held to it (§8.1.2.6).
+        match request.content_length() {
+            Some(Ok(declared)) => {
+                if let Some(stream) = self.streams.get_mut(stream_id) {
+                    stream.content_length = Some(declared);
+                }
+            }
+            Some(Err(code)) => return self.write_rst_stream(stream_id, code).await,
+            None => {}
+        }
+        // A bodyless request with a nonzero `content-length` is already wrong;
+        // there is no DATA coming to make it right.
+        if end_stream && let Some(code) = self.request_body_error(stream_id) {
+            return self.write_rst_stream(stream_id, code).await;
+        }
+
+        let response = self.service.respond(&request);
+        self.send_response(stream_id, response).await
+    }
+
+    /// Whether the body that arrived contradicts the request's `content-length`
+    /// (§8.1.2.6). Call this at the point the request body ends, and *before*
+    /// the transition that retires the stream.
+    fn request_body_error(&mut self, stream_id: StreamId) -> Option<ErrorCode> {
+        let stream = self.streams.get_mut(stream_id)?;
+        (!stream.content_length_matches()).then(|| {
+            debug!(
+                stream = stream_id.get(),
+                declared = stream.content_length,
+                received = stream.data_received,
+                "content-length disagrees with the body",
+            );
+            ErrorCode::ProtocolError
+        })
+    }
+
+    /// Encode a response's HEADERS and queue its body for the scheduler.
+    async fn send_response(
+        &mut self,
+        stream_id: StreamId,
+        response: Response,
+    ) -> Result<(), ConnectionError> {
+        let headers = response.to_headers();
+        let echo = matches!(response.body, Body::Echo);
+        let body = match response.body {
+            Body::Fixed(body) if !body.is_empty() => Some(body),
+            _ => None,
+        };
+        // END_STREAM rides the HEADERS only when nothing else will follow. An
+        // echo has no body *yet* but may still get one, so it stays open.
+        let end_stream = body.is_none() && !echo;
+
+        let mut block = BytesMut::new();
+        self.hpack_enc.encode(&headers, &mut block);
+        self.write_frame(&Frame::Headers {
+            stream_id,
+            block: block.freeze(),
+            end_stream,
+            end_headers: true,
+        })
+        .await
+        .map_err(io_as_conn_error)?;
+        self.apply_stream_event(
+            stream_id,
+            StreamEvent::SendHeaders { end_stream },
+            "response",
+        )?;
+
+        if let Some(body) = body {
+            let Some(stream) = self.streams.get_mut(stream_id) else {
+                return Ok(());
+            };
+            stream.send_queue.push_back(body);
+            stream.send_end_stream = true;
+            self.enqueue_ready(stream_id);
+        }
         Ok(())
+    }
+
+    /// Answer a request we refuse to process with a bare status and END_STREAM.
+    ///
+    /// Used for the 431 case, where a response is more useful to the client than
+    /// an RST_STREAM: the header list decoded cleanly, it was simply too big, and
+    /// the client can act on being told so.
+    async fn reject_stream(
+        &mut self,
+        stream_id: StreamId,
+        status: u16,
+    ) -> Result<(), ConnectionError> {
+        // The stream still has to exist before it can be answered.
+        if self.streams.get_mut(stream_id).is_none() {
+            match self.streams.open_peer(stream_id) {
+                Ok(_) => {}
+                Err(OpenRejection::Protocol(why)) => {
+                    return Err(ConnectionError::new(
+                        ErrorCode::ProtocolError,
+                        format!("stream {}: {why}", stream_id.get()),
+                    ));
+                }
+                Err(OpenRejection::Refused) => {
+                    return self
+                        .write_rst_stream(stream_id, ErrorCode::RefusedStream)
+                        .await;
+                }
+            }
+            self.apply_stream_event(
+                stream_id,
+                StreamEvent::RecvHeaders { end_stream: true },
+                "oversized request",
+            )?;
+        }
+        self.send_response(stream_id, Response::status(status, Body::Empty))
+            .await
+    }
+
+    /// Account for inbound DATA at both flow-control levels and feed an echo.
+    async fn recv_data(
+        &mut self,
+        stream_id: StreamId,
+        data: &Bytes,
+        end_stream: bool,
+    ) -> Result<(), ConnectionError> {
+        let len = data.len() as u32;
+
+        // The connection window is debited **before** the stream is looked up.
+        // Octets that arrive for a stream we have already closed were still sent
+        // and still count (§5.1); skipping them here desyncs us from the peer's
+        // accounting in a way only a long-running connection would reveal.
+        self.conn_recv_window.record(len).map_err(|code| {
+            ConnectionError::new(code, "peer exceeded the connection flow-control window")
+        })?;
+        if let Some(increment) = self.conn_recv_window.release(len) {
+            self.write_frame(&Frame::WindowUpdate {
+                stream_id: StreamId::CONNECTION,
+                increment,
+            })
+            .await
+            .map_err(io_as_conn_error)?;
+        }
+
+        let overspent = match self.streams.lookup(stream_id) {
+            Lookup::Idle => {
+                return Err(ConnectionError::new(
+                    ErrorCode::ProtocolError,
+                    format!("DATA on stream {}, which was never opened", stream_id.get()),
+                ));
+            }
+            // §5.1: DATA for a stream that is finished is a stream error, not
+            // something to swallow. The connection-level accounting above has
+            // already happened — the octets were sent regardless — so all that
+            // is left is to tell the peer to stop.
+            Lookup::Closed => {
+                return self
+                    .write_rst_stream(stream_id, ErrorCode::StreamClosed)
+                    .await;
+            }
+            Lookup::Live(stream) => {
+                stream.data_received = stream.data_received.saturating_add(u64::from(len));
+                stream.recv_window.record(len).err()
+            }
+        };
+        if let Some(code) = overspent {
+            return self.write_rst_stream(stream_id, code).await;
+        }
+
+        // Judge `content-length` at the moment the body ends, before the
+        // terminal transition retires the stream and its counters (§8.1.2.6).
+        if end_stream && let Some(code) = self.request_body_error(stream_id) {
+            return self.write_rst_stream(stream_id, code).await;
+        }
+
+        self.apply_stream_event(stream_id, StreamEvent::RecvData { end_stream }, "data")?;
+
+        // Mirror it back if this stream is echoing. Doing it here rather than in
+        // the service is what keeps `Service::respond` synchronous — the body
+        // streams through the connection, not through the responder.
+        if !data.is_empty()
+            && let Some(stream) = self.streams.get_mut(stream_id)
+        {
+            stream.send_queue.push_back(data.clone());
+            self.enqueue_ready(stream_id);
+        }
+        if end_stream && let Some(stream) = self.streams.get_mut(stream_id) {
+            stream.send_end_stream = true;
+            self.enqueue_ready(stream_id);
+        }
+
+        // Only release the credit once the octets are queued onward. Week 6
+        // withholds this call until the *client* drains, and that delay is the
+        // whole backpressure bridge (§4.2).
+        if let Some(stream) = self.streams.get_mut(stream_id)
+            && let Some(increment) = stream.recv_window.release(len)
+        {
+            self.write_frame(&Frame::WindowUpdate {
+                stream_id,
+                increment,
+            })
+            .await
+            .map_err(io_as_conn_error)?;
+        }
+        Ok(())
+    }
+
+    /// The peer abandoned a stream.
+    fn recv_rst_stream(
+        &mut self,
+        stream_id: StreamId,
+        error_code: ErrorCode,
+    ) -> Result<(), ConnectionError> {
+        match self.streams.lookup(stream_id) {
+            Lookup::Idle => {
+                return Err(ConnectionError::new(
+                    ErrorCode::ProtocolError,
+                    format!(
+                        "RST_STREAM on stream {}, which was never opened",
+                        stream_id.get()
+                    ),
+                ));
+            }
+            // A reset crossing our own close. Nothing to undo.
+            Lookup::Closed => return Ok(()),
+            Lookup::Live(_) => {}
+        }
+
+        debug!(stream = stream_id.get(), ?error_code, "peer reset stream");
+        self.summary.streams_reset += 1;
+        self.streams.retire(stream_id);
+        self.ready.retain(|id| *id != stream_id);
+        Ok(())
+    }
+
+    /// Credit a send window (§6.9).
+    async fn recv_window_update(
+        &mut self,
+        stream_id: StreamId,
+        increment: u32,
+    ) -> Result<(), ConnectionError> {
+        if increment == 0 {
+            // A zero increment is meaningless in both scopes, but the blast
+            // radius follows the stream id.
+            return if stream_id.is_connection() {
+                Err(ConnectionError::new(
+                    ErrorCode::ProtocolError,
+                    "WINDOW_UPDATE with a zero increment on stream 0",
+                ))
+            } else {
+                self.write_rst_stream(stream_id, ErrorCode::ProtocolError)
+                    .await
+            };
+        }
+
+        if stream_id.is_connection() {
+            self.conn_send_window.increase(increment).map_err(|code| {
+                ConnectionError::new(code, "WINDOW_UPDATE overflows the connection window")
+            })?;
+            trace!(increment, "connection window credited");
+            // Stalled streams are still sitting in the ring with their turn
+            // order intact, so there is nothing to re-queue — the next
+            // `pump_outbound` lap simply finds budget where it had none.
+            return Ok(());
+        }
+
+        let overflowed = match self.streams.lookup(stream_id) {
+            Lookup::Idle => {
+                return Err(ConnectionError::new(
+                    ErrorCode::ProtocolError,
+                    format!(
+                        "WINDOW_UPDATE on stream {}, which was never opened",
+                        stream_id.get()
+                    ),
+                ));
+            }
+            // Credit for a stream that has finished; harmless.
+            Lookup::Closed => return Ok(()),
+            Lookup::Live(stream) => stream.send_window.increase(increment).is_err(),
+        };
+        if overflowed {
+            // §6.9.1 scopes a window overflow to the stream when it arrives on
+            // one, and to the connection only on stream 0.
+            return self
+                .write_rst_stream(stream_id, ErrorCode::FlowControlError)
+                .await;
+        }
+        self.enqueue_ready(stream_id);
+        Ok(())
+    }
+
+    /// Drive `event` through the stream's state machine, promoting the one code
+    /// that §5.1 scopes to the connection.
+    fn apply_stream_event(
+        &mut self,
+        stream_id: StreamId,
+        event: StreamEvent,
+        what: &str,
+    ) -> Result<(), ConnectionError> {
+        match self.streams.apply(stream_id, event) {
+            Ok(state) => {
+                if state.is_closed() {
+                    self.ready.retain(|id| *id != stream_id);
+                }
+                Ok(())
+            }
+            // "This stream was never opened" means the two ends disagree about
+            // what exists, so nothing after it can be trusted (§5.1).
+            Err(e) if e.code == ErrorCode::ProtocolError => Err(ConnectionError::new(
+                ErrorCode::ProtocolError,
+                format!("{what} on stream {}, which is idle", stream_id.get()),
+            )),
+            Err(e) => {
+                // Everything else is one stream's problem.
+                debug!(stream = stream_id.get(), code = ?e.code, "illegal {what}");
+                self.streams.retire(stream_id);
+                self.ready.retain(|id| *id != stream_id);
+                self.pending_reset.push(e);
+                Ok(())
+            }
+        }
+    }
+
+    /// Put a stream in the round-robin ring if it has work and is not already
+    /// there.
+    fn enqueue_ready(&mut self, stream_id: StreamId) {
+        let Some(stream) = self.streams.get_mut(stream_id) else {
+            return;
+        };
+        if stream.queued || !stream.has_pending_send() {
+            return;
+        }
+        stream.queued = true;
+        self.ready.push_back(stream_id);
+    }
+
+    /// Write as much queued DATA as the two windows allow, fairly (design doc
+    /// §4.1).
+    ///
+    /// Round-robin over the ready ring, with a per-visit ceiling of
+    /// [`SEND_BUDGET`]. The budget is the point: without it a 10 MiB response
+    /// would hold the connection until it finished and starve every small
+    /// request behind it. Rotating after each visit whether or not the stream
+    /// finished is what makes the interleaving fair rather than merely present.
+    ///
+    /// **Stalling must not cost a stream its turn.** The ring is rebuilt after
+    /// every lap with the stalled streams first, in their original order, and
+    /// the streams that were served behind them. The obvious alternative —
+    /// rotating everyone to the back as they are visited — quietly starves: a
+    /// stream that stalls lands *behind* whoever wrote in the same lap, so the
+    /// same stream wins every scarce credit and the others never send a byte.
+    /// The `flow_control.rs` two-stream test exists for exactly this.
+    async fn pump_outbound(&mut self) -> Result<(), ConnectionError> {
+        // One lap at a time. A lap that writes nothing means every stream in the
+        // ring is out of window, so there is nothing to do until the peer sends
+        // a WINDOW_UPDATE — which is what "the sender is blocked" means, and
+        // where the connection loop parks.
+        while !self.ready.is_empty() {
+            let lap: Vec<StreamId> = self.ready.drain(..).collect();
+            let mut stalled: VecDeque<StreamId> = VecDeque::new();
+            let mut served: VecDeque<StreamId> = VecDeque::new();
+            let mut wrote = false;
+
+            for stream_id in lap {
+                match self.visit_ready_stream(stream_id).await? {
+                    Visit::Stalled => stalled.push_back(stream_id),
+                    Visit::Wrote { more } => {
+                        wrote = true;
+                        if more {
+                            served.push_back(stream_id);
+                        }
+                    }
+                    Visit::Finished => {}
+                }
+            }
+
+            self.ready = stalled;
+            self.ready.extend(served);
+            for stream_id in self.ready.clone() {
+                if let Some(stream) = self.streams.get_mut(stream_id) {
+                    stream.queued = true;
+                }
+            }
+            // A stream retired mid-lap leaves no entry, so drop it from the ring.
+            let streams = &mut self.streams;
+            self.ready.retain(|id| streams.get_mut(*id).is_some());
+
+            if !wrote {
+                if !self.ready.is_empty() {
+                    self.summary.flow_control_stalls += 1;
+                }
+                break;
+            }
+        }
+        self.flush_pending_resets().await
+    }
+
+    /// One visit in the round-robin: write at most [`SEND_BUDGET`] octets for
+    /// `stream_id`. The caller owns the ring, so this only reports what happened.
+    async fn visit_ready_stream(&mut self, stream_id: StreamId) -> Result<Visit, ConnectionError> {
+        let Some(stream) = self.streams.get_mut(stream_id) else {
+            return Ok(Visit::Finished); // retired while queued
+        };
+        stream.queued = false;
+
+        // The four ceilings on one write: our fair-share budget, the credit this
+        // stream has, the credit the whole connection has, and the largest frame
+        // the peer will accept.
+        let budget = SEND_BUDGET
+            .min(stream.send_window.sendable())
+            .min(self.conn_send_window.sendable())
+            .min(self.peer_settings.max_frame_size as usize);
+
+        let pending = stream.pending_send();
+        if pending > 0 && budget == 0 {
+            // Queued octets with nowhere to put them: the stall the milestone is
+            // about.
+            return Ok(Visit::Stalled);
+        }
+
+        let chunk = take_from_queue(&mut stream.send_queue, budget);
+        let drained = stream.send_queue.is_empty();
+        let end_stream = drained && stream.send_end_stream;
+        if chunk.is_empty() && !end_stream {
+            return Ok(Visit::Finished);
+        }
+        // Clear the flag on the visit that actually spends it — not before, or a
+        // body spanning several visits never ends. Leaving it set makes
+        // `has_pending_send` true forever, which re-queues the stream and emits a
+        // second, empty DATA with END_STREAM: a protocol error the peer sees, and
+        // one that hides whenever the request itself carried END_STREAM, because
+        // then the stream is retired before the second visit can happen.
+        if end_stream {
+            stream.send_end_stream = false;
+        }
+
+        let len = chunk.len() as u32;
+        if len > 0 {
+            stream.send_window.consume(len).map_err(|code| {
+                ConnectionError::new(code, "internal: overspent a stream window")
+            })?;
+            self.conn_send_window.consume(len).map_err(|code| {
+                ConnectionError::new(code, "internal: overspent the connection window")
+            })?;
+        }
+
+        self.write_frame(&Frame::Data {
+            stream_id,
+            data: chunk,
+            end_stream,
+        })
+        .await
+        .map_err(io_as_conn_error)?;
+        self.summary.data_bytes_sent += u64::from(len);
+        self.apply_stream_event(
+            stream_id,
+            StreamEvent::SendData { end_stream },
+            "response data",
+        )?;
+
+        let more = self
+            .streams
+            .get_mut(stream_id)
+            .is_some_and(|stream| stream.has_pending_send());
+        Ok(Visit::Wrote { more })
+    }
+
+    /// Emit the RST_STREAMs queued by [`Self::apply_stream_event`], which cannot
+    /// write from inside the state-machine call.
+    async fn flush_pending_resets(&mut self) -> Result<(), ConnectionError> {
+        while let Some(err) = self.pending_reset.pop() {
+            self.write_rst_stream(err.stream, err.code).await?;
+        }
+        Ok(())
+    }
+
+    /// Abort one stream, leaving the connection up (§5.4.2).
+    async fn write_rst_stream(
+        &mut self,
+        stream_id: StreamId,
+        error_code: ErrorCode,
+    ) -> Result<(), ConnectionError> {
+        debug!(stream = stream_id.get(), ?error_code, "resetting stream");
+        self.summary.streams_reset += 1;
+        self.streams.retire(stream_id);
+        self.ready.retain(|id| *id != stream_id);
+        self.write_frame(&Frame::RstStream {
+            stream_id,
+            error_code,
+        })
+        .await
+        .map_err(io_as_conn_error)
     }
 
     /// Acknowledge the peer's SETTINGS (§6.5.3).
@@ -694,9 +1431,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Connection<IO> {
 
     /// Encode `frame` and flush it to the peer.
     ///
-    /// Writes go straight out from the reader task for now; the dedicated writer
-    /// task that serializes the outbound mux arrives with per-stream handlers in
-    /// week 5.
+    /// **This can park.** `write_all` blocks when the socket buffer is full, and
+    /// because the connection is one task, that parks the frame loop and stops us
+    /// reading. For a server that is tolerable — a peer that will not read its
+    /// socket has no claim on being read from — but it is not acceptable for a
+    /// proxy, where a stalled client leg would stall an unrelated upstream one.
+    /// Week 6 splits this into a select over readable *and* writable.
     async fn write_frame(&mut self, frame: &Frame) -> std::io::Result<()> {
         self.write_buf.clear();
         // Failing to encode a frame *we* built is a bug in this crate, not
@@ -763,6 +1503,23 @@ impl std::fmt::Debug for Redacted<'_> {
             }
         }
         list.finish()
+    }
+}
+
+/// Take up to `budget` octets off the front of a send queue.
+///
+/// Zero-copy in the common case (ADR 0007): a chunk that fits whole is moved out
+/// as-is, and one that does not is `split_to`'d, which is a refcount bump rather
+/// than a copy. Coalescing across chunks would need an allocation to gain
+/// nothing — the peer is just as happy with two frames.
+fn take_from_queue(queue: &mut VecDeque<Bytes>, budget: usize) -> Bytes {
+    let Some(front) = queue.front_mut() else {
+        return Bytes::new();
+    };
+    if front.len() <= budget {
+        queue.pop_front().expect("just peeked")
+    } else {
+        front.split_to(budget)
     }
 }
 
@@ -911,6 +1668,28 @@ mod tests {
             .await;
         }
 
+        /// Send our preface and consume everything the server opens with, so a
+        /// test can go straight to the frames it actually cares about.
+        ///
+        /// Three frames, not two: SETTINGS, then the stream-0 WINDOW_UPDATE that
+        /// lifts the connection window off its 64 KiB default (§6.9.1 — SETTINGS
+        /// cannot do it), then the ACK of ours.
+        async fn complete_handshake(&mut self) {
+            self.send_preface().await;
+            assert!(matches!(
+                self.recv().await,
+                Frame::Settings { ack: false, .. }
+            ));
+            assert!(matches!(
+                self.recv().await,
+                Frame::WindowUpdate { stream_id, .. } if stream_id.is_connection()
+            ));
+            assert!(matches!(
+                self.recv().await,
+                Frame::Settings { ack: true, .. }
+            ));
+        }
+
         /// Read one frame, failing the test if none arrives in time.
         async fn recv(&mut self) -> Frame {
             tokio::time::timeout(TIMEOUT, async {
@@ -1005,6 +1784,7 @@ mod tests {
             peer.recv().await,
             Frame::Settings { ack: false, .. }
         ));
+        assert!(matches!(peer.recv().await, Frame::WindowUpdate { .. }));
         assert!(
             matches!(peer.recv().await, Frame::Settings { ack: true, .. }),
             "the server must acknowledge our SETTINGS (§6.5.3)",
@@ -1014,9 +1794,7 @@ mod tests {
     #[tokio::test]
     async fn a_completed_handshake_is_reported() {
         let (mut peer, _tx, handle) = TestPeer::connect();
-        peer.send_preface().await;
-        let _ = peer.recv().await; // server SETTINGS
-        let _ = peer.recv().await; // ACK of ours
+        peer.complete_handshake().await;
         drop(peer);
 
         let summary = tokio::time::timeout(TIMEOUT, handle)
@@ -1036,10 +1814,11 @@ mod tests {
 
         let frames = peer.drain().await;
         assert!(
-            frames
-                .iter()
-                .all(|f| matches!(f, Frame::Settings { ack: false, .. })),
-            "expected only our own preface SETTINGS, got {frames:?}",
+            frames.iter().all(|f| matches!(
+                f,
+                Frame::Settings { ack: false, .. } | Frame::WindowUpdate { .. }
+            )),
+            "expected only our own preface, got {frames:?}",
         );
         let summary = tokio::time::timeout(TIMEOUT, handle)
             .await
@@ -1053,9 +1832,7 @@ mod tests {
     #[tokio::test]
     async fn ping_is_answered_with_an_ack_carrying_the_same_payload() {
         let (mut peer, _tx, _handle) = TestPeer::connect();
-        peer.send_preface().await;
-        let _ = peer.recv().await; // server SETTINGS
-        let _ = peer.recv().await; // ACK of ours
+        peer.complete_handshake().await;
 
         let payload = *b"keepaliv";
         peer.send(&Frame::Ping {
@@ -1077,9 +1854,7 @@ mod tests {
     #[tokio::test]
     async fn a_peer_goaway_closes_the_connection_quietly() {
         let (mut peer, _tx, handle) = TestPeer::connect();
-        peer.send_preface().await;
-        let _ = peer.recv().await;
-        let _ = peer.recv().await;
+        peer.complete_handshake().await;
 
         peer.send(&Frame::GoAway {
             last_stream_id: StreamId::CONNECTION,
@@ -1105,13 +1880,18 @@ mod tests {
     /// must answer with.
     async fn goaway_after(frames: &[Frame]) -> Frame {
         let (mut peer, _tx, _handle) = TestPeer::connect();
-        peer.send_preface().await;
-        let _ = peer.recv().await;
-        let _ = peer.recv().await;
+        peer.complete_handshake().await;
         for frame in frames {
             peer.send(frame).await;
         }
-        peer.recv().await
+        // Skip past anything stream-scoped the setup provoked on the way — the
+        // question here is only which *connection* error comes out.
+        loop {
+            match peer.recv().await {
+                Frame::RstStream { .. } | Frame::Headers { .. } | Frame::Data { .. } => continue,
+                frame => return frame,
+            }
+        }
     }
 
     #[tokio::test]
@@ -1185,20 +1965,20 @@ mod tests {
     async fn a_continuation_may_follow_its_headers() {
         // The other side of the rule above: the legal sequence must survive.
         let (mut peer, _tx, _handle) = TestPeer::connect();
-        peer.send_preface().await;
-        let _ = peer.recv().await;
-        let _ = peer.recv().await;
+        peer.complete_handshake().await;
 
+        // `:method: GET` + `:scheme: http` here, `:path: /` in the continuation:
+        // one request, split so it only validates if the fragments are rejoined.
         peer.send(&Frame::Headers {
             stream_id: StreamId::new(1),
-            block: Bytes::from_static(b"\x82"),
-            end_stream: false,
+            block: Bytes::from_static(b"\x82\x86"),
+            end_stream: true,
             end_headers: false,
         })
         .await;
         peer.send(&Frame::Continuation {
             stream_id: StreamId::new(1),
-            block: Bytes::from_static(b"\x86"),
+            block: Bytes::from_static(b"\x84"),
             end_headers: true,
         })
         .await;
@@ -1209,13 +1989,28 @@ mod tests {
             ack: false,
         })
         .await;
-        assert_eq!(
-            peer.recv().await,
-            Frame::Ping {
-                data: [1; 8],
-                ack: true
-            },
-        );
+
+        let mut saw_response = false;
+        loop {
+            match peer.recv().await {
+                Frame::Headers { stream_id, .. } => {
+                    assert_eq!(stream_id, StreamId::new(1));
+                    saw_response = true;
+                }
+                Frame::Data { .. } => {}
+                frame => {
+                    assert_eq!(
+                        frame,
+                        Frame::Ping {
+                            data: [1; 8],
+                            ack: true
+                        },
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(saw_response, "the rejoined block was a complete request");
     }
 
     #[tokio::test]
@@ -1246,9 +2041,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_frame_produces_a_goaway() {
         let (mut peer, _tx, _handle) = TestPeer::connect();
-        peer.send_preface().await;
-        let _ = peer.recv().await;
-        let _ = peer.recv().await;
+        peer.complete_handshake().await;
 
         // RST_STREAM with a 3-octet payload: a frame-size error (§6.4).
         peer.send_raw(&[0, 0, 3, 0x3, 0, 0, 0, 0, 1, 0, 0, 0]).await;
@@ -1271,9 +2064,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_header_block_is_decoded() {
         let (mut peer, _tx, handle) = TestPeer::connect();
-        peer.send_preface().await;
-        let _ = peer.recv().await; // our SETTINGS
-        let _ = peer.recv().await; // the ACK of theirs
+        peer.complete_handshake().await;
 
         let mut encoder = HpackEncoder::new(Settings::default().header_table_size as usize);
         let mut block = BytesMut::new();
@@ -1310,9 +2101,7 @@ mod tests {
     #[tokio::test]
     async fn a_header_block_split_across_continuation_decodes_once() {
         let (mut peer, _tx, handle) = TestPeer::connect();
-        peer.send_preface().await;
-        let _ = peer.recv().await;
-        let _ = peer.recv().await;
+        peer.complete_handshake().await;
 
         let mut encoder = HpackEncoder::new(Settings::default().header_table_size as usize);
         let mut block = BytesMut::new();
@@ -1381,9 +2170,7 @@ mod tests {
     #[tokio::test]
     async fn an_endless_header_block_is_cut_off() {
         let (mut peer, _tx, _handle) = TestPeer::connect();
-        peer.send_preface().await;
-        let _ = peer.recv().await;
-        let _ = peer.recv().await;
+        peer.complete_handshake().await;
 
         peer.send(&Frame::Headers {
             stream_id: StreamId::new(1),
