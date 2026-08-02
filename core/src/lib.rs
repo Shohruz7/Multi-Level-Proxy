@@ -12,6 +12,7 @@
 //! - [`stream`] — per-stream state machine (RFC 9113 §5.1)
 //! - [`flow`] — connection + stream flow-control windows (RFC 9113 §5.2)
 //! - [`conn`] — per-connection task: demux/mux, SETTINGS, errors (§2.2, §5.4)
+//! - [`service`] — what answers a stream, and §8.3 request validation
 //! - [`pool`] — warm upstream connections and coalescing (design doc §4.3)
 //! - [`lb`] — load-balancer trait and strategies (design doc §5.1)
 //! - [`proxy`] — the request path tying it together (design doc §2.1, §4)
@@ -23,6 +24,7 @@ pub mod hpack;
 pub mod lb;
 pub mod pool;
 pub mod proxy;
+pub mod service;
 pub mod stream;
 
 #[cfg(test)]
