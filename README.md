@@ -97,9 +97,16 @@ Correctness here is not self-reported. The engine is checked in layers:
 - **Property tests** — encode/decode identity, in-order decoding of a frame
   stream, byte-at-a-time reads never mis-parsing, and encoder/decoder tables
   staying in lockstep over arbitrary header sequences.
+- **Property tests over flow control** — that a window never wraps or exceeds
+  2³¹−1, that a closed stream leaves no entry behind, and the one that matters:
+  we never emit more octets than the peer credited, at either level.
 - **Fuzzing** — `cargo-fuzz` targets for the frame parser and the HPACK
   decoder, both fed wholly unconstrained input. The contract is total: any
   input yields `Err`, `Ok(None)` or a frame — never a panic.
+- **Conformance** — [h2spec](https://github.com/summerwind/h2spec)'s RFC 9113
+  suite runs against the live daemon: **146/146**. It earned its place by
+  finding four real defects the suite above did not, including a duplicate
+  END_STREAM that every well-behaved client hides.
 
 ## Goals and non-goals
 
@@ -147,31 +154,45 @@ curl -s http://127.0.0.1:9090/metrics | grep h2proxy_
 Dev loop (needs [`just`](https://github.com/casey/just)): `just dev` runs a local
 h2 backend plus the proxy; `just baseline` captures the no-proxy baseline (see
 [bench/README.md](bench/README.md)). Fuzzing: `just fuzz 60 frame_parser` or
-`just fuzz 60 hpack_decoder`.
+`just fuzz 60 hpack_decoder`. Conformance: `just h2spec` against a running
+daemon (needs `brew install h2spec`).
 
-Connect a real HTTP/2 client and watch a request get decoded to its fields:
+Connect a real HTTP/2 client and get a response:
 
 ```sh
-RUST_LOG=h2proxy_core=debug cargo run -p h2proxyd
-curl -vk --http2 --max-time 3 https://127.0.0.1:8443/
-#   → * ALPN: server accepted h2 ... * using HTTP/2
-#   daemon logs: decoded header block
-#     headers=[:method: GET, :path: /, :authority: 127.0.0.1:8443, ...]
+cargo run -p h2proxyd
+curl -k --http2 https://127.0.0.1:8443/ -o /dev/null -w '%{http_version} %{http_code} %{size_download}\n'
+#   → 2 200 1024
+
+# Ask for an exact response size — the handle the load and flow-control tests use
+curl -k https://127.0.0.1:8443/bytes/1000000 -o /dev/null -w '%{size_download}\n'
+#   → 1000000
+```
+
+Many streams at once, and the flow-control evidence:
+
+```sh
+h2load -n 10000 -c 10 -m 100 https://127.0.0.1:8443/
+#   → 10000 succeeded, 0 failed
+curl -s http://127.0.0.1:9090/metrics | grep -E 'concurrency|stalls'
+#   → h2proxy_stream_concurrency_max 100
+#   → h2proxy_flow_control_stalls_total 269      ← backpressure, actually engaging
 ```
 
 ## Current state
 
-The client-facing half of the engine is built and tested: TLS 1.3 with ALPN,
-the connection preface and SETTINGS handshake, the full frame codec, HPACK, and
-the connection-control frames (SETTINGS, PING, GOAWAY) with the GOAWAY error
-path. A request is accepted, decompressed and understood down to its individual
-header fields.
+The client-facing half of the engine is built and tested, and it is a working
+HTTP/2 server: TLS 1.3 with ALPN, the preface and SETTINGS handshake, the full
+frame codec, HPACK, the stream lifecycle with its ID and concurrency rules, and
+two-level flow control with fair outbound interleaving. Hundreds of streams run
+concurrently on one connection, and a sender that exhausts its window
+demonstrably stops and resumes on `WINDOW_UPDATE`. It passes h2spec 146/146.
 
-It does not forward traffic yet. Per-stream demultiplexing and responses, flow
-control, the upstream pool and load balancer, and the backpressure bridge are
-the remaining work — so a request currently establishes, decodes, and then
-waits. The modules for each are in place with their types and contracts
-defined.
+**It does not forward traffic yet.** Requests are answered by a built-in
+responder standing in for the real request path. The upstream pool, the load
+balancer, and the backpressure bridge that couples the two connections' windows
+are the remaining work; the modules for each are in place with their types and
+contracts defined.
 
 ## License
 
