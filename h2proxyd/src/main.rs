@@ -5,19 +5,20 @@
 //! Errors here are `anyhow` — "log and exit", never "pick a frame to send"
 //! (ADR 0008).
 //!
-//! Current milestone (week 2): terminate TLS 1.3, negotiate ALPN to `h2`, and
-//! hand the byte stream to the protocol engine's connection skeleton
-//! ([`h2proxy_core::conn::Connection`]). The engine reads the connection and
-//! drains cleanly on shutdown or EOF; frame parsing plugs into its reader loop
-//! in week 5. The accept loop and graceful-shutdown drain (the §2.2 skeleton)
-//! give that engine a stable lifecycle to slot into.
+//! Current milestone (week 5): terminate TLS 1.3, negotiate ALPN to `h2`, and
+//! hand the byte stream to the protocol engine
+//! ([`h2proxy_core::conn::Connection`]), which now multiplexes streams and
+//! answers them from a [`Echo`] responder — a working HTTP/2 server. Week 6
+//! swaps that responder for the proxy, at which point the daemon stops serving
+//! its own bodies and starts forwarding.
 
 mod tls;
 
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use h2proxy_core::conn::Connection;
+use h2proxy_core::conn::{Connection, Settings};
+use h2proxy_core::service::Echo;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
@@ -86,8 +87,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Terminate TLS for one accepted connection, confirm ALPN negotiated `h2`, and
-/// hand the byte stream to the protocol engine ([`Connection`]). Week 2 wires
-/// the lifecycle; the engine's frame handling lands in week 5.
+/// hand the byte stream to the protocol engine ([`Connection`]), which owns it
+/// until the peer closes or the drain signal fires.
 async fn handle_connection(
     acceptor: TlsAcceptor,
     stream: TcpStream,
@@ -129,10 +130,17 @@ async fn handle_connection(
         }
     }
 
-    // Hand off to the protocol engine: it runs the preface + SETTINGS handshake
-    // and the frame loop. Per-stream dispatch (and therefore responses) lands in
-    // week 5, so a request currently establishes and then waits.
-    let summary = Connection::new(tls_stream, shutdown).run().await;
+    // Hand off to the protocol engine: preface + SETTINGS, then the frame loop,
+    // the stream table, and the outbound scheduler. Requests are answered by the
+    // built-in responder until week 6 swaps in the proxy.
+    let summary = Connection::with_service(
+        tls_stream,
+        shutdown,
+        Settings::server(),
+        Echo::new(default_body_size()),
+    )
+    .run()
+    .await;
 
     // The engine reports; the binary instruments (so `h2proxy-core` stays free
     // of the metrics dependency).
@@ -142,13 +150,35 @@ async fn handle_connection(
     metrics::counter!("h2proxy_frames_received_total").increment(summary.frames_received);
     metrics::counter!("h2proxy_header_blocks_decoded_total")
         .increment(summary.header_blocks_decoded);
+    metrics::counter!("h2proxy_streams_opened_total").increment(summary.streams_opened);
+    metrics::counter!("h2proxy_streams_reset_total").increment(summary.streams_reset);
+    metrics::counter!("h2proxy_data_bytes_sent_total").increment(summary.data_bytes_sent);
+    metrics::counter!("h2proxy_flow_control_stalls_total").increment(summary.flow_control_stalls);
+    metrics::gauge!("h2proxy_stream_concurrency_max")
+        .set(f64::from(summary.peak_concurrent_streams));
     info!(
         %peer,
         handshake = summary.handshake_completed,
         frames = summary.frames_received,
         header_blocks = summary.header_blocks_decoded,
+        streams = summary.streams_opened,
+        resets = summary.streams_reset,
+        peak_streams = summary.peak_concurrent_streams,
+        data_bytes = summary.data_bytes_sent,
+        stalls = summary.flow_control_stalls,
         "connection closed",
     );
+}
+
+/// Body size the built-in responder returns for a request that does not ask for
+/// a specific one, via `H2PROXYD_BODY_SIZE`. Mirrors the `backend` crate's
+/// `BACKEND_BODY_SIZE`, so a benchmark profile can size both ends the same way
+/// without a rebuild.
+fn default_body_size() -> usize {
+    std::env::var("H2PROXYD_BODY_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024)
 }
 
 /// Resolve when the process is asked to stop: SIGTERM (container stop) or
@@ -215,6 +245,26 @@ fn init_metrics() {
         "h2proxy_header_blocks_decoded_total",
         "Complete HPACK header blocks decoded from clients"
     );
+    metrics::describe_counter!("h2proxy_streams_opened_total", "Client streams opened");
+    metrics::describe_counter!(
+        "h2proxy_streams_reset_total",
+        "Streams aborted with RST_STREAM, in either direction"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_stream_concurrency_max",
+        "Most streams live at once on a single connection"
+    );
+    metrics::describe_counter!(
+        "h2proxy_data_bytes_sent_total",
+        "DATA payload octets written to clients"
+    );
+    // The interesting one: a nonzero stall count under load is the observable
+    // proof that flow control is doing something rather than being nominally
+    // present.
+    metrics::describe_counter!(
+        "h2proxy_flow_control_stalls_total",
+        "Times the outbound scheduler had octets queued but no window to send them in"
+    );
     // Seed each series at zero so a scrape returns them before any traffic.
     metrics::gauge!("h2proxy_active_streams").set(0.0);
     metrics::counter!("h2proxy_requests_total").increment(0);
@@ -222,6 +272,11 @@ fn init_metrics() {
     metrics::counter!("h2proxy_handshakes_total").increment(0);
     metrics::counter!("h2proxy_frames_received_total").increment(0);
     metrics::counter!("h2proxy_header_blocks_decoded_total").increment(0);
+    metrics::counter!("h2proxy_streams_opened_total").increment(0);
+    metrics::counter!("h2proxy_streams_reset_total").increment(0);
+    metrics::gauge!("h2proxy_stream_concurrency_max").set(0.0);
+    metrics::counter!("h2proxy_data_bytes_sent_total").increment(0);
+    metrics::counter!("h2proxy_flow_control_stalls_total").increment(0);
 
     info!(%addr, "metrics exporter listening at /metrics");
 }
