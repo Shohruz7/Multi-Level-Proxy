@@ -5,19 +5,25 @@
 //! Errors here are `anyhow` — "log and exit", never "pick a frame to send"
 //! (ADR 0008).
 //!
-//! Current milestone (week 5): terminate TLS 1.3, negotiate ALPN to `h2`, and
+//! Current milestone (week 6): terminate TLS 1.3, negotiate ALPN to `h2`, and
 //! hand the byte stream to the protocol engine
-//! ([`h2proxy_core::conn::Connection`]), which now multiplexes streams and
-//! answers them from a [`Echo`] responder — a working HTTP/2 server. Week 6
-//! swaps that responder for the proxy, at which point the daemon stops serving
-//! its own bodies and starts forwarding.
+//! ([`h2proxy_core::conn::Connection`]), which multiplexes streams and answers
+//! them from a [`Proxy`] — forwarding each one to a pooled h2c connection to a
+//! backend. With no backends configured it falls back to the built-in [`Echo`]
+//! responder, which is what keeps the week-5 server (and its `h2load` targets
+//! and h2spec run) available without a rebuild.
 
 mod tls;
 
 use std::net::SocketAddr;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::Context;
 use h2proxy_core::conn::{Connection, Settings};
+use h2proxy_core::lb::Backend;
+use h2proxy_core::proxy::{Proxy, Shared};
 use h2proxy_core::service::Echo;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -42,6 +48,24 @@ async fn main() -> anyhow::Result<()> {
         .context("parsing H2PROXYD_LISTEN as a socket address")?;
 
     let acceptor = TlsAcceptor::from(tls::server_config()?);
+
+    // With backends configured the daemon is a proxy; without them it is the
+    // week-5 server. Keeping both is what lets `h2spec` and the `h2load`
+    // baselines run against the engine alone, with no backend in the numbers.
+    let backends = upstreams()?;
+    let proxy = if backends.is_empty() {
+        info!("no H2PROXYD_UPSTREAMS configured; answering from the built-in responder");
+        None
+    } else {
+        info!(
+            upstreams = ?backends.iter().map(|b| b.addr).collect::<Vec<_>>(),
+            "proxying to backends over h2c",
+        );
+        Some(Shared::new(backends, max_conns_per_backend()))
+    };
+    if let Some(shared) = &proxy {
+        spawn_stats_sampler(Arc::clone(shared));
+    }
 
     let listener = TcpListener::bind(listen)
         .await
@@ -74,7 +98,8 @@ async fn main() -> anyhow::Result<()> {
 
                 let acceptor = acceptor.clone();
                 let shutdown = shutdown_tx.subscribe();
-                conns.spawn(handle_connection(acceptor, stream, peer, shutdown));
+                let proxy = proxy.clone();
+                conns.spawn(handle_connection(acceptor, stream, peer, shutdown, proxy));
             }
         }
     }
@@ -94,6 +119,7 @@ async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
     mut shutdown: broadcast::Receiver<()>,
+    proxy: Option<Arc<Shared>>,
 ) {
     // Race the handshake against shutdown so a stalled TLS negotiation can't
     // hold the drain open.
@@ -131,16 +157,27 @@ async fn handle_connection(
     }
 
     // Hand off to the protocol engine: preface + SETTINGS, then the frame loop,
-    // the stream table, and the outbound scheduler. Requests are answered by the
-    // built-in responder until week 6 swaps in the proxy.
-    let summary = Connection::with_service(
-        tls_stream,
-        shutdown,
-        Settings::server(),
-        Echo::new(default_body_size()),
-    )
-    .run()
-    .await;
+    // the stream table, and the outbound scheduler. What answers the requests is
+    // the one thing that changes between the two modes — the engine cannot tell
+    // the difference, which is the whole point of the `Service` seam.
+    let settings = Settings::server();
+    let summary = match proxy {
+        Some(shared) => {
+            Connection::with_service(tls_stream, shutdown, settings, Proxy::new(shared))
+                .run()
+                .await
+        }
+        None => {
+            Connection::with_service(
+                tls_stream,
+                shutdown,
+                settings,
+                Echo::new(default_body_size()),
+            )
+            .run()
+            .await
+        }
+    };
 
     // The engine reports; the binary instruments (so `h2proxy-core` stays free
     // of the metrics dependency).
@@ -151,6 +188,7 @@ async fn handle_connection(
     metrics::counter!("h2proxy_header_blocks_decoded_total")
         .increment(summary.header_blocks_decoded);
     metrics::counter!("h2proxy_streams_opened_total").increment(summary.streams_opened);
+    metrics::counter!("h2proxy_requests_total").increment(summary.requests_dispatched);
     metrics::counter!("h2proxy_streams_reset_total").increment(summary.streams_reset);
     metrics::counter!("h2proxy_data_bytes_sent_total").increment(summary.data_bytes_sent);
     metrics::counter!("h2proxy_flow_control_stalls_total").increment(summary.flow_control_stalls);
@@ -168,6 +206,64 @@ async fn handle_connection(
         stalls = summary.flow_control_stalls,
         "connection closed",
     );
+}
+
+/// The backends to proxy to, from `H2PROXYD_UPSTREAMS` — a comma-separated list
+/// of `host:port`. Empty (or unset) keeps the built-in responder.
+///
+/// Static configuration on purpose: a dynamic control plane is a stated non-goal
+/// (see the README), and resolving names at startup would hide a backend that
+/// moved behind a cache with no TTL anyone chose.
+fn upstreams() -> anyhow::Result<Vec<Backend>> {
+    let raw = std::env::var("H2PROXYD_UPSTREAMS").unwrap_or_default();
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .parse::<SocketAddr>()
+                .map(Backend::new)
+                .with_context(|| format!("parsing upstream {entry:?} as a socket address"))
+        })
+        .collect()
+}
+
+/// How many connections the pool may open to a single backend, via
+/// `H2PROXYD_MAX_UPSTREAM_CONNS`.
+///
+/// A ceiling, not a target: the pool fills one connection before opening
+/// another, so a backend advertising a generous `MAX_CONCURRENT_STREAMS` stays
+/// at one however many clients arrive. That collapse is the number to watch in
+/// `h2proxy_upstream_pool_connections`.
+fn max_conns_per_backend() -> usize {
+    std::env::var("H2PROXYD_MAX_UPSTREAM_CONNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
+/// Publish the proxy's live counters once a second.
+///
+/// Sampled rather than reported at connection close, because upstream
+/// connections are long-lived by design: a pool that is working correctly might
+/// not close a connection for hours, and a gauge that only moves on teardown
+/// would read zero through an entire load test.
+fn spawn_stats_sampler(shared: Arc<Shared>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let stats = &shared.stats;
+            metrics::gauge!("h2proxy_upstream_pool_connections")
+                .set(stats.upstream_connections() as f64);
+            metrics::gauge!("h2proxy_upstream_streams_active").set(stats.upstream_streams() as f64);
+            metrics::gauge!("h2proxy_bridge_buffered_bytes").set(stats.buffered() as f64);
+            metrics::gauge!("h2proxy_bridge_buffered_bytes_peak").set(stats.peak_buffered() as f64);
+            metrics::gauge!("h2proxy_upstream_connects_total").set(stats.connects() as f64);
+            metrics::gauge!("h2proxy_upstream_connect_failures_total")
+                .set(stats.connect_failures() as f64);
+        }
+    });
 }
 
 /// Body size the built-in responder returns for a request that does not ask for
@@ -233,6 +329,31 @@ fn init_metrics() {
         "h2proxy_upstream_pool_connections",
         "Warm upstream connections in the pool"
     );
+    metrics::describe_gauge!(
+        "h2proxy_upstream_streams_active",
+        "Streams currently in flight to backends"
+    );
+    // The bounded-memory claim, as a number you can watch: response octets held
+    // between a backend and a client because the client has not taken them yet.
+    // Under a fast-upstream/slow-client mismatch this stays flat at roughly one
+    // connection window per upstream connection instead of tracking the
+    // response size (§4.2, ADR 0016).
+    metrics::describe_gauge!(
+        "h2proxy_bridge_buffered_bytes",
+        "Response octets received from backends but not yet delivered to clients"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_bridge_buffered_bytes_peak",
+        "High-water mark of h2proxy_bridge_buffered_bytes"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_upstream_connects_total",
+        "Upstream connections attempted"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_upstream_connect_failures_total",
+        "Upstream connections that failed to establish"
+    );
     metrics::describe_counter!(
         "h2proxy_handshakes_total",
         "Connections that completed the preface + SETTINGS exchange"
@@ -269,6 +390,11 @@ fn init_metrics() {
     metrics::gauge!("h2proxy_active_streams").set(0.0);
     metrics::counter!("h2proxy_requests_total").increment(0);
     metrics::gauge!("h2proxy_upstream_pool_connections").set(0.0);
+    metrics::gauge!("h2proxy_upstream_streams_active").set(0.0);
+    metrics::gauge!("h2proxy_bridge_buffered_bytes").set(0.0);
+    metrics::gauge!("h2proxy_bridge_buffered_bytes_peak").set(0.0);
+    metrics::gauge!("h2proxy_upstream_connects_total").set(0.0);
+    metrics::gauge!("h2proxy_upstream_connect_failures_total").set(0.0);
     metrics::counter!("h2proxy_handshakes_total").increment(0);
     metrics::counter!("h2proxy_frames_received_total").increment(0);
     metrics::counter!("h2proxy_header_blocks_decoded_total").increment(0);
