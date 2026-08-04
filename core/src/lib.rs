@@ -13,6 +13,7 @@
 //! - [`flow`] — connection + stream flow-control windows (RFC 9113 §5.2)
 //! - [`conn`] — per-connection task: demux/mux, SETTINGS, errors (§2.2, §5.4)
 //! - [`service`] — what answers a stream, and §8.3 request validation
+//! - [`upstream`] — the client-role engine: one connection to a backend (§4.3)
 //! - [`pool`] — warm upstream connections and coalescing (design doc §4.3)
 //! - [`lb`] — load-balancer trait and strategies (design doc §5.1)
 //! - [`proxy`] — the request path tying it together (design doc §2.1, §4)
@@ -26,6 +27,7 @@ pub mod pool;
 pub mod proxy;
 pub mod service;
 pub mod stream;
+pub mod upstream;
 
 #[cfg(test)]
 mod tests {
