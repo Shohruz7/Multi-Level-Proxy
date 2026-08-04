@@ -42,7 +42,11 @@ The parts that carry the weight:
 - **Backpressure bridging** — the centerpiece. The proxy withholds the
   upstream's `WINDOW_UPDATE` until bytes have drained to the client, so a slow
   client transitively throttles a fast upstream and proxy memory stays bounded
-  under any speed mismatch.
+  under any speed mismatch. Nothing is buffered and nothing blocks: credit is
+  relayed, so the bound is the *window* (1 MiB) rather than the response size.
+- **Coalescing** — a shared pool behind every client connection. Twenty client
+  connections carrying 400 streams land on a handful of upstream connections,
+  and the stream-id remapping between the two id spaces is the pool's job.
 - **Resilience** — connection pooling and coalescing, load balancing by
   least-outstanding-streams, health checking with outlier ejection, and
   mitigations for the HTTP/2 abuse patterns (Rapid Reset, control-frame and
@@ -103,10 +107,21 @@ Correctness here is not self-reported. The engine is checked in layers:
 - **Fuzzing** — `cargo-fuzz` targets for the frame parser and the HPACK
   decoder, both fed wholly unconstrained input. The contract is total: any
   input yields `Err`, `Ok(None)` or a frame — never a panic.
+- **Differential tests in both roles** — the `h2` crate is the oracle on each
+  side: a real `h2` client runs against our server engine, and a real
+  `h2::server` runs against our hand-built *client* engine. A session only
+  progresses if the frames we synthesize are ones a mature implementation
+  accepts.
+- **A bounded-memory test** — a backend producing 64 MiB against a client
+  reading a few KB at a time, asserting that the octets held between them stay
+  under one connection window *and* that the backend provably stopped. Both
+  halves matter: flat memory alone would also describe a proxy that dropped data.
 - **Conformance** — [h2spec](https://github.com/summerwind/h2spec)'s RFC 9113
-  suite runs against the live daemon: **146/146**. It earned its place by
-  finding four real defects the suite above did not, including a duplicate
-  END_STREAM that every well-behaved client hides.
+  suite runs against the live daemon: **146/146, with and without the proxy path
+  in front of a real backend**. It earned its place by finding six real defects
+  the suites above did not, including a duplicate END_STREAM that every
+  well-behaved client hides, and a second field section being read as trailers
+  before the state machine was asked whether the peer could still send.
 
 ## Goals and non-goals
 
@@ -124,7 +139,9 @@ Correctness here is not self-reported. The engine is checked in layers:
 
 ```
 core/        h2proxy-core — the hand-built protocol engine (library)
-  frame  hpack  stream  flow  conn  pool  lb  proxy   (one module per concern)
+  frame  hpack  stream  flow          the protocol primitives
+  conn  upstream                      the two connection engines: server, client
+  service  proxy  pool  lb            what answers a stream, and where it goes
 h2proxyd/    the reverse-proxy daemon (binary): TLS, sockets, config, signals
 backend/     a tiny hyper h2c upstream, for the local dev loop and baselines
 bench/       load-test harness (h2load) and the committed reference baseline
@@ -152,47 +169,60 @@ curl -s http://127.0.0.1:9090/metrics | grep h2proxy_
 ```
 
 Dev loop (needs [`just`](https://github.com/casey/just)): `just dev` runs a local
-h2 backend plus the proxy; `just baseline` captures the no-proxy baseline (see
+h2c backend *and* the proxy wired to it — the full client → proxy → backend path.
+`just run-server` runs the engine with no backends, answering from its built-in
+responder. `just baseline` captures the no-proxy baseline (see
 [bench/README.md](bench/README.md)). Fuzzing: `just fuzz 60 frame_parser` or
-`just fuzz 60 hpack_decoder`. Conformance: `just h2spec` against a running
-daemon (needs `brew install h2spec`).
+`just fuzz 60 hpack_decoder`. Conformance: `just h2spec` (server) or
+`just h2spec-proxy` (through the proxy); needs `brew install h2spec`.
 
-Connect a real HTTP/2 client and get a response:
-
-```sh
-cargo run -p h2proxyd
-curl -k --http2 https://127.0.0.1:8443/ -o /dev/null -w '%{http_version} %{http_code} %{size_download}\n'
-#   → 2 200 1024
-
-# Ask for an exact response size — the handle the load and flow-control tests use
-curl -k https://127.0.0.1:8443/bytes/1000000 -o /dev/null -w '%{size_download}\n'
-#   → 1000000
-```
-
-Many streams at once, and the flow-control evidence:
+Proxy a request to a real backend:
 
 ```sh
-h2load -n 10000 -c 10 -m 100 https://127.0.0.1:8443/
-#   → 10000 succeeded, 0 failed
-curl -s http://127.0.0.1:9090/metrics | grep -E 'concurrency|stalls'
-#   → h2proxy_stream_concurrency_max 100
-#   → h2proxy_flow_control_stalls_total 269      ← backpressure, actually engaging
+just dev    # backend on :8080, proxy on :8443 forwarding to it
+
+curl -k --http2 https://127.0.0.1:8443/bytes/100000 -o /dev/null \
+  -w '%{http_version} %{http_code} %{size_download}\n'
+#   → 2 200 100000        ← served by the backend, through the proxy
 ```
+
+Many streams, and the coalescing evidence:
+
+```sh
+h2load -n 20000 -c 50 -m 20 https://127.0.0.1:8443/
+#   → 20000 succeeded, 0 failed
+
+curl -s http://127.0.0.1:9090/metrics | grep -E 'upstream_|bridge_'
+#   → h2proxy_upstream_pool_connections 8        ← 50 client connections in
+#   → h2proxy_upstream_streams_active 0
+#   → h2proxy_bridge_buffered_bytes_peak 3072    ← the bridge is holding ~nothing
+```
+
+The bounded-memory claim, watched live: run a slow client against a large
+response and `h2proxy_bridge_buffered_bytes` stays flat near one connection
+window while the transfer runs, instead of tracking the response size.
 
 ## Current state
 
-The client-facing half of the engine is built and tested, and it is a working
-HTTP/2 server: TLS 1.3 with ALPN, the preface and SETTINGS handshake, the full
-frame codec, HPACK, the stream lifecycle with its ID and concurrency rules, and
-two-level flow control with fair outbound interleaving. Hundreds of streams run
-concurrently on one connection, and a sender that exhausts its window
-demonstrably stops and resumes on `WINDOW_UPDATE`. It passes h2spec 146/146.
+**It is a proxy.** Both halves of the engine are hand-built and tested: the
+server side that faces clients, and the client side that faces backends. A
+request arrives over TLS, is decoded and validated, forwarded over a pooled h2c
+connection to a backend, and the response is streamed back — with the two
+connections' flow-control windows coupled so that neither peer can outrun the
+other into this process's memory.
 
-**It does not forward traffic yet.** Requests are answered by a built-in
-responder standing in for the real request path. The upstream pool, the load
-balancer, and the backpressure bridge that couples the two connections' windows
-are the remaining work; the modules for each are in place with their types and
-contracts defined.
+What works and is covered by tests: TLS 1.3 + ALPN, the full frame codec, HPACK
+in both directions with independent dynamic tables, the stream lifecycle,
+two-level flow control with fair interleaving, the upstream connection pool with
+coalescing and stream-id remapping, least-outstanding-streams load balancing,
+trailers across both legs, and the backpressure bridge. h2spec passes 146/146
+both as a plain server and with the proxy path in front of a real backend.
+
+Still to come: **week 7** — graceful GOAWAY drain, health checking with outlier
+ejection, idempotent retries, and the §6 abuse mitigations (Rapid Reset,
+control-frame and empty-frame floods). **Week 8** — the CDK stack, the deployed
+load test, and the tuning pass that turns the reasoned window sizes into
+measured ones.
 
 ## License
 
