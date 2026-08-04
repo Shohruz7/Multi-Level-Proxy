@@ -33,6 +33,11 @@ use crate::flow::{RecvWindow, Window};
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct StreamId(u32);
 
+/// The last odd id an initiator can use before the 31-bit space runs out
+/// (§5.1.1). A connection that reaches it is retired and replaced rather than
+/// wrapped: ids are never reused, so there is nothing else to do.
+pub const MAX_LOCAL_STREAM_ID: u32 = 0x7fff_ffff;
+
 impl StreamId {
     /// The connection control stream (SETTINGS, PING, GOAWAY, and
     /// connection-level WINDOW_UPDATE all ride stream 0).
@@ -186,6 +191,13 @@ pub struct Stream {
     pub send_queue: VecDeque<Bytes>,
     /// Whether END_STREAM rides the last chunk in `send_queue`.
     pub send_end_stream: bool,
+    /// A trailer section to send once the body has drained (§8.1).
+    ///
+    /// It cannot go out when it arrives: trailers come *after* the body by
+    /// definition, and the body may still be sitting in `send_queue` waiting on
+    /// a window. While this is set, END_STREAM belongs to the trailers rather
+    /// than to the last DATA frame.
+    pub pending_trailers: Option<Vec<crate::hpack::Header>>,
     /// Whether this stream is already in the connection's round-robin ring.
     /// Keeps a stream from being enqueued twice by two chunks arriving back to
     /// back.
@@ -195,6 +207,16 @@ pub struct Stream {
     /// message, which cannot be judged until the body ends.
     pub content_length: Option<u64>,
     pub data_received: u64,
+    /// Octets recorded against the **connection** receive window that have not
+    /// been released yet — the credit this stream is currently holding hostage
+    /// on behalf of the whole connection (§4.2).
+    ///
+    /// It exists because the bridge defers `release`, and deferred credit for a
+    /// stream that then dies would never come back: the connection window would
+    /// shrink a little on every abandoned transfer until throughput quietly
+    /// stopped. [`StreamTable::retire`] cannot return it (it has no access to
+    /// the connection window), so the caller drains this on the way out.
+    pub pending_conn_release: u32,
 }
 
 impl Stream {
@@ -205,9 +227,11 @@ impl Stream {
             recv_window: RecvWindow::new(recv_window),
             send_queue: VecDeque::new(),
             send_end_stream: false,
+            pending_trailers: None,
             queued: false,
             content_length: None,
             data_received: 0,
+            pending_conn_release: 0,
         }
     }
 
@@ -223,10 +247,10 @@ impl Stream {
         self.send_queue.iter().map(Bytes::len).sum()
     }
 
-    /// Is there anything the scheduler could write for this stream — either body
-    /// octets or a bare END_STREAM to close it out?
+    /// Is there anything the scheduler could write for this stream — body
+    /// octets, a trailer section, or a bare END_STREAM to close it out?
     pub fn has_pending_send(&self) -> bool {
-        !self.send_queue.is_empty() || self.send_end_stream
+        !self.send_queue.is_empty() || self.send_end_stream || self.pending_trailers.is_some()
     }
 }
 
@@ -261,6 +285,13 @@ pub enum Lookup<'a> {
     Idle,
 }
 
+impl Lookup<'_> {
+    /// Whether this id was never opened at all.
+    pub fn is_idle(&self) -> bool {
+        matches!(self, Lookup::Idle)
+    }
+}
+
 /// Every live stream on one connection, plus the §5.1.1 / §5.1.2 rules that no
 /// individual stream can enforce.
 ///
@@ -272,8 +303,13 @@ pub enum Lookup<'a> {
 #[derive(Debug)]
 pub struct StreamTable {
     live: HashMap<StreamId, Stream>,
-    /// Highest client-initiated id seen, for the ordering rule and for GOAWAY.
+    /// Highest peer-initiated id seen, for the ordering rule and for GOAWAY.
     highest_peer_id: StreamId,
+    /// Highest id *we* opened. Only the upstream (client-role) side uses this:
+    /// there we are the initiator, so the §5.1.1 ordering rule applies to our own
+    /// ids and the peer's `MAX_CONCURRENT_STREAMS` is a budget we obey rather
+    /// than one we impose.
+    highest_local_id: StreamId,
     /// How many streams may be open or half-closed at once (§5.1.2).
     max_concurrent: u32,
     /// Initial send window for a new stream — the peer's `INITIAL_WINDOW_SIZE`.
@@ -283,6 +319,8 @@ pub struct StreamTable {
     /// The high-water mark, for the daemon's metrics.
     peak_concurrent: u32,
     opened: u64,
+    /// Connection-level receive credit owed back by retired streams.
+    reclaimed: u32,
 }
 
 impl StreamTable {
@@ -290,11 +328,13 @@ impl StreamTable {
         StreamTable {
             live: HashMap::new(),
             highest_peer_id: StreamId::CONNECTION,
+            highest_local_id: StreamId::CONNECTION,
             max_concurrent,
             initial_send_window,
             initial_recv_window,
             peak_concurrent: 0,
             opened: 0,
+            reclaimed: 0,
         }
     }
 
@@ -317,6 +357,22 @@ impl StreamTable {
     /// Highest client-initiated id seen — GOAWAY's `last_stream_id` (§6.8).
     pub const fn highest_peer_id(&self) -> StreamId {
         self.highest_peer_id
+    }
+
+    /// Highest id we opened ourselves (upstream side only).
+    pub const fn highest_local_id(&self) -> StreamId {
+        self.highest_local_id
+    }
+
+    /// Whether another local stream may be opened: the peer's
+    /// `MAX_CONCURRENT_STREAMS` is not met and the id space is not exhausted.
+    ///
+    /// The pool asks this before leasing, which is why it is separate from
+    /// [`Self::open_local`] — the decision happens in the pool's task, the open
+    /// happens in the connection's.
+    pub fn can_open_local(&self) -> bool {
+        (self.live.len() as u64) < u64::from(self.max_concurrent)
+            && self.highest_local_id.get() < MAX_LOCAL_STREAM_ID
     }
 
     /// Admit a new peer-initiated stream, enforcing the id and concurrency
@@ -350,12 +406,56 @@ impl StreamTable {
         Ok(self.live.get_mut(&id).expect("just inserted"))
     }
 
+    /// Admit a stream *we* are opening (the upstream/client role).
+    ///
+    /// The mirror of [`Self::open_peer`], and the differences are the whole
+    /// reason it is a separate function rather than a flag: the id must be odd
+    /// because *we* are the client here, the ordering rule applies to our own
+    /// high-water mark, and exceeding the concurrency budget is our bug rather
+    /// than a peer violation — so it returns `Refused` for the pool to handle by
+    /// opening another connection, never a `Protocol` rejection.
+    pub fn open_local(&mut self, id: StreamId) -> Result<&mut Stream, OpenRejection> {
+        if !id.is_client_initiated() {
+            return Err(OpenRejection::Protocol(
+                "a client may only open odd-numbered streams",
+            ));
+        }
+        if id <= self.highest_local_id {
+            return Err(OpenRejection::Protocol("stream ids must strictly increase"));
+        }
+        if self.live.len() as u64 >= u64::from(self.max_concurrent) {
+            return Err(OpenRejection::Refused);
+        }
+
+        self.highest_local_id = id;
+        self.opened += 1;
+        let stream = Stream::new(self.initial_send_window, self.initial_recv_window);
+        self.live.insert(id, stream);
+        self.peak_concurrent = self.peak_concurrent.max(self.live.len() as u32);
+        Ok(self.live.get_mut(&id).expect("just inserted"))
+    }
+
+    /// Update the concurrency budget from the peer's SETTINGS (§6.5.2).
+    ///
+    /// Only meaningful on the upstream side, where the limit is one we obey. A
+    /// decrease below the number of live streams is legal and is *not*
+    /// retroactive — the RFC forbids opening new streams, not finishing open
+    /// ones.
+    pub fn set_max_concurrent(&mut self, max: u32) {
+        self.max_concurrent = max;
+    }
+
     /// Resolve a frame's stream id against the table.
+    ///
+    /// The "closed vs idle" split works from either role: a frame's id is at or
+    /// below whichever high-water mark could have produced it, and taking the
+    /// larger of the two is right because only one of them is ever nonzero on a
+    /// given connection.
     pub fn lookup(&mut self, id: StreamId) -> Lookup<'_> {
         // Borrowck: decide the branch before taking the mutable borrow.
         if self.live.contains_key(&id) {
             Lookup::Live(self.live.get_mut(&id).expect("just checked"))
-        } else if id <= self.highest_peer_id {
+        } else if id <= self.highest_peer_id.max(self.highest_local_id) {
             Lookup::Closed
         } else {
             Lookup::Idle
@@ -375,7 +475,7 @@ impl StreamTable {
         let Some(stream) = self.live.get_mut(&id) else {
             // No live entry: idle streams are a protocol error, already-closed
             // ones are the in-flight grace period.
-            return if id <= self.highest_peer_id {
+            return if id <= self.highest_peer_id.max(self.highest_local_id) {
                 Err(StreamError::new(id, ErrorCode::StreamClosed))
             } else {
                 Err(StreamError::new(id, ErrorCode::ProtocolError))
@@ -395,8 +495,22 @@ impl StreamTable {
 
     /// Drop a finished stream. Idempotent — a stream can be retired by
     /// END_STREAM and then again by a crossing RST_STREAM.
+    ///
+    /// Any connection-level credit the stream was still holding is moved to
+    /// [`Self::take_reclaimed`] rather than dropped with the entry. Forgetting
+    /// that is a leak with no symptom until the connection is old.
     pub fn retire(&mut self, id: StreamId) {
-        self.live.remove(&id);
+        if let Some(stream) = self.live.remove(&id) {
+            self.reclaimed = self.reclaimed.saturating_add(stream.pending_conn_release);
+        }
+    }
+
+    /// Connection-level credit owed back by streams that have been retired.
+    ///
+    /// Drained by the connection loop, which is the only thing that owns the
+    /// connection window and can turn it into a WINDOW_UPDATE.
+    pub fn take_reclaimed(&mut self) -> u32 {
+        std::mem::take(&mut self.reclaimed)
     }
 
     /// Fan a change in the peer's `INITIAL_WINDOW_SIZE` across every live
