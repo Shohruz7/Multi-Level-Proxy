@@ -53,9 +53,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         tokio::spawn(async move {
-            let service = service_fn(move |_req: Request<Incoming>| {
+            let service = service_fn(move |req: Request<Incoming>| {
                 let body = body.clone();
-                async move { Ok::<_, Infallible>(Response::new(Full::new(body))) }
+                async move {
+                    // `/bytes/<n>` mirrors the proxy's own built-in responder,
+                    // so a test or a benchmark profile can name the response
+                    // size in the URL instead of restarting the backend. The
+                    // backpressure test needs exactly this: a response far
+                    // larger than any window, produced on demand.
+                    let body = match sized_path(req.uri().path()) {
+                        Some(n) => Bytes::from(vec![b'x'; n]),
+                        None => body,
+                    };
+                    Ok::<_, Infallible>(Response::new(Full::new(body)))
+                }
             });
             if let Err(e) = builder
                 .serve_connection(TokioIo::new(stream), service)
@@ -65,6 +76,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
     }
+}
+
+/// Parse `/bytes/<n>`, capped so a stray URL cannot ask this process to
+/// allocate the machine.
+fn sized_path(path: &str) -> Option<usize> {
+    const MAX: usize = 256 * 1024 * 1024;
+    let rest = path.strip_prefix("/bytes/")?;
+    let n: usize = rest.parse().ok()?;
+    Some(n.min(MAX))
 }
 
 fn env_or(key: &str, default: &str) -> String {
