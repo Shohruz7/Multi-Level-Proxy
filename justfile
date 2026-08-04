@@ -17,7 +17,9 @@ run-proxy:
 run-backend:
     cargo run -p backend
 
-# Build both, run the backend in the background, then the proxy in the foreground.
+# Build both, run the backend in the background, then the proxy in the foreground
+# with the backend wired up as its upstream — the full client -> proxy -> backend
+# path.
 dev:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -25,6 +27,11 @@ dev:
     ./target/debug/backend &
     backend_pid=$!
     trap 'kill $backend_pid 2>/dev/null || true' EXIT
+    H2PROXYD_UPSTREAMS=127.0.0.1:8080 cargo run -p h2proxyd
+
+# The week-5 server: no upstreams, so the built-in responder answers. What
+# h2spec and the engine-only benchmarks run against.
+run-server:
     cargo run -p h2proxyd
 
 # Bring the dockerized backend up on a fixed port (8080).
@@ -37,9 +44,11 @@ curl-backend:
       -w 'http_version=%{http_version} code=%{http_code} size=%{size_download}\n' \
       http://127.0.0.1:8080/
 
-# Hit the proxy over TLS + h2 (ALPN negotiates; request stalls until week 5).
+# Hit the proxy over TLS + h2 and show what came back through it.
 curl-through:
-    curl -sv -k --http2 --max-time 3 https://127.0.0.1:8443/ 2>&1 | grep -iE 'alpn|http'
+    curl -s -k --http2 -o /dev/null \
+      -w 'http_version=%{http_version} code=%{http_code} size=%{size_download}\n' \
+      https://127.0.0.1:8443/bytes/100000
 
 # Workspace checks (mirror CI).
 test:
@@ -68,7 +77,26 @@ fuzz-build-all:
 baseline:
     bench/baseline.sh
 
-# RFC 9113 conformance against a running daemon (`just run-proxy` in another
+# RFC 9113 conformance against a running daemon (`just run-server` in another
 # shell). Needs `brew install h2spec`; -t -k = TLS, skip cert verification.
 h2spec target='':
     h2spec -t -k -h 127.0.0.1 -p 8443 {{target}}
+
+# Conformance with the proxy in the path: backend + proxy + h2spec, all here.
+# The engine is the same either way, so a difference between this and `h2spec`
+# is a proxy-path bug rather than a protocol one.
+h2spec-proxy target='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p backend -p h2proxyd
+    ./target/debug/backend &
+    backend_pid=$!
+    H2PROXYD_UPSTREAMS=127.0.0.1:8080 ./target/debug/h2proxyd &
+    proxy_pid=$!
+    trap 'kill $backend_pid $proxy_pid 2>/dev/null || true' EXIT
+    sleep 1
+    h2spec -t -k -h 127.0.0.1 -p 8443 {{target}}
+
+# Pool coalescing and bridge occupancy, live, from a running daemon's metrics.
+coalescing:
+    curl -s http://127.0.0.1:9090/metrics | grep -E 'upstream_|bridge_'
