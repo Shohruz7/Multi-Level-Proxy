@@ -120,6 +120,18 @@ calibrate:
 attack:
     bench/attack.sh
 
+# Synthesize the CDK stack and run its template assertions. Needs no AWS
+# account: the stack is environment-agnostic and does no context lookups, which
+# is what makes this the substitute for having deployed it (docs/adr/0022).
+synth:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd infra
+    [ -d node_modules ] || npm ci
+    npm test
+    npx cdk synth > /dev/null
+    echo "stack synthesized and template assertions passed"
+
 # Five minutes of load with a backend dying and restarting throughout, sampling
 # the quantities that must stay flat. The leak detector: every other harness here
 # measures a moment, this one measures a trend. Fails if anything grew.

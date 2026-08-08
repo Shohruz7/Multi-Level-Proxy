@@ -27,6 +27,7 @@ perf.data*
 /Documentation/Week3-8.md
 /Documentation/*-plan.md
 
-# CDK: installed dependencies and synth output.
+# CDK: installed dependencies, compiled TypeScript, and synth output.
 /infra/node_modules/
+/infra/dist/
 /infra/cdk.out/
