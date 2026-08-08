@@ -99,6 +99,10 @@ jobs:
       # with no `/v2` suffix, so every v2.x tag is an invalid version to it.
       # Building the checkout directly is what Homebrew does, and it keeps the
       # version pinned.
+      #
+      # It self-reports "2.0.0 (Unknown)": the real version string is injected by
+      # ldflags at release time and a source build has neither. The 146-test
+      # count below is what actually confirms the pinned suite.
       - name: Install h2spec
         run: |
           git clone --depth 1 --branch v2.6.0 https://github.com/summerwind/h2spec.git "$RUNNER_TEMP/h2spec"
