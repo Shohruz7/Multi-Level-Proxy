@@ -142,6 +142,15 @@ Correctness here is not self-reported. The engine is checked in layers:
   well-behaved client hides, and a second field section being read as trailers
   before the state machine was asked whether the peer could still send.
 
+All of it runs in CI on every push, and the gates are chosen from what has
+actually gone wrong here: **the suite in release as well as debug**, because the
+worst bug of week 7 was one `--release` compiles away and six weeks of green
+debug-only runs never saw; **h2spec in both modes**, with an assertion that the
+abuse guard terminated nothing, because a false positive on legitimate traffic is
+the way a mitigation becomes an outage; and **a build of every fuzz target**,
+because a target that silently stops compiling means nobody has fuzzed that
+surface since.
+
 ## Goals and non-goals
 
 - **Goal** — a correct HTTP/2 intermediary that negotiates `h2` over TLS via

@@ -40,3 +40,145 @@ jobs:
 
       - name: Test
         run: cargo nextest run --workspace
+
+  # The suite again, optimised. Not belt and braces: `RecvWindow::release`
+  # credited its window back inside a `debug_assert!`, which `--release` compiles
+  # away entirely, and six weeks of green tests missed it because every one of
+  # them ran in debug. It cost 14% of throughput and made the proxy send
+  # GOAWAY(FLOW_CONTROL_ERROR) to its own backends. A debug-only suite cannot see
+  # a bug in the binary that ships.
+  test-release:
+    name: test · release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Test (release)
+        run: cargo nextest run --workspace --release
+
+  # RFC 9113 conformance against the running daemon, in both modes. h2spec found
+  # six defects that the unit, property, and differential suites did not —
+  # including a duplicate END_STREAM every well-behaved client hides — so it is
+  # the check most worth having a machine repeat.
+  #
+  # Both modes, because the engine is shared: a difference between them is a
+  # proxy-path bug rather than a protocol one, and that is exactly the regression
+  # a local-only recipe stops catching the first time someone forgets to run it.
+  conformance:
+    name: h2spec · engine + proxy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install h2spec
+        run: |
+          version=v2.6.0
+          curl -sSfL "https://github.com/summerwind/h2spec/releases/download/${version}/h2spec_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin h2spec
+          h2spec --version
+
+      - name: Build
+        run: cargo build --release -p h2proxyd -p backend
+
+      # No upstreams configured, so the built-in responder answers and h2spec is
+      # testing the engine alone. -t -k: TLS, and skip verifying the self-signed
+      # certificate the daemon generates at startup.
+      #
+      # The guard is enforcing throughout, and the metric check is the second
+      # half of the claim. h2spec resets unanswered streams deliberately, which
+      # makes it the sharpest false-positive check available — and a trip here is
+      # never fixed by exempting the workload, it is fixed by moving the
+      # threshold and re-running `just calibrate` (design doc §6).
+      - name: h2spec (engine only)
+        run: |
+          ./target/release/h2proxyd &
+          proxy=$!
+          trap 'kill $proxy 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            curl -sk --http2 -o /dev/null https://127.0.0.1:8443/ && break
+            sleep 0.2
+          done
+          h2spec -t -k -h 127.0.0.1 -p 8443
+          # Scraped to a file and checked for a series known to exist first.
+          # Summing a missing series gives 0, which is also what "nothing
+          # tripped" looks like — so without this, a dead exporter or a renamed
+          # metric would pass silently, and a check that cannot fail is worse
+          # than no check.
+          curl -sS http://127.0.0.1:9090/metrics > metrics.txt
+          grep -q '^h2proxy_handshakes_total' metrics.txt
+          tripped=$(awk '/^h2proxy_connections_terminated_total/ {s+=$2} END {print s+0}' metrics.txt)
+          echo "connections the abuse guard terminated: $tripped"
+          test "$tripped" = "0"
+
+      # The same suite with a real backend behind the proxy, so every frame makes
+      # the full round trip: pool checkout, the two id spaces, the bridge, and
+      # back.
+      - name: h2spec (through the proxy)
+        run: |
+          ./target/release/backend &
+          backend=$!
+          H2PROXYD_UPSTREAMS=127.0.0.1:8080 ./target/release/h2proxyd &
+          proxy=$!
+          trap 'kill $backend $proxy 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            curl -sk --http2 -o /dev/null https://127.0.0.1:8443/ && break
+            sleep 0.2
+          done
+          h2spec -t -k -h 127.0.0.1 -p 8443
+
+  # A build, not a run. Fuzzing finds bugs on a timescale CI does not have, but a
+  # target that stops *compiling* is a different failure: it happens silently the
+  # moment an engine signature changes, and it means nobody has fuzzed that
+  # surface since. The cheap check keeps the expensive one available.
+  # `just fuzz 60 <target>` is still how it is actually run.
+  fuzz-build:
+    name: fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-fuzz needs nightly for its sanitizer and coverage flags.
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      # `fuzz/` is its own workspace, deliberately, so the sanitizer build never
+      # touches the main one. Both need caching.
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      # RUSTFLAGS is cleared for this job: cargo-fuzz sets its own instrumentation
+      # flags, and the workflow-level value would be in its way for no benefit —
+      # clippy already holds the `-D warnings` line for this code.
+      - name: Build every target
+        env:
+          RUSTFLAGS: ""
+        run: |
+          for target in frame_parser hpack_decoder guard; do
+            echo "::group::$target"
+            cargo +nightly fuzz build "$target"
+            echo "::endgroup::"
+          done
