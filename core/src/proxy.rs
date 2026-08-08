@@ -850,6 +850,28 @@ impl Service for Proxy {
     }
 }
 
+/// A client connection ending is an ending for every stream still open on it.
+///
+/// The engine has nothing to say here — a peer that hangs up mid-stream sends no
+/// RST_STREAM and no END_STREAM, so neither [`Service::cancel`] nor
+/// [`Service::finish`] is ever called for those streams — and the leases release
+/// themselves when `routes` drops. What does *not* take care of itself is the
+/// accounting, and the soak found both halves of it: the active-stream gauge
+/// climbed forever, because every client that hangs up leaves its streams
+/// counted as active, and the RED latency histogram silently omitted them.
+///
+/// Neither is a resource leak, which is precisely why it survived: everything
+/// still worked, and only the numbers were wrong. `h2proxy_client_streams_active`
+/// read 458 with no load running and nothing in flight — a gauge that is not
+/// wrong once but wrong permanently, and increasingly so.
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        for route in self.routes.values() {
+            self.finished(route);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
