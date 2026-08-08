@@ -48,9 +48,11 @@ The parts that carry the weight:
   connections carrying 400 streams land on a handful of upstream connections,
   and the stream-id remapping between the two id spaces is the pool's job.
 - **Resilience** — connection pooling and coalescing, load balancing by
-  least-outstanding-streams, health checking with outlier ejection and
-  single-request probe-back, conservative idempotent-only retries, and a
-  graceful two-phase GOAWAY drain on both legs.
+  least-outstanding-streams, health checking with outlier ejection, active PING
+  probing and single-request probe-back, conservative idempotent-only retries,
+  and a graceful two-phase GOAWAY drain on both legs. The probe is the part that
+  catches a backend which accepts connections and then answers nothing: it fails
+  no request, it *hangs* them, so nothing passive can see it.
 - **Defence** — per-connection accounting for the HTTP/2 abuse patterns: Rapid
   Reset (CVE-2023-44487), PING and SETTINGS floods, empty-DATA floods, and
   CONTINUATION floods. The offending connection is closed with
@@ -121,6 +123,18 @@ Correctness here is not self-reported. The engine is checked in layers:
   reading a few KB at a time, asserting that the octets held between them stay
   under one connection window *and* that the backend provably stopped. Both
   halves matter: flat memory alone would also describe a proxy that dropped data.
+- **Accounting invariants at scale** — 3,000 requests through every ending a
+  stream has (served, refused-and-retried, failed, cancelled mid-download, and a
+  backend killed under live traffic), then the assertion that the books balance:
+  zero pool leases outstanding, zero streams open, zero octets in the bridge.
+  These are the bugs that no single request exposes — the worst two of the last
+  fortnight were both invisible below a few thousand requests.
+- **A soak** (`just soak`) — five minutes of load with a backend killed and
+  restarted every 30 s, sampling the quantities that must stay *flat* rather than
+  the ones that must be fast. It found a real leak on its first run: the
+  active-stream gauge counted every stream of every client that hung up
+  mid-request, forever. Nothing broke and nothing leaked but the numbers, which
+  is exactly why a week of feature tests missed it.
 - **Conformance** — [h2spec](https://github.com/summerwind/h2spec)'s RFC 9113
   suite runs against the live daemon: **146/146, with and without the proxy path
   in front of a real backend**. It earned its place by finding six real defects
@@ -187,7 +201,9 @@ h2c backend *and* the proxy wired to it — the full client → proxy → backen
 responder. `just baseline` captures the no-proxy baseline (see
 [bench/README.md](bench/README.md)). Fuzzing: `just fuzz 60 frame_parser` or
 `just fuzz 60 hpack_decoder`. Conformance: `just h2spec` (server) or
-`just h2spec-proxy` (through the proxy); needs `brew install h2spec`.
+`just h2spec-proxy` (through the proxy); needs `brew install h2spec`. Leak
+hunting: `just soak` (five minutes of load with a backend dying and returning
+throughout, failing if anything that should be flat grew).
 
 Proxy a request to a real backend:
 
@@ -228,14 +244,17 @@ Covered by tests: TLS 1.3 + ALPN, the full frame codec, HPACK in both directions
 with independent dynamic tables, the stream lifecycle, two-level flow control
 with fair interleaving, the upstream pool with coalescing and stream-id
 remapping, least-outstanding-streams load balancing, trailers across both legs,
-the backpressure bridge, the graceful drain, health checking with ejection and
-probe-back, idempotent retries, `x-forwarded-for`, and the abuse guard.
+the backpressure bridge, the graceful drain, health checking with ejection,
+active PING probing and probe-back, idempotent retries, `x-forwarded-for`, and
+the abuse guard.
 
 Measured, locally, in release builds:
 
 | Claim | Number |
 |---|---|
 | Backend killed mid-load, 200k requests | **0 5xx**, 2 ejections, 247 retries rescued |
+| Backend that accepts and then answers nothing | detected and ejected in ~2× `ping_idle`; the request gets an answer instead of hanging |
+| 5-minute soak, a backend killed and restarted every 30 s | 13.0M requests, **0 5xx**, 1,177 retries, 16 ejections, 126 probes / 0 probe failures; RSS plateaued and every in-flight gauge settled to **0** |
 | SIGTERM mid-load, 75k requests | **0 5xx**; a 20 MB response completed in full across it |
 | Rapid Reset flood beside ordinary load | attacker GOAWAYed; bystander p99 **11.65 ms → 8.11 ms** (unharmed) |
 | Abuse guard cost per frame | **0.46%** of frame dispatch (272.1 ns → 273.4 ns) |
@@ -249,8 +268,17 @@ release-only flow-control bug that six weeks of green tests had missed — the
 whole suite ran in debug, and `RecvWindow::release` credited its window back
 inside a `debug_assert!`, which `--release` compiles away entirely.
 
+Two of the three bugs found in week 7, and the one found closing it out, were the
+same shape: a feature that ran, passed its tests, and reported nothing. None was
+found by reading code or adding a unit test. All three were found by measuring —
+which is why the harnesses above (`just calibrate`, `just attack`, `just soak`)
+are part of the project rather than notes in a terminal.
+
 Still to come: **week 8** — the CDK stack, the deployed load test, and the tuning
-pass that turns the reasoned window sizes into measured ones.
+pass that turns the reasoned window sizes into measured ones. The deployed run is
+also the first sight of real traffic *shape*, so the guard's thresholds should be
+re-calibrated against it; every one of them is an environment variable for
+exactly that reason.
 
 ## License
 
