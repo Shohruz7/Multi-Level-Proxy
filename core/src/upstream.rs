@@ -67,6 +67,14 @@ use crate::stream::{Lookup, StreamEvent, StreamId, StreamTable};
 /// same bound the client side applies to a client.
 const MAX_HEADER_BLOCK_BYTES: usize = MAX_HEADER_LIST_SIZE as usize;
 
+/// How long to let a backend finish the streams it promised after sending
+/// GOAWAY, before giving up on them.
+///
+/// Shorter than the client-facing drain deadline on purpose: the client is
+/// waiting on us for all of it, and a backend that has said goodbye and then
+/// stops answering should cost one slow request rather than one very slow one.
+const PEER_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Names one request on one upstream connection, from the moment the pool leases
 /// a slot until the stream ends.
 ///
@@ -224,6 +232,16 @@ pub struct UpstreamConnection<IO> {
     /// The next id to open. Odd and strictly increasing, because we are the
     /// client here (§5.1.1).
     next_stream_id: u32,
+    /// Set when the backend has sent GOAWAY: the last id it promised to
+    /// process, and when we stop waiting for those to finish.
+    ///
+    /// A GOAWAY is a *drain request*, not a hang-up — §6.8 is explicit that
+    /// streams at or below `last_stream_id` may still complete, and a backend
+    /// restarting behind a rolling deploy relies on exactly that. Treating it as
+    /// an immediate close is what turned every ordinary backend restart into a
+    /// burst of 502s for requests the backend was still perfectly willing to
+    /// answer.
+    peer_draining: Option<(StreamId, tokio::time::Instant)>,
     inbox: mpsc::UnboundedReceiver<ToUpstream>,
     stats: std::sync::Arc<crate::proxy::ProxyStats>,
     /// The pool's view of this connection, if it came from one. The peer's
@@ -282,6 +300,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
             cancelled: std::collections::HashSet::new(),
             pending: VecDeque::new(),
             next_stream_id: 1,
+            peer_draining: None,
             inbox,
             stats,
             record,
@@ -372,10 +391,21 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
                 return Stop::Failed(e);
             }
 
+            // Checked after every batch of frames, because the thing that ends a
+            // peer drain is the last promised response arriving — a socket
+            // wake-up, not a clock one.
+            if self.peer_drain_complete() {
+                return Stop::Quiet;
+            }
+
             match self.tick().await {
                 Ok(true) => {}
                 Ok(false) => return Stop::Quiet,
                 Err(e) => return Stop::Failed(e),
+            }
+
+            if self.peer_drain_complete() {
+                return Stop::Quiet;
             }
         }
     }
@@ -384,9 +414,22 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
     async fn tick(&mut self) -> Result<bool, ConnectionError> {
         let mut wrote = 0usize;
         let mut msg = None;
+        // Only during a peer drain, so an idle connection still parks on its
+        // sockets rather than waking on a timer it has no use for.
+        let drain_deadline = self.peer_draining.map(|(_, at)| at);
 
         let keep_going = tokio::select! {
             biased;
+            // Wakes the loop when a draining backend has gone quiet without
+            // finishing what it promised. Without it the deadline is only
+            // noticed if some other event happens to arrive.
+            _ = async {
+                match drain_deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => true,
+
             written = self.writer.write(&self.out), if !self.out.is_empty() => {
                 match written {
                     Ok(0) => false,
@@ -541,6 +584,19 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
             // it — work for the backend and a wasted id.
             return Ok(());
         }
+        // Leased just before the backend's GOAWAY landed. The backend has said
+        // it will process nothing further, so this provably never started.
+        if self.peer_draining.is_some() {
+            debug!(
+                ?request,
+                "backend is draining; refusing a newly leased request"
+            );
+            let _ = events.send(ServiceEvent::Reset {
+                id: client_id,
+                code: ErrorCode::RefusedStream,
+            });
+            return Ok(());
+        }
         // No slot at the backend's limit: wait for one rather than refuse.
         if !self.streams.can_open_local() {
             self.pending.push_back(Pending {
@@ -689,6 +745,69 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
         let _ = self.drain_pending();
     }
 
+    /// The backend is going away. Retire this connection from the pool, release
+    /// everything it will never process, and keep the rest running.
+    ///
+    /// The split is the whole point of §6.8: a stream at or below
+    /// `last_stream_id` was accepted and its response is still coming, while
+    /// anything above it — including every request still queued for a slot —
+    /// provably never started. The latter get REFUSED_STREAM, which promises the
+    /// client nothing was processed and makes the request safe to send
+    /// elsewhere.
+    fn begin_peer_drain(&mut self, last_stream_id: StreamId) {
+        // Out of the pool first, so no further request is leased onto a
+        // connection that cannot open a stream for it.
+        if let Some(record) = &self.record {
+            record.retire();
+        }
+
+        let deadline = tokio::time::Instant::now() + PEER_DRAIN_DEADLINE;
+        self.peer_draining = Some((last_stream_id, deadline));
+
+        // Queued requests never got an id, so they are unambiguously unstarted.
+        for pending in std::mem::take(&mut self.pending) {
+            let _ = pending.events.send(ServiceEvent::Reset {
+                id: pending.client_id,
+                code: ErrorCode::RefusedStream,
+            });
+        }
+
+        let abandoned: Vec<StreamId> = self
+            .routes
+            .keys()
+            .copied()
+            .filter(|id| *id > last_stream_id)
+            .collect();
+        for id in abandoned {
+            if let Some(route) = self.routes.get(&id) {
+                let _ = route.events.send(ServiceEvent::Reset {
+                    id: route.client_id,
+                    code: ErrorCode::RefusedStream,
+                });
+            }
+            self.forget(id);
+        }
+    }
+
+    /// Whether a peer drain is finished — nothing left to wait for, or waited
+    /// long enough.
+    fn peer_drain_complete(&self) -> bool {
+        let Some((_, deadline)) = self.peer_draining else {
+            return false;
+        };
+        if self.routes.is_empty() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                live = self.routes.len(),
+                "backend drain deadline expired; abandoning in-flight streams",
+            );
+            return true;
+        }
+        false
+    }
+
     /// Tell every client still waiting that this connection is gone.
     fn fail_all_routes(&mut self) {
         self.requests.clear();
@@ -797,27 +916,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
                 debug!(
                     last_stream_id = last_stream_id.get(),
                     ?error_code,
-                    "backend sent GOAWAY",
+                    live = self.routes.len(),
+                    "backend sent GOAWAY; draining this connection",
                 );
-                // Streams above the backend's last_stream_id were never
-                // processed, so they are safe to retry elsewhere — which is
-                // precisely what REFUSED_STREAM tells the client.
-                let abandoned: Vec<StreamId> = self
-                    .routes
-                    .keys()
-                    .copied()
-                    .filter(|id| *id > *last_stream_id)
-                    .collect();
-                for id in abandoned {
-                    if let Some(route) = self.routes.get(&id) {
-                        let _ = route.events.send(ServiceEvent::Reset {
-                            id: route.client_id,
-                            code: ErrorCode::RefusedStream,
-                        });
-                    }
-                    self.forget(id);
-                }
-                return Ok(false);
+                self.begin_peer_drain(*last_stream_id);
+                // Keep serving. Everything at or below `last_stream_id` was
+                // accepted by the backend and is still coming; the loop ends in
+                // `drive` once the last of them retires.
+                return Ok(true);
             }
             Frame::WindowUpdate {
                 stream_id,

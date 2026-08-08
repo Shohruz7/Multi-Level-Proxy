@@ -52,6 +52,9 @@
 //! next pass resumes. Reading is never what blocks, so there is no deadlock.
 
 use std::collections::VecDeque;
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -67,7 +70,9 @@ use crate::frame::{
 };
 use crate::hpack::{HpackDecoder, HpackEncoder, HpackError};
 use crate::service::{Echo, RequestHead, Response, Service, ServiceEvent};
-use crate::stream::{Lookup, OpenRejection, StreamEvent, StreamId, StreamTable};
+use crate::stream::{
+    Lookup, MAX_LOCAL_STREAM_ID, OpenRejection, StreamEvent, StreamId, StreamTable,
+};
 
 /// How many encoded octets may sit in the outbound buffer before the scheduler
 /// stops adding to it.
@@ -83,6 +88,105 @@ pub const MAX_WRITE_QUEUE: usize = 256 * 1024;
 /// How long the last write on a dying connection may take before it is
 /// abandoned. See [`Connection::flush`].
 const FINAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How a connection winds down when the daemon is asked to stop (§6.8, design
+/// doc §5.3).
+///
+/// Plain data with a `Default`, rather than constants, so the daemon can move
+/// the numbers from the environment without a rebuild and the tests can drive
+/// them to zero. The library never reads the environment itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DrainPolicy {
+    /// How long to keep accepting new streams after the advisory GOAWAY.
+    ///
+    /// The point of a nonzero grace is the request already on the wire: a client
+    /// that put HEADERS in flight microseconds before our GOAWAY has not done
+    /// anything wrong, and refusing it turns a clean deploy into a handful of
+    /// client-visible errors. One round trip plus reaction time is enough.
+    pub grace: Duration,
+    /// How long to let in-flight streams finish after the final GOAWAY, before
+    /// closing regardless.
+    ///
+    /// Bounded by what the container runtime will wait: Kubernetes'
+    /// `terminationGracePeriodSeconds` and ECS' `StopTimeout` both default to
+    /// 30 s, and being SIGKILLed mid-drain is strictly worse than closing
+    /// cleanly a moment early.
+    pub deadline: Duration,
+}
+
+impl Default for DrainPolicy {
+    fn default() -> Self {
+        DrainPolicy {
+            grace: Duration::from_secs(2),
+            deadline: Duration::from_secs(30),
+        }
+    }
+}
+
+impl DrainPolicy {
+    /// Wind down immediately: no grace, no waiting for in-flight streams. What
+    /// the tests use when the drain itself is not what is under test.
+    pub const fn immediate() -> Self {
+        DrainPolicy {
+            grace: Duration::ZERO,
+            deadline: Duration::ZERO,
+        }
+    }
+}
+
+/// A drain in progress (§6.8).
+///
+/// Two GOAWAYs, not one. The first is advisory — `last_stream_id` is the maximum
+/// possible id, which commits to nothing and means only "stop opening streams".
+/// The second, one `grace` later, names the highest id we will actually serve.
+/// Sending only the second is the common shortcut and it is wrong in a specific
+/// way: it retroactively refuses whatever the peer had already put on the wire.
+#[derive(Clone, Copy, Debug)]
+struct Drain {
+    /// When the final GOAWAY goes out and new streams stop being accepted.
+    commit_at: Instant,
+    /// When to close whether or not the stream table has emptied.
+    deadline_at: Instant,
+    /// The id named in the final GOAWAY, once sent. `Some` means no new stream
+    /// will be accepted.
+    committed: Option<StreamId>,
+}
+
+impl Drain {
+    /// The grace exists to protect a request the peer put on the wire before it
+    /// could see our GOAWAY, so it can be skipped only when no such request can
+    /// exist. That is a statement about *quiet*, not about emptiness:
+    ///
+    /// - "nothing in flight right now" is true of a busy connection between
+    ///   every pair of requests, and using it collapsed a 2 s grace to 4.8 ms
+    ///   under `h2load -m 20`;
+    /// - "nothing in flight, and nothing for at least a grace period" cannot be
+    ///   true of a connection with a request in flight, because a request in
+    ///   flight is at most one round trip old.
+    ///
+    /// So a genuinely parked keep-alive connection still costs nothing at
+    /// shutdown, and an active one keeps every millisecond of its grace.
+    fn begin(policy: DrainPolicy, now: Instant, quiet_for: Duration) -> Self {
+        let grace = if quiet_for >= policy.grace {
+            Duration::ZERO
+        } else {
+            policy.grace - quiet_for
+        };
+        Drain {
+            commit_at: now + grace,
+            deadline_at: now + grace + policy.deadline,
+            committed: None,
+        }
+    }
+
+    /// The next instant this drain has something to do.
+    fn next_wake(&self) -> Instant {
+        match self.committed {
+            None => self.commit_at,
+            Some(_) => self.deadline_at,
+        }
+    }
+}
 
 /// How many streams a peer may have open or half-closed at once, advertised as
 /// `SETTINGS_MAX_CONCURRENT_STREAMS` (§5.1.2). An abuse guard as much as a
@@ -398,6 +502,10 @@ pub struct ConnectionSummary {
     /// A nonzero count under load is the observable proof that flow control is
     /// doing something.
     pub flow_control_stalls: u64,
+    /// Whether this connection wound down through a graceful drain — i.e. it
+    /// got as far as committing a GOAWAY id — rather than being closed by the
+    /// peer or by an error.
+    pub drained: bool,
 }
 
 /// Why the reader loop stopped.
@@ -489,6 +597,17 @@ pub struct Connection<IO, S = Echo> {
     /// that cannot also write (they already hold a borrow of the stream table),
     /// so the frame is queued here and flushed on the way out.
     pending_reset: Vec<StreamError>,
+    /// When this connection last had a stream open, so a drain can tell a parked
+    /// keep-alive connection from one that is merely between requests. Only read
+    /// at the moment a drain begins, so keeping it costs one store per request.
+    last_stream_at: Instant,
+    /// How to wind down when asked to stop.
+    drain_policy: DrainPolicy,
+    /// Set once the shutdown signal has fired. While this is `Some` the loop
+    /// keeps serving — that is the whole difference between a drain and a
+    /// teardown — and the shutdown arm of the select is disabled, because a
+    /// fired broadcast receiver resolves instantly forever and would spin.
+    draining: Option<Drain>,
     /// What answers a request.
     service: S,
     /// Where the responder's answers arrive. Unbounded on purpose — see the
@@ -561,10 +680,21 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             conn_recv_window: RecvWindow::new(CONNECTION_WINDOW),
             ready: VecDeque::new(),
             pending_reset: Vec::new(),
+            last_stream_at: Instant::now(),
+            drain_policy: DrainPolicy::default(),
+            draining: None,
             service,
             events,
             summary: ConnectionSummary::default(),
         }
+    }
+
+    /// Set how this connection winds down on shutdown. The daemon passes its
+    /// configured policy; tests that are not about draining pass
+    /// [`DrainPolicy::immediate`].
+    pub fn with_drain_policy(mut self, policy: DrainPolicy) -> Self {
+        self.drain_policy = policy;
+        self
     }
 
     /// Run the connection until the peer closes it, a shutdown signal arrives,
@@ -729,11 +859,36 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
         // is advanced once they are gone.
         let mut wrote = 0usize;
         let mut event = None;
+        let mut begin_drain = false;
+        let mut drain_tick = false;
+
+        // Read the drain's next deadline out before the select, so the timer arm
+        // does not have to borrow `self`.
+        let drain_wake = self.draining.as_ref().map(Drain::next_wake);
 
         let keep_going = tokio::select! {
             biased;
-            // Closed channel (Err) or a value both mean "drain now".
-            _ = self.shutdown.recv() => false,
+            // Closed channel (Err) or a value both mean "start draining". Only
+            // armed while we are *not* already draining: a broadcast receiver
+            // that has fired resolves immediately forever, so leaving this armed
+            // would spin the loop at full speed for the whole drain.
+            _ = self.shutdown.recv(), if self.draining.is_none() => {
+                begin_drain = true;
+                true
+            }
+
+            // The drain's own clock: the grace expiring, then the deadline.
+            // `pending()` when there is no drain, so the arm simply never fires
+            // rather than needing a guard that borrows `self`.
+            _ = async {
+                match drain_wake {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                drain_tick = true;
+                true
+            }
 
             // Flush before reading more: the queue is bounded, and leaving it
             // full would stop the scheduler from making progress.
@@ -780,7 +935,98 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             self.handle_service_event(event)?;
             self.drain_service_events()?;
         }
-        Ok(keep_going)
+        if !keep_going {
+            return Ok(false);
+        }
+        if begin_drain {
+            self.begin_drain()?;
+        }
+        // Re-checked on every pass, not only on the timer: the last stream
+        // finishing is what usually ends a drain, and that happens on a socket
+        // wake-up rather than a clock one.
+        if self.draining.is_some() {
+            return self.advance_drain(drain_tick);
+        }
+        Ok(true)
+    }
+
+    /// Send the advisory GOAWAY and start the drain clock (§6.8).
+    ///
+    /// `2^31 - 1` is deliberate: it is the largest id that can exist, so it
+    /// promises nothing about what we will refuse and says only "open no more
+    /// streams". The real id follows one `grace` later, by which time anything
+    /// already in flight has arrived and been counted.
+    fn begin_drain(&mut self) -> Result<(), ConnectionError> {
+        let now = Instant::now();
+        // How long this connection has had nothing at all in flight. A live
+        // stream means zero: whatever it is doing is current by definition.
+        let quiet_for = if self.streams.live_count() > 0 {
+            Duration::ZERO
+        } else {
+            now.saturating_duration_since(self.last_stream_at)
+        };
+        self.draining = Some(Drain::begin(self.drain_policy, now, quiet_for));
+        debug!(
+            live = self.streams.live_count(),
+            quiet_ms = quiet_for.as_millis() as u64,
+            "draining: advertising GOAWAY(NO_ERROR) with no committed id",
+        );
+        let advisory = Frame::GoAway {
+            last_stream_id: StreamId::new(MAX_LOCAL_STREAM_ID),
+            error_code: ErrorCode::NoError,
+            debug_data: Bytes::new(),
+        };
+        self.queue_frame(&advisory)
+    }
+
+    /// Move the drain along: commit when the grace expires, and finish when the
+    /// last stream ends or the deadline arrives. `Ok(false)` closes the loop.
+    fn advance_drain(&mut self, timer_fired: bool) -> Result<bool, ConnectionError> {
+        let Some(drain) = self.draining else {
+            return Ok(true);
+        };
+        let now = Instant::now();
+
+        if drain.committed.is_none() && (timer_fired || now >= drain.commit_at) {
+            let last = self.streams.highest_peer_id();
+            debug!(
+                last_stream_id = last.get(),
+                live = self.streams.live_count(),
+                "draining: committing GOAWAY; no new streams accepted",
+            );
+            self.queue_frame(&Frame::GoAway {
+                last_stream_id: last,
+                error_code: ErrorCode::NoError,
+                debug_data: Bytes::new(),
+            })?;
+            if let Some(drain) = self.draining.as_mut() {
+                drain.committed = Some(last);
+            }
+            self.summary.drained = true;
+        }
+
+        let Some(drain) = self.draining else {
+            return Ok(true);
+        };
+        if drain.committed.is_some() {
+            if self.streams.live_count() == 0 {
+                trace!("draining: every stream finished");
+                return Ok(false);
+            }
+            if now >= drain.deadline_at {
+                warn!(
+                    live = self.streams.live_count(),
+                    "drain deadline expired; closing with streams still open",
+                );
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether the drain has committed an id, i.e. no new stream may open.
+    fn drain_committed(&self) -> bool {
+        self.draining.is_some_and(|d| d.committed.is_some())
     }
 
     /// Take everything the responder has produced so far.
@@ -1239,6 +1485,18 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             ));
         }
 
+        // Past the committed GOAWAY id, so this request was never processed.
+        // REFUSED_STREAM says exactly that, which is what makes it safe for the
+        // client to send elsewhere — the same promise §5.1.2 relies on, and the
+        // reason a drain is not visible to a well-behaved client as an error.
+        if self.drain_committed() {
+            debug!(
+                stream = stream_id.get(),
+                "refusing a new stream: connection is draining",
+            );
+            return self.write_rst_stream(stream_id, ErrorCode::RefusedStream);
+        }
+
         match self.streams.open_peer(stream_id) {
             Ok(_) => {}
             Err(OpenRejection::Protocol(why)) => {
@@ -1296,6 +1554,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
         // a `ServiceEvent`, and until then this stream costs nothing but a table
         // entry while the other streams on the connection keep being served.
         self.summary.requests_dispatched += 1;
+        self.last_stream_at = Instant::now();
         self.service.dispatch(stream_id, request, end_stream);
         Ok(())
     }
@@ -1925,7 +2184,6 @@ pub(crate) fn take_from_queue(queue: &mut VecDeque<Bytes>, budget: usize) -> Byt
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
 
     use tokio::io::DuplexStream;
 
@@ -2128,10 +2386,20 @@ mod tests {
         // Keep the client half alive and never write, so the reader's socket
         // read pends forever — the only way `run` can return is the shutdown
         // branch. That isolates the lifecycle we care about.
+        //
+        // `immediate()` because this test is about the *lifecycle*, not the
+        // drain: with the default policy a connection this young owes a 2 s
+        // grace to a request that might be on the wire, and waiting it out here
+        // would only be measuring `DrainPolicy::default()`. `drain.rs` covers
+        // the timing.
         let (_client, server) = tokio::io::duplex(1024);
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
-        let handle = tokio::spawn(Connection::new(server, shutdown_rx).run());
+        let handle = tokio::spawn(
+            Connection::new(server, shutdown_rx)
+                .with_drain_policy(DrainPolicy::immediate())
+                .run(),
+        );
         shutdown_tx.send(()).expect("a live receiver");
 
         tokio::time::timeout(TIMEOUT, handle)

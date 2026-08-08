@@ -123,6 +123,17 @@ impl UpstreamRecord {
     pub fn set_max_concurrent(&self, max: usize) {
         self.max_concurrent.store(max, Ordering::Relaxed);
     }
+
+    /// Take this connection out of rotation while its task keeps running.
+    ///
+    /// The two are genuinely different states. A connection whose backend has
+    /// sent GOAWAY must accept no *new* request — leasing onto it would produce
+    /// a request the connection cannot open a stream for — but it is still
+    /// serving the streams the backend promised to finish, and it is not gone
+    /// until those are done.
+    pub fn retire(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+    }
 }
 
 /// A leased slot on an upstream connection: which connection, and which request

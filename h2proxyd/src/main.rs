@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use h2proxy_core::conn::{Connection, Settings};
+use h2proxy_core::conn::{Connection, DrainPolicy, Settings};
 use h2proxy_core::lb::Backend;
 use h2proxy_core::proxy::{Proxy, Shared};
 use h2proxy_core::service::Echo;
@@ -64,8 +64,14 @@ async fn main() -> anyhow::Result<()> {
         Some(Shared::new(backends, max_conns_per_backend()))
     };
     if let Some(shared) = &proxy {
-        spawn_stats_sampler(Arc::clone(shared));
+        spawn_stats_sampler(shared);
     }
+    let drain = drain_policy();
+    info!(
+        grace_s = drain.grace.as_secs_f64(),
+        deadline_s = drain.deadline.as_secs_f64(),
+        "drain policy",
+    );
 
     let listener = TcpListener::bind(listen)
         .await
@@ -99,15 +105,43 @@ async fn main() -> anyhow::Result<()> {
                 let acceptor = acceptor.clone();
                 let shutdown = shutdown_tx.subscribe();
                 let proxy = proxy.clone();
-                conns.spawn(handle_connection(acceptor, stream, peer, shutdown, proxy));
+                conns.spawn(handle_connection(acceptor, stream, peer, shutdown, proxy, drain));
             }
         }
     }
 
-    // Tell in-flight tasks to stop, then wait for the drain to finish.
+    // Tell in-flight tasks to stop, then wait for the drain to finish. Each
+    // connection sends its advisory GOAWAY, keeps serving for the grace, commits
+    // a final GOAWAY, and closes when its last stream ends (§6.8).
+    let started = std::time::Instant::now();
     drop(shutdown_tx);
     while conns.join_next().await.is_some() {}
-    info!("all connections drained; exiting");
+    info!(seconds = started.elapsed().as_secs_f64(), "clients drained");
+
+    // Now the upstream half. The pool owns the sender for every upstream
+    // connection's inbox, so those tasks cannot notice they are finished while
+    // anything still holds `Shared` — dropping it here is what closes their
+    // inboxes and lets them wind down. The sampler holds only a `Weak`, so it is
+    // never the thing keeping them alive.
+    let upstreams = proxy.as_ref().map(|shared| Arc::clone(&shared.stats));
+    drop(proxy);
+    if let Some(stats) = upstreams {
+        let deadline = std::time::Instant::now() + UPSTREAM_DRAIN_DEADLINE;
+        while stats.upstream_connections() > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let left = stats.upstream_connections();
+        if left > 0 {
+            warn!(
+                connections = left,
+                "upstream connections still open at exit"
+            );
+        }
+    }
+    info!(
+        seconds = started.elapsed().as_secs_f64(),
+        "all connections drained; exiting",
+    );
     Ok(())
 }
 
@@ -120,6 +154,7 @@ async fn handle_connection(
     peer: SocketAddr,
     mut shutdown: broadcast::Receiver<()>,
     proxy: Option<Arc<Shared>>,
+    drain: DrainPolicy,
 ) {
     // Race the handshake against shutdown so a stalled TLS negotiation can't
     // hold the drain open.
@@ -164,6 +199,7 @@ async fn handle_connection(
     let summary = match proxy {
         Some(shared) => {
             Connection::with_service(tls_stream, shutdown, settings, Proxy::new(shared))
+                .with_drain_policy(drain)
                 .run()
                 .await
         }
@@ -174,6 +210,7 @@ async fn handle_connection(
                 settings,
                 Echo::new(default_body_size()),
             )
+            .with_drain_policy(drain)
             .run()
             .await
         }
@@ -248,11 +285,20 @@ fn max_conns_per_backend() -> usize {
 /// connections are long-lived by design: a pool that is working correctly might
 /// not close a connection for hours, and a gauge that only moves on teardown
 /// would read zero through an entire load test.
-fn spawn_stats_sampler(shared: Arc<Shared>) {
+fn spawn_stats_sampler(shared: &Arc<Shared>) {
+    // A `Weak`, deliberately. A sampler holding a strong reference would keep
+    // the pool — and therefore every upstream connection's inbox sender — alive
+    // for the life of the process, so the upstream tasks could never observe
+    // that their last client had gone and the drain would always hit its
+    // deadline instead of finishing.
+    let shared = Arc::downgrade(shared);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
             let stats = &shared.stats;
             metrics::gauge!("h2proxy_upstream_pool_connections")
                 .set(stats.upstream_connections() as f64);
@@ -265,6 +311,31 @@ fn spawn_stats_sampler(shared: Arc<Shared>) {
         }
     });
 }
+
+/// How the connections wind down on SIGTERM, from `H2PROXYD_DRAIN_GRACE` and
+/// `H2PROXYD_DRAIN_DEADLINE` (both in seconds).
+///
+/// Configurable because the right deadline is a property of the *deployment*,
+/// not of the proxy: it has to stay under whatever the container runtime will
+/// wait before SIGKILL, and that number belongs to whoever wrote the manifest.
+fn drain_policy() -> DrainPolicy {
+    let seconds = |name: &str, fallback: Duration| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map_or(fallback, Duration::from_secs_f64)
+    };
+    let default = DrainPolicy::default();
+    DrainPolicy {
+        grace: seconds("H2PROXYD_DRAIN_GRACE", default.grace),
+        deadline: seconds("H2PROXYD_DRAIN_DEADLINE", default.deadline),
+    }
+}
+
+/// How long to wait for upstream connections to finish after the clients have
+/// gone. Sized to sit inside the same container-stop budget as the client drain.
+const UPSTREAM_DRAIN_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Body size the built-in responder returns for a request that does not ask for
 /// a specific one, via `H2PROXYD_BODY_SIZE`. Mirrors the `backend` crate's
