@@ -210,7 +210,7 @@ async fn a_dead_backend_does_not_take_the_live_one_down_with_it() {
 
     // Half the requests land on a backend that is not there. Those get a 502
     // (an empty `x-served-by`); the rest must still be served normally, on the
-    // same client connections. Week 7's health checking is what stops the dead
+    // same client connections. Health checking (`retry.rs`) is what stops the dead
     // backend being chosen at all — this test is the floor below that: a dead
     // backend degrades the service, it does not break it.
     let served = responses.iter().filter(|who| *who == "live").count();

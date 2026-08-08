@@ -22,12 +22,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 use h2proxy_core::conn::{Connection, DrainPolicy, Settings};
+use h2proxy_core::guard::Limits;
+use h2proxy_core::health;
 use h2proxy_core::lb::Backend;
 use h2proxy_core::proxy::{Proxy, Shared};
 use h2proxy_core::service::Echo;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
@@ -61,12 +64,20 @@ async fn main() -> anyhow::Result<()> {
             upstreams = ?backends.iter().map(|b| b.addr).collect::<Vec<_>>(),
             "proxying to backends over h2c",
         );
-        Some(Shared::new(backends, max_conns_per_backend()))
+        Some(Shared::with_policy(
+            backends,
+            max_conns_per_backend(),
+            health_policy(),
+        ))
     };
     if let Some(shared) = &proxy {
         spawn_stats_sampler(shared);
     }
     let drain = drain_policy();
+    let limits = guard_limits();
+    if limits.observe_only {
+        info!("abuse guard in OBSERVE-ONLY mode: peaks recorded, nothing enforced");
+    }
     info!(
         grace_s = drain.grace.as_secs_f64(),
         deadline_s = drain.deadline.as_secs_f64(),
@@ -105,7 +116,9 @@ async fn main() -> anyhow::Result<()> {
                 let acceptor = acceptor.clone();
                 let shutdown = shutdown_tx.subscribe();
                 let proxy = proxy.clone();
-                conns.spawn(handle_connection(acceptor, stream, peer, shutdown, proxy, drain));
+                conns.spawn(handle_connection(
+                    acceptor, stream, peer, shutdown, proxy, drain, limits,
+                ));
             }
         }
     }
@@ -155,6 +168,7 @@ async fn handle_connection(
     mut shutdown: broadcast::Receiver<()>,
     proxy: Option<Arc<Shared>>,
     drain: DrainPolicy,
+    limits: Limits,
 ) {
     // Race the handshake against shutdown so a stalled TLS negotiation can't
     // hold the drain open.
@@ -198,8 +212,12 @@ async fn handle_connection(
     let settings = Settings::server();
     let summary = match proxy {
         Some(shared) => {
-            Connection::with_service(tls_stream, shutdown, settings, Proxy::new(shared))
+            let service = Proxy::new(shared)
+                .with_peer(peer.ip())
+                .trusting_forwarded_headers(trust_forwarded());
+            Connection::with_service(tls_stream, shutdown, settings, service)
                 .with_drain_policy(drain)
+                .with_limits(limits)
                 .run()
                 .await
         }
@@ -211,6 +229,7 @@ async fn handle_connection(
                 Echo::new(default_body_size()),
             )
             .with_drain_policy(drain)
+            .with_limits(limits)
             .run()
             .await
         }
@@ -300,14 +319,57 @@ fn spawn_stats_sampler(shared: &Arc<Shared>) {
                 return;
             };
             let stats = &shared.stats;
+
+            // Gauges: quantities that go up and down.
             metrics::gauge!("h2proxy_upstream_pool_connections")
                 .set(stats.upstream_connections() as f64);
             metrics::gauge!("h2proxy_upstream_streams_active").set(stats.upstream_streams() as f64);
+            metrics::gauge!("h2proxy_client_streams_active").set(stats.client_streams() as f64);
             metrics::gauge!("h2proxy_bridge_buffered_bytes").set(stats.buffered() as f64);
             metrics::gauge!("h2proxy_bridge_buffered_bytes_peak").set(stats.peak_buffered() as f64);
-            metrics::gauge!("h2proxy_upstream_connects_total").set(stats.connects() as f64);
-            metrics::gauge!("h2proxy_upstream_connect_failures_total")
-                .set(stats.connect_failures() as f64);
+            metrics::gauge!("h2proxy_backends_healthy").set(
+                shared
+                    .health
+                    .healthy_count(&shared.backends, Instant::now()) as f64,
+            );
+
+            // Counters: monotonic totals. `absolute` rather than `increment`
+            // because the engine owns the running value — this republishes it
+            // rather than trying to track deltas, which would drift on every
+            // missed tick. These were `gauge!` before, which made a `_total`
+            // series a gauge and quietly broke `rate()` for anyone scraping it.
+            metrics::counter!("h2proxy_upstream_connects_total").absolute(stats.connects());
+            metrics::counter!("h2proxy_upstream_connect_failures_total")
+                .absolute(stats.connect_failures());
+            metrics::counter!("h2proxy_upstream_requests_total").absolute(stats.requests());
+            metrics::counter!("h2proxy_upstream_retries_total").absolute(stats.retries());
+            metrics::counter!("h2proxy_backend_ejections_total")
+                .absolute(shared.health.ejections());
+            for class in 1..=5u16 {
+                metrics::counter!("h2proxy_responses_total", "class" => format!("{class}xx"))
+                    .absolute(stats.responses(class as usize));
+            }
+
+            // The RED histogram. `metrics` has no "publish precomputed buckets"
+            // API, so the buckets are emitted as the counters Prometheus expects
+            // a histogram to be made of — `_bucket{le=…}`, `_sum`, `_count`.
+            // That keeps the `metrics` dependency in the binary, where it has
+            // always been, instead of leaking it into the engine for the sake of
+            // one histogram.
+            let buckets = stats.latency_buckets();
+            for (count, bound) in buckets.iter().zip(h2proxy_core::proxy::LATENCY_BUCKETS) {
+                let le = if bound.is_infinite() {
+                    "+Inf".to_string()
+                } else {
+                    bound.to_string()
+                };
+                metrics::counter!("h2proxy_request_duration_seconds_bucket", "le" => le)
+                    .absolute(*count);
+            }
+            metrics::counter!("h2proxy_request_duration_seconds_count")
+                .absolute(stats.latency_count());
+            metrics::gauge!("h2proxy_request_duration_seconds_sum")
+                .set(stats.latency_sum_seconds());
         }
     });
 }
@@ -336,6 +398,71 @@ fn drain_policy() -> DrainPolicy {
 /// How long to wait for upstream connections to finish after the clients have
 /// gone. Sized to sit inside the same container-stop budget as the client drain.
 const UPSTREAM_DRAIN_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Read a numeric override, keeping the default when it is missing or unusable.
+///
+/// Deliberately lenient: a typo in an environment variable must not stop a proxy
+/// from starting, because the failure mode of "refuses to boot on a bad env var"
+/// is an outage during a deploy, while the failure mode of "logs and uses the
+/// default" is a warning nobody acted on.
+fn env_num<T: std::str::FromStr + PartialOrd + Copy>(name: &str, fallback: T) -> T {
+    match std::env::var(name).ok().map(|v| v.parse::<T>()) {
+        None => fallback,
+        Some(Ok(value)) => value,
+        Some(Err(_)) => {
+            warn!(var = name, "unparseable value; using the default");
+            fallback
+        }
+    }
+}
+
+fn env_secs(name: &str, fallback: Duration) -> Duration {
+    let seconds = env_num(name, fallback.as_secs_f64());
+    if seconds.is_finite() && seconds >= 0.0 {
+        Duration::from_secs_f64(seconds)
+    } else {
+        fallback
+    }
+}
+
+/// The abuse-guard thresholds (design doc §6). Every one is overridable, because
+/// the right threshold is a property of the traffic and the traffic is not known
+/// until it is measured — see `just calibrate`.
+fn guard_limits() -> Limits {
+    let d = Limits::default();
+    Limits {
+        reset_burst: env_num("H2PROXYD_RESET_BURST", d.reset_burst),
+        reset_rate: env_num("H2PROXYD_RESET_RATE", d.reset_rate),
+        unanswered_burst: env_num("H2PROXYD_UNANSWERED_BURST", d.unanswered_burst),
+        unanswered_rate: env_num("H2PROXYD_UNANSWERED_RATE", d.unanswered_rate),
+        control_burst: env_num("H2PROXYD_CONTROL_BURST", d.control_burst),
+        control_rate: env_num("H2PROXYD_CONTROL_RATE", d.control_rate),
+        max_consecutive_empty: env_num("H2PROXYD_MAX_EMPTY_FRAMES", d.max_consecutive_empty),
+        max_continuations: env_num("H2PROXYD_MAX_CONTINUATIONS", d.max_continuations),
+        // The calibration run sets this; so does a cautious first rollout.
+        observe_only: std::env::var("H2PROXYD_GUARD_OBSERVE_ONLY").is_ok_and(|v| v != "0"),
+    }
+}
+
+/// Health-checking and ejection policy (design doc §5.2).
+fn health_policy() -> health::Policy {
+    let d = health::Policy::default();
+    health::Policy {
+        eject_after: env_num("H2PROXYD_EJECT_AFTER", d.eject_after),
+        base_backoff: env_secs("H2PROXYD_EJECT_BACKOFF", d.base_backoff),
+        max_backoff: env_secs("H2PROXYD_EJECT_MAX_BACKOFF", d.max_backoff),
+        ping_idle: env_secs("H2PROXYD_PING_IDLE", d.ping_idle),
+        ping_timeout: env_secs("H2PROXYD_PING_TIMEOUT", d.ping_timeout),
+        idle_timeout: env_secs("H2PROXYD_UPSTREAM_IDLE", d.idle_timeout),
+    }
+}
+
+/// Whether to append to a client-supplied `x-forwarded-for` rather than replace
+/// it. Off unless something trustworthy runs in front — see
+/// [`Proxy::trusting_forwarded_headers`].
+fn trust_forwarded() -> bool {
+    std::env::var("H2PROXYD_TRUST_FORWARDED").is_ok_and(|v| v != "0")
+}
 
 /// Body size the built-in responder returns for a request that does not ask for
 /// a specific one, via `H2PROXYD_BODY_SIZE`. Mirrors the `backend` crate's
@@ -394,7 +521,6 @@ fn init_metrics() {
         return;
     }
 
-    metrics::describe_gauge!("h2proxy_active_streams", "Currently open client streams");
     metrics::describe_counter!("h2proxy_requests_total", "Client requests proxied");
     metrics::describe_gauge!(
         "h2proxy_upstream_pool_connections",
@@ -417,13 +543,42 @@ fn init_metrics() {
         "h2proxy_bridge_buffered_bytes_peak",
         "High-water mark of h2proxy_bridge_buffered_bytes"
     );
-    metrics::describe_gauge!(
+    metrics::describe_counter!(
         "h2proxy_upstream_connects_total",
         "Upstream connections attempted"
     );
-    metrics::describe_gauge!(
+    metrics::describe_counter!(
         "h2proxy_upstream_connect_failures_total",
         "Upstream connections that failed to establish"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_client_streams_active",
+        "Client streams currently being proxied (zero in built-in-responder mode)"
+    );
+    metrics::describe_counter!(
+        "h2proxy_upstream_requests_total",
+        "Requests actually forwarded to a backend; the gap from \
+         h2proxy_requests_total is what the proxy answered itself (502/503)"
+    );
+    metrics::describe_counter!(
+        "h2proxy_upstream_retries_total",
+        "Second attempts made after a retryable upstream failure"
+    );
+    metrics::describe_counter!(
+        "h2proxy_backend_ejections_total",
+        "Times a backend was removed from rotation by health checking"
+    );
+    metrics::describe_gauge!("h2proxy_backends_healthy", "Backends currently in rotation");
+    metrics::describe_counter!(
+        "h2proxy_responses_total",
+        "Responses to clients, by status class"
+    );
+    // The D and E of RED. Emitted as the counters Prometheus expects a histogram
+    // to be made of, because the engine holds the buckets and owns no metrics
+    // dependency (design doc §7).
+    metrics::describe_counter!(
+        "h2proxy_request_duration_seconds_bucket",
+        "Cumulative count of proxied requests completing within each latency bound"
     );
     metrics::describe_counter!(
         "h2proxy_handshakes_total",
@@ -458,14 +613,18 @@ fn init_metrics() {
         "Times the outbound scheduler had octets queued but no window to send them in"
     );
     // Seed each series at zero so a scrape returns them before any traffic.
-    metrics::gauge!("h2proxy_active_streams").set(0.0);
     metrics::counter!("h2proxy_requests_total").increment(0);
     metrics::gauge!("h2proxy_upstream_pool_connections").set(0.0);
     metrics::gauge!("h2proxy_upstream_streams_active").set(0.0);
     metrics::gauge!("h2proxy_bridge_buffered_bytes").set(0.0);
     metrics::gauge!("h2proxy_bridge_buffered_bytes_peak").set(0.0);
-    metrics::gauge!("h2proxy_upstream_connects_total").set(0.0);
-    metrics::gauge!("h2proxy_upstream_connect_failures_total").set(0.0);
+    metrics::counter!("h2proxy_upstream_connects_total").absolute(0);
+    metrics::counter!("h2proxy_upstream_connect_failures_total").absolute(0);
+    metrics::gauge!("h2proxy_client_streams_active").set(0.0);
+    metrics::counter!("h2proxy_upstream_requests_total").absolute(0);
+    metrics::counter!("h2proxy_upstream_retries_total").absolute(0);
+    metrics::counter!("h2proxy_backend_ejections_total").absolute(0);
+    metrics::gauge!("h2proxy_backends_healthy").set(0.0);
     metrics::counter!("h2proxy_handshakes_total").increment(0);
     metrics::counter!("h2proxy_frames_received_total").increment(0);
     metrics::counter!("h2proxy_header_blocks_decoded_total").increment(0);

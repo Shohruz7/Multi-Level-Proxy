@@ -15,7 +15,7 @@
 //! across HEADERS + CONTINUATION and decoded through a *per-connection* codec,
 //! because the dynamic table spans every block the peer sends. Week 5 makes it
 //! a server — streams, flow control, and responses. The graceful GOAWAY drain
-//! and the Rapid-Reset / flood accounting are week 7 (design doc §6).
+//! and the Rapid-Reset / flood accounting live in [`crate::guard`] (§6).
 //!
 //! # One task, three sources of work (ADR 0013, amended by ADR 0015)
 //!
@@ -81,9 +81,9 @@ use crate::stream::{
 /// The flow-control windows already bound DATA in flight, but control frames —
 /// SETTINGS acks, PING acks, RST_STREAMs, WINDOW_UPDATEs — are not
 /// flow-controlled, so a peer that never reads its socket could otherwise grow
-/// this without limit. Week 7's flood limits attack the same problem from the
-/// other end; this is the backstop that makes a stalled writer cost bounded
-/// memory rather than unbounded.
+/// this without limit. [`crate::guard`]'s flood limits attack the same problem
+/// from the other end; this is the backstop that makes a stalled writer cost
+/// bounded memory rather than unbounded.
 pub const MAX_WRITE_QUEUE: usize = 256 * 1024;
 
 /// How long the last write on a dying connection may take before it is
@@ -209,8 +209,9 @@ pub const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 /// A separate bound from [`MAX_HEADER_LIST_SIZE`], and a necessary one: the
 /// decoded-size limit can only be applied once a block is complete, so without
 /// this a peer could stream CONTINUATION frames forever and grow the buffer
-/// without ever finishing a block. Week 7's CONTINUATION-flood mitigation
-/// builds on this.
+/// without ever finishing a block. [`crate::guard`]'s CONTINUATION *count*
+/// limit closes the other half: a stream of 1-octet frames stays under this
+/// cap forever.
 const MAX_HEADER_BLOCK_BYTES: usize = MAX_HEADER_LIST_SIZE as usize;
 
 /// HTTP/2 error codes (RFC 9113 §7), shared by connection errors (GOAWAY) and
@@ -473,7 +474,8 @@ impl Settings {
 //     window (`flow::CONNECTION_WINDOW`), which caps in-flight octets no matter
 //     how many streams are open.
 //   - Per-stream tasks exist to keep a slow *upstream* from blocking the reader.
-//     That problem arrives in week 6, and so should they.
+//     Week 6 solved that with a third select arm rather than a task per stream:
+//     the responder is a source of work, not a thing to wait on.
 // ---------------------------------------------------------------------------
 
 /// What a finished connection did, for the daemon's logs and metrics. Keeps the
@@ -542,7 +544,8 @@ enum Visit {
 /// GOAWAY). Week 5 adds the streams: inbound frames land on a [`StreamTable`],
 /// requests are answered by an `S: Service`, and outbound DATA is metered by two
 /// levels of flow-control window and interleaved by a round-robin scheduler. The
-/// graceful GOAWAY drain is week 7 and slots into this lifecycle unchanged.
+/// Week 7 added the graceful GOAWAY drain ([`DrainPolicy`]) and the abuse
+/// guard ([`crate::guard`]), both inside this same lifecycle.
 pub struct Connection<IO, S = Echo> {
     /// The socket, halved so a read future and a write future can be in flight
     /// at once (ADR 0015). Week 5 owned `io` whole and called `write_all` from
@@ -1303,8 +1306,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
                 self.summary.handshake_completed = true;
             }
             Frame::Settings { ack: true, .. } => {
-                // The peer accepted ours. Enforcing SETTINGS_TIMEOUT when this
-                // never arrives is week-7 hardening.
+                // The peer accepted ours. A peer that never acknowledges is
+                // not currently treated as a SETTINGS_TIMEOUT — it costs us
+                // nothing to keep serving one, and the flood limits already
+                // bound the frames it can spend while not answering.
                 trace!("peer acknowledged our SETTINGS");
             }
             Frame::Ping { data, ack: false } => {
@@ -1315,8 +1320,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
                 self.queue_frame(&pong)?;
             }
             Frame::Ping { ack: true, .. } => {
-                // A reply to a keepalive we sent; nothing to do until week 7
-                // starts measuring them.
+                // A reply to a keepalive we sent. Nothing to do on the client
+                // leg: it is the *upstream* leg that pings to prove a backend is
+                // still alive, and it matches the nonce itself.
             }
             Frame::GoAway {
                 last_stream_id,

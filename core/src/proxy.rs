@@ -406,6 +406,12 @@ pub struct Proxy {
     shared: Arc<Shared>,
     events: Option<Events>,
     routes: HashMap<StreamId, Route>,
+    /// The client's address, for `x-forwarded-for`. `None` when the caller has
+    /// no socket to name — the differential tests run the engine over a duplex
+    /// pipe, and inventing an address there would be a lie in a header.
+    peer: Option<std::net::IpAddr>,
+    /// Whether to believe a client-supplied `x-forwarded-for` and append to it.
+    trust_forwarded: bool,
 }
 
 impl Proxy {
@@ -414,7 +420,32 @@ impl Proxy {
             shared,
             events: None,
             routes: HashMap::new(),
+            peer: None,
+            trust_forwarded: false,
         }
+    }
+
+    /// Name the client, so requests carry `x-forwarded-for`.
+    ///
+    /// Per client connection, which is why this lives on `Proxy` and not in the
+    /// engine: `conn.rs` needs no knowledge of sockets for any of this.
+    pub fn with_peer(mut self, peer: std::net::IpAddr) -> Self {
+        self.peer = Some(peer);
+        self
+    }
+
+    /// Append to a client-supplied `x-forwarded-for` instead of replacing it.
+    ///
+    /// **Off by default, and that is the security-relevant choice.** Appending
+    /// means any client can prepend whatever addresses it likes and the backend
+    /// cannot tell which entry we observed and which the client invented — so an
+    /// allowlist or rate limit keyed on the first entry is trivially forged. The
+    /// proxy sits directly behind an NLB (ADR 0005), which adds no such header,
+    /// so the peer address *is* the client and overwriting is both correct and
+    /// safe. Turn this on only when something trustworthy runs in front.
+    pub fn trusting_forwarded_headers(mut self, trust: bool) -> Self {
+        self.trust_forwarded = trust;
+        self
     }
 
     fn emit(&self, event: ServiceEvent) {
@@ -447,6 +478,47 @@ impl Proxy {
     /// rewrites it silently changes which virtual host the backend serves.
     fn sanitize(head: &mut RequestHead) {
         head.fields.retain(|field| field.name.as_ref() != b"te");
+    }
+
+    /// Tell the backend who the client is (`x-forwarded-for`) and how it reached
+    /// us (`x-forwarded-proto`).
+    ///
+    /// RFC 7239's `Forwarded` is the standardised header and is deliberately not
+    /// emitted: almost nothing reads it, and sending both means two sources of
+    /// truth that can disagree. `x-forwarded-for` is what backends actually
+    /// parse.
+    fn add_forwarded(&self, head: &mut RequestHead) {
+        let Some(peer) = self.peer else {
+            return;
+        };
+        let existing = self
+            .trust_forwarded
+            .then(|| {
+                head.fields
+                    .iter()
+                    .find(|f| f.name.as_ref() == b"x-forwarded-for")
+                    .map(|f| f.value.clone())
+            })
+            .flatten();
+
+        head.fields.retain(|f| {
+            f.name.as_ref() != b"x-forwarded-for" && f.name.as_ref() != b"x-forwarded-proto"
+        });
+
+        let value = match existing {
+            Some(chain) => format!("{}, {peer}", String::from_utf8_lossy(&chain)),
+            None => peer.to_string(),
+        };
+        head.fields.push(Header::new(
+            Bytes::from_static(b"x-forwarded-for"),
+            Bytes::from(value.into_bytes()),
+        ));
+        head.fields.push(Header::new(
+            Bytes::from_static(b"x-forwarded-proto"),
+            // The client leg is TLS by construction — the daemon terminates it
+            // and only hands us an h2-over-TLS stream (ADR 0005, 0017).
+            Bytes::from_static(b"https"),
+        ));
     }
 
     /// Send one attempt of a request to a backend.
@@ -532,9 +604,7 @@ impl Proxy {
     /// healthiest exactly when things are worst.
     fn finished(&self, route: &Route) {
         self.shared.stats.close_client_stream();
-        self.shared
-            .stats
-            .observe_latency(route.started.elapsed());
+        self.shared.stats.observe_latency(route.started.elapsed());
     }
 
     /// Try this stream again on a different backend, if it is safe to.
@@ -588,6 +658,7 @@ impl Service for Proxy {
 
     fn dispatch(&mut self, id: StreamId, mut head: RequestHead, end_stream: bool) {
         Self::sanitize(&mut head);
+        self.add_forwarded(&mut head);
         // Kept only if it could ever be replayed — see `Route::head`.
         let retryable = end_stream && IDEMPOTENT.contains(&head.method.as_ref());
         let spare = retryable.then(|| Box::new(head.clone()));
@@ -764,6 +835,86 @@ mod tests {
             "rewriting the authority would change which vhost the backend serves",
         );
         assert!(head.fields.iter().any(|f| f.name.as_ref() == b"accept"));
+    }
+
+    fn forwarded_for(head: &RequestHead) -> Option<String> {
+        head.fields
+            .iter()
+            .find(|f| f.name.as_ref() == b"x-forwarded-for")
+            .map(|f| String::from_utf8_lossy(&f.value).into_owned())
+    }
+
+    fn proxy_with_peer(trust: bool) -> Proxy {
+        Proxy::new(Shared::new(Vec::new(), 1))
+            .with_peer(std::net::IpAddr::from([203, 0, 113, 7]))
+            .trusting_forwarded_headers(trust)
+    }
+
+    #[test]
+    fn a_forged_forwarded_for_is_replaced_by_default() {
+        // The security-relevant default. Appending to a client-supplied chain
+        // lets any client prepend whatever it likes, and the backend then cannot
+        // tell which entry we observed from which the client invented — so an
+        // allowlist or rate limit keyed on the first entry is trivially forged.
+        let mut head = request("/");
+        head.fields.push(Header::new(
+            Bytes::from_static(b"x-forwarded-for"),
+            Bytes::from_static(b"10.0.0.1, 192.168.1.1"),
+        ));
+        proxy_with_peer(false).add_forwarded(&mut head);
+        assert_eq!(
+            forwarded_for(&head).as_deref(),
+            Some("203.0.113.7"),
+            "the client's own claim about who it is must not survive",
+        );
+        assert_eq!(
+            head.fields
+                .iter()
+                .filter(|f| f.name.as_ref() == b"x-forwarded-for")
+                .count(),
+            1,
+            "exactly one x-forwarded-for, or the backend picks arbitrarily",
+        );
+    }
+
+    #[test]
+    fn a_trusted_chain_is_appended_to() {
+        // Only when something trustworthy runs in front and the operator says so.
+        let mut head = request("/");
+        head.fields.push(Header::new(
+            Bytes::from_static(b"x-forwarded-for"),
+            Bytes::from_static(b"10.0.0.1"),
+        ));
+        proxy_with_peer(true).add_forwarded(&mut head);
+        assert_eq!(
+            forwarded_for(&head).as_deref(),
+            Some("10.0.0.1, 203.0.113.7"),
+        );
+    }
+
+    #[test]
+    fn without_a_peer_no_forwarding_header_is_invented() {
+        // The engine runs over duplex pipes in the differential tests, where
+        // there is no address to name. Making one up would be a lie in a header
+        // a backend might act on.
+        let mut head = request("/");
+        Proxy::new(Shared::new(Vec::new(), 1)).add_forwarded(&mut head);
+        assert_eq!(forwarded_for(&head), None);
+    }
+
+    #[test]
+    fn the_latency_histogram_buckets_cumulatively() {
+        let stats = ProxyStats::default();
+        stats.observe_latency(Duration::from_micros(400));
+        stats.observe_latency(Duration::from_millis(4));
+        let buckets = stats.latency_buckets();
+        // 0.4 ms falls in the 0.0005 bucket and every one above it; 4 ms starts
+        // at 0.005. Cumulative means the last bucket holds everything.
+        assert_eq!(buckets[0], 0, "nothing was under 0.1 ms");
+        assert_eq!(buckets[2], 1, "0.4 ms is at or under 0.5 ms");
+        assert_eq!(buckets[6], 2, "both are at or under 5 ms");
+        assert_eq!(buckets[LATENCY_BUCKETS.len() - 1], 2, "+Inf holds all");
+        assert_eq!(stats.latency_count(), 2);
     }
 
     #[tokio::test]

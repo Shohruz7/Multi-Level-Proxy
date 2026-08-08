@@ -2,9 +2,9 @@
 //!
 //! Maintains warm HTTP/2 connections per backend, opens more on demand up to
 //! the backend's advertised `MAX_CONCURRENT_STREAMS`, and retires them on
-//! failure or stream-id exhaustion. Coalescing is the project thesis made
-//! concrete: many client streams — arriving over many *client connections* —
-//! ride few upstream ones.
+//! failure, idle timeout, or stream-id exhaustion. Coalescing is the project
+//! thesis made concrete: many client streams — arriving over many *client
+//! connections* — ride few upstream ones.
 //!
 //! # A checkout never waits
 //!
@@ -32,7 +32,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
@@ -59,8 +60,6 @@ const ID_EXHAUSTION_MARGIN: u32 = 64;
 pub enum PoolError {
     #[error("backend {0:?} is unreachable")]
     Unreachable(Backend),
-    #[error("backend {0:?} is at its concurrent-stream limit")]
-    Exhausted(Backend),
     #[error("no backend is configured")]
     NoBackend,
 }
@@ -83,21 +82,34 @@ pub struct UpstreamRecord {
     max_concurrent: AtomicUsize,
     /// Set when the connection task has gone or is going away.
     closed: AtomicBool,
+    /// Millis since this pool was built, at the last checkout. An atomic rather
+    /// than an `Instant` so the hot path stays lock-free and the record stays
+    /// `Sync` without a mutex.
+    last_used_ms: AtomicU64,
 }
 
 impl UpstreamRecord {
-    fn new(handle: UpstreamHandle) -> Self {
+    fn new(handle: UpstreamHandle, now_ms: u64) -> Self {
         UpstreamRecord {
             handle,
             live: AtomicUsize::new(0),
             issued: AtomicU32::new(0),
             max_concurrent: AtomicUsize::new(ASSUMED_MAX_CONCURRENT),
             closed: AtomicBool::new(false),
+            last_used_ms: AtomicU64::new(now_ms),
         }
     }
 
-    fn usable(&self) -> bool {
-        !self.closed.load(Ordering::Relaxed)
+    fn usable(&self, now_ms: u64, idle_timeout_ms: u64) -> bool {
+        // An idle connection is recycled rather than kept forever. The timeout
+        // sits *under* the common 65 s upstream keep-alive so that we close
+        // first: racing a backend's own idle close means occasionally handing a
+        // request to a socket that is already going away, and the client sees
+        // that as a failure rather than as the housekeeping it is.
+        let idle_ms = now_ms.saturating_sub(self.last_used_ms.load(Ordering::Relaxed));
+        let idle_and_empty = idle_ms >= idle_timeout_ms && self.live.load(Ordering::Relaxed) == 0;
+        !idle_and_empty
+            && !self.closed.load(Ordering::Relaxed)
             && !self.handle.is_closed()
             // Two ids per request (odd only), so the id space runs out at half
             // the count. A connection that reaches it is retired rather than
@@ -110,7 +122,8 @@ impl UpstreamRecord {
     }
 
     /// Claim a slot on this connection for one request.
-    fn lease(self: &Arc<Self>) -> Lease {
+    fn lease(self: &Arc<Self>, now_ms: u64) -> Lease {
+        self.last_used_ms.store(now_ms, Ordering::Relaxed);
         let request = self.issued.fetch_add(1, Ordering::Relaxed);
         self.live.fetch_add(1, Ordering::Relaxed);
         Lease {
@@ -181,15 +194,39 @@ pub struct Pool {
     /// connection is full, so a healthy backend with a generous
     /// `MAX_CONCURRENT_STREAMS` stays at one.
     max_conns_per_backend: usize,
+    /// When this pool was built. Idle ages are millis from here, so the record
+    /// can hold a plain `AtomicU64` instead of a lock around an `Instant`.
+    epoch: Instant,
+    /// How long a connection may sit unused before it is recycled.
+    idle_timeout_ms: u64,
 }
 
 impl Pool {
     pub fn new(stats: Arc<ProxyStats>, max_conns_per_backend: usize) -> Self {
+        Self::with_idle_timeout(
+            stats,
+            max_conns_per_backend,
+            crate::health::Policy::default().idle_timeout,
+        )
+    }
+
+    pub fn with_idle_timeout(
+        stats: Arc<ProxyStats>,
+        max_conns_per_backend: usize,
+        idle_timeout: std::time::Duration,
+    ) -> Self {
         Pool {
             backends: Mutex::new(HashMap::new()),
             stats,
             max_conns_per_backend: max_conns_per_backend.max(1),
+            epoch: Instant::now(),
+            idle_timeout_ms: idle_timeout.as_millis() as u64,
         }
+    }
+
+    /// Millis since this pool was built.
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
     }
 
     /// Lease a slot on a connection to `backend`, opening one if every warm
@@ -201,7 +238,9 @@ impl Pool {
         // Drop connections that have died since we last looked. Doing it here
         // rather than on a timer keeps the pool free of a reaper task, and the
         // list is short by construction.
-        pool.conns.retain(|record| record.usable());
+        let now_ms = self.now_ms();
+        pool.conns
+            .retain(|record| record.usable(now_ms, self.idle_timeout_ms));
 
         // Prefer the *fullest* connection that still has room. Filling one
         // before opening another is what coalescing means — spreading streams
@@ -213,13 +252,13 @@ impl Pool {
             .filter(|record| record.has_room())
             .max_by_key(|record| record.live.load(Ordering::Relaxed))
         {
-            return Ok(record.lease());
+            return Ok(record.lease(now_ms));
         }
 
         if pool.conns.len() < self.max_conns_per_backend {
-            let record = self.open(*backend);
+            let record = self.open(*backend, now_ms);
             pool.conns.push(Arc::clone(&record));
-            return Ok(record.lease());
+            return Ok(record.lease(now_ms));
         }
 
         // At the connection ceiling with every connection full: lease from the
@@ -235,7 +274,7 @@ impl Pool {
         pool.conns
             .iter()
             .min_by_key(|record| record.live.load(Ordering::Relaxed))
-            .map(|record| record.lease())
+            .map(|record| record.lease(now_ms))
             .ok_or(PoolError::Unreachable(*backend))
     }
 
@@ -262,19 +301,25 @@ impl Pool {
 
     /// Warm connections currently held, for the pool-utilization gauge (§7).
     pub fn connection_count(&self) -> usize {
+        let now_ms = self.now_ms();
         self.backends
             .lock()
             .expect("pool mutex poisoned")
             .values()
-            .map(|pool| pool.conns.iter().filter(|c| c.usable()).count())
+            .map(|pool| {
+                pool.conns
+                    .iter()
+                    .filter(|c| c.usable(now_ms, self.idle_timeout_ms))
+                    .count()
+            })
             .sum()
     }
 
     /// Create the record and start connecting. The record is usable
     /// immediately; the socket catches up.
-    fn open(&self, backend: Backend) -> Arc<UpstreamRecord> {
+    fn open(&self, backend: Backend, now_ms: u64) -> Arc<UpstreamRecord> {
         let (handle, inbox) = crate::upstream::channel();
-        let record = Arc::new(UpstreamRecord::new(handle));
+        let record = Arc::new(UpstreamRecord::new(handle, now_ms));
         let stats = Arc::clone(&self.stats);
         let task_record = Arc::clone(&record);
 
@@ -325,13 +370,13 @@ mod tests {
         let (handle, rx) = crate::upstream::channel();
         // Keep the receiver alive: a dropped one makes the handle look closed.
         Box::leak(Box::new(rx));
-        Arc::new(UpstreamRecord::new(handle))
+        Arc::new(UpstreamRecord::new(handle, 0))
     }
 
     #[test]
     fn every_lease_names_a_distinct_request() {
         let record = record();
-        let leases: Vec<Lease> = (0..100).map(|_| record.lease()).collect();
+        let leases: Vec<Lease> = (0..100).map(|_| record.lease(0)).collect();
         let ids: Vec<u32> = leases.iter().map(|l| l.id.get()).collect();
         assert!(
             ids.windows(2).all(|w| w[0] < w[1]),
@@ -344,7 +389,7 @@ mod tests {
     fn dropping_a_lease_frees_the_slot() {
         let record = record();
         {
-            let _lease = record.lease();
+            let _lease = record.lease(0);
             assert_eq!(record.live.load(Ordering::Relaxed), 1);
         }
         assert_eq!(record.live.load(Ordering::Relaxed), 0);
@@ -353,12 +398,12 @@ mod tests {
     #[test]
     fn a_connection_stops_being_usable_near_the_end_of_the_id_space() {
         let record = record();
-        assert!(record.usable());
+        assert!(record.usable(0, u64::MAX));
         record
             .issued
             .store(MAX_LOCAL_STREAM_ID / 2, Ordering::Relaxed);
         assert!(
-            !record.usable(),
+            !record.usable(0, u64::MAX),
             "an exhausted connection must be replaced, not wrapped: ids are never reused",
         );
     }
@@ -367,8 +412,8 @@ mod tests {
     fn room_follows_the_backends_advertised_limit() {
         let record = record();
         record.set_max_concurrent(2);
-        let _a = record.lease();
-        let _b = record.lease();
+        let _a = record.lease(0);
+        let _b = record.lease(0);
         assert!(!record.has_room(), "at the backend's limit");
     }
 
@@ -397,6 +442,49 @@ mod tests {
         first.record.set_max_concurrent(1);
         let _second = pool.checkout(&backend(2)).expect("a second lease");
         assert_eq!(pool.connection_count(), 2);
+    }
+
+    #[test]
+    fn an_idle_connection_is_recycled_but_a_busy_one_is_not() {
+        // The pool doc has promised idle recycling since week 6 without it
+        // existing. It matters for a specific reason: the common upstream
+        // keep-alive is 65 s, so a pool that holds connections forever
+        // eventually hands a request to a socket the backend is closing, and the
+        // client sees a failure rather than the housekeeping it is.
+        let record = record();
+        assert!(
+            record.usable(1_000, 60_000),
+            "fresh, and inside the timeout"
+        );
+        assert!(
+            record.usable(60_000, 60_000) || record.live.load(Ordering::Relaxed) == 0,
+            "sanity",
+        );
+
+        // Idle past the timeout with nothing in flight: recycle.
+        assert!(!record.usable(60_001, 60_000));
+
+        // Same age, but a stream is live: keep it. Recycling a connection with
+        // work on it would abandon that work.
+        let _lease = record.lease(0);
+        assert!(
+            record.usable(60_001, 60_000),
+            "a connection with a live stream is not idle, however old",
+        );
+    }
+
+    #[test]
+    fn a_checkout_keeps_a_connection_from_going_idle() {
+        let record = record();
+        let lease = record.lease(0);
+        drop(lease);
+        assert!(!record.usable(60_001, 60_000), "idle since ms 0");
+        let lease = record.lease(60_000);
+        drop(lease);
+        assert!(
+            record.usable(60_001, 60_000),
+            "a checkout must count as use, or a busy pool churns its connections",
+        );
     }
 
     #[tokio::test]

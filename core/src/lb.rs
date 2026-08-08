@@ -13,9 +13,9 @@
 //! Two random samples land within a constant factor of optimal while looking at
 //! two counters.
 //!
-//! Week 7 adds the resilience half behind the same trait: active + passive
-//! health checking with outlier ejection and probe-back, and conservative
-//! idempotent-only retries (§5.3). Both fit by filtering the candidate list.
+//! The resilience half lives beside it rather than inside it: [`crate::health`]
+//! filters the candidate list before `pick` ever sees it, so eligibility and
+//! balancing stay separable and this stays a pure function of its input.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,8 +48,10 @@ pub struct BackendLoad {
 
 /// The load-balancing seam (design doc §5.1).
 pub trait LoadBalancer: Send + Sync + std::fmt::Debug {
-    /// Choose a backend for a new request, or `None` if none are eligible
-    /// (e.g. all ejected by week 7's health checking).
+    /// Choose a backend for a new request, or `None` if the candidate list is
+    /// empty. Candidates have already been filtered by [`crate::health`]; note
+    /// that it fails *open*, so "every backend is unhealthy" arrives here as the
+    /// full list rather than as an empty one.
     fn pick(&self, candidates: &[BackendLoad]) -> Option<Backend>;
 }
 
