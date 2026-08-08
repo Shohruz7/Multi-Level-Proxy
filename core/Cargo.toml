@@ -18,3 +18,10 @@ h2.workspace = true
 http.workspace = true
 proptest.workspace = true
 criterion.workspace = true
+
+# The first use of the criterion dependency, which has been declared since week 1
+# and unused since week 1. Week 7 adds per-frame work, so "it costs nothing"
+# finally needs a number.
+[[bench]]
+name = "hot_path"
+harness = false

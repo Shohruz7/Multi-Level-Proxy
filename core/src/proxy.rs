@@ -767,6 +767,22 @@ impl Service for Proxy {
                 Some(event)
             }
 
+            ServiceEvent::Gone { id } => {
+                let Some(route) = self.routes.get(id) else {
+                    return Some(event);
+                };
+                let backend = route.backend;
+                // The connection died rather than the backend answering. This
+                // is the one signal that genuinely says "this backend is not
+                // reachable", and mistaking it for a response is what left
+                // health checking inert: a killed backend produced 18% 5xx with
+                // the ejection counter at zero.
+                self.shared.health.failure(&backend, Instant::now());
+                if self.retry(*id) {
+                    return None;
+                }
+                Some(event)
+            }
             ServiceEvent::Reset { id, code } => {
                 let Some(route) = self.routes.get(id) else {
                     return Some(event);

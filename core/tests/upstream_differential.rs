@@ -286,7 +286,7 @@ async fn a_backend_reset_reaches_the_client_as_a_stream_error() {
 }
 
 #[tokio::test]
-async fn a_dead_backend_becomes_a_502_rather_than_a_hang() {
+async fn a_dead_backend_is_reported_rather_than_left_to_hang() {
     let (ours, theirs) = tokio::io::duplex(4096);
     let (handle, inbox) = channel();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -312,16 +312,17 @@ async fn a_dead_backend_becomes_a_502_rather_than_a_hang() {
         .expect("the client is told something")
         .expect("an event");
     match event {
-        ServiceEvent::Head {
-            id,
-            response,
-            end_stream,
-        } => {
-            assert_eq!(id, StreamId::new(5));
-            assert_eq!(response.status, 502);
-            assert!(end_stream, "a synthetic error response carries no body");
-        }
-        other => panic!("expected a 502, got {other:?}"),
+        // `Gone`, not a 502. The engine reports *what happened* — the connection
+        // died before answering — and the connection layer renders that as a 502
+        // (or a reset, if a `:status` already went out). Week 7 split the two
+        // because collapsing them made every dead connection indistinguishable
+        // from a backend answering 502, and health checking, which can only act
+        // on the difference, never ejected anything.
+        //
+        // The client-visible 502 is still asserted, one layer up, by
+        // `proxy_e2e::with_no_backend_reachable_the_client_gets_a_status_not_a_hang`.
+        ServiceEvent::Gone { id } => assert_eq!(id, StreamId::new(5)),
+        other => panic!("expected Gone, got {other:?}"),
     }
 }
 

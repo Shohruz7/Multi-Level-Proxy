@@ -481,7 +481,7 @@ impl Settings {
 /// What a finished connection did, for the daemon's logs and metrics. Keeps the
 /// `metrics` crate out of the engine: the binary owns instrumentation, the
 /// library just reports.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct ConnectionSummary {
     /// Whether the preface + SETTINGS exchange completed (§3.4).
     pub handshake_completed: bool,
@@ -509,6 +509,15 @@ pub struct ConnectionSummary {
     /// got as far as committing a GOAWAY id — rather than being closed by the
     /// peer or by an error.
     pub drained: bool,
+    /// The highest rate this connection reached on each guarded signal.
+    ///
+    /// Reported so the daemon can publish it, which is what makes threshold
+    /// tuning a measurement instead of an argument: the calibration run drives
+    /// legitimate traffic in observe-only mode and reads the headroom off these
+    /// (design doc §6).
+    pub guard_peaks: crate::guard::Peaks,
+    /// The signal that closed this connection, if the guard closed it.
+    pub guard_tripped: Option<crate::guard::Signal>,
 }
 
 /// Why the reader loop stopped.
@@ -739,7 +748,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
         let stop = self.drive().await;
         self.summary.peak_concurrent_streams = self.streams.peak_concurrent();
         self.summary.streams_opened = self.streams.opened();
+        self.summary.guard_peaks = self.guard.peaks(Instant::now());
         if let Stop::Failed(err) = stop {
+            if err.code == ErrorCode::EnhanceYourCalm {
+                self.summary.guard_tripped = self.guard.last_trip();
+            }
             warn!(code = ?err.code, reason = %err.debug, "connection error; sending GOAWAY");
             let go_away = Frame::GoAway {
                 last_stream_id: self.streams.highest_peer_id(),
@@ -1123,6 +1136,21 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             }
             ServiceEvent::BodyAccepted { id, n } => {
                 self.release_recv_window(id, n)?;
+            }
+            ServiceEvent::Gone { id } => {
+                // The upstream died before answering. Which of the two endings
+                // is available depends on whether a `:status` is already on the
+                // wire — once it is, there is no way to un-send it and the only
+                // truthful ending left is an abort.
+                let started = self
+                    .streams
+                    .get_mut(id)
+                    .is_some_and(|stream| stream.response_started);
+                if started {
+                    self.write_rst_stream(id, ErrorCode::InternalError)?;
+                } else {
+                    self.reject_stream(id, 502)?;
+                }
             }
             ServiceEvent::Reset { id, code } => {
                 if self.streams.get_mut(id).is_some() {

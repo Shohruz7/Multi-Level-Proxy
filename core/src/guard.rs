@@ -125,6 +125,14 @@ pub struct Limits {
     /// Unanswered resets per second. The sharpest Rapid Reset signal there is:
     /// the attack's whole shape is opening streams and abandoning them before
     /// they can be served.
+    ///
+    /// Raised from 5 to 15 by the calibration run. Legitimate traffic — mostly
+    /// h2spec, which resets unanswered streams deliberately — peaked at 1/s,
+    /// and 5 left only 5x headroom against the 10x rule. Still well under
+    /// `reset_rate`, so it remains the tighter and more specific of the two, and
+    /// still trips an attack in well under a second: Rapid Reset exhausts
+    /// `unanswered_burst` on its first flight of frames, long before the rate
+    /// matters.
     pub unanswered_rate: f64,
 
     /// Control frames absorbed instantly — enough for a settings exchange plus
@@ -166,7 +174,7 @@ impl Default for Limits {
             reset_burst: 100.0,
             reset_rate: 20.0,
             unanswered_burst: 50.0,
-            unanswered_rate: 5.0,
+            unanswered_rate: 15.0,
             control_burst: 200.0,
             control_rate: 50.0,
             max_consecutive_empty: 32,
@@ -270,17 +278,28 @@ impl RateMeter {
         self.count = self.count.saturating_add(1);
     }
 
-    /// The peak, including a window still in progress — otherwise a short-lived
-    /// attack connection reports zero, which is exactly the case worth seeing.
+    /// The peak *sustained* rate, including a window still in progress —
+    /// otherwise a short-lived attack connection reports zero, which is exactly
+    /// the case worth seeing.
+    ///
+    /// The in-progress window is divided by a full [`Self::WINDOW`] even when
+    /// less than that has elapsed, and that floor is the whole subtlety.
+    /// Dividing by the real elapsed time *extrapolates*: two control frames
+    /// 200 us apart become "10,000 per second", and a connection that lived for
+    /// a millisecond reports a rate no traffic ever reached. The first
+    /// calibration run measured 40,631 control frames/sec against ordinary
+    /// `h2load` traffic for exactly that reason, which would have made every
+    /// threshold below look hopelessly tight.
+    ///
+    /// Bursts are not lost by this — that is what the bucket's `burst` is for.
+    /// This measures the sustained rate the *rate* limit is set against, and a
+    /// burst compressed into a moment is not a sustained rate.
     fn peak(&self, now: Instant) -> f64 {
         let elapsed = now
             .saturating_duration_since(self.window_start)
+            .max(Self::WINDOW)
             .as_secs_f64();
-        let partial = if elapsed > 0.0 {
-            f64::from(self.count) / elapsed
-        } else {
-            0.0
-        };
+        let partial = f64::from(self.count) / elapsed;
         self.peak_per_sec.max(partial)
     }
 }
@@ -328,6 +347,9 @@ pub struct Guard {
     continuations: u32,
     peak_empty: u32,
     peak_continuations: u32,
+    /// What tripped, kept so the connection can name it in a metric label after
+    /// the verdict has become a `ConnectionError`.
+    last_trip: Option<Signal>,
 }
 
 impl Guard {
@@ -341,14 +363,21 @@ impl Guard {
             continuations: 0,
             peak_empty: 0,
             peak_continuations: 0,
+            last_trip: None,
         }
     }
 
+    /// The signal that tripped, if one did.
+    pub const fn last_trip(&self) -> Option<Signal> {
+        self.last_trip
+    }
+
     /// A trip, unless we are only observing.
-    fn verdict(&self, signal: Signal) -> Verdict {
+    fn verdict(&mut self, signal: Signal) -> Verdict {
         if self.limits.observe_only {
             Verdict::Ok
         } else {
+            self.last_trip = Some(signal);
             Verdict::Trip(signal)
         }
     }
@@ -645,6 +674,28 @@ mod tests {
         assert!(
             (90.0..=110.0).contains(&peak),
             "expected about 100/s, measured {peak}",
+        );
+    }
+
+    #[test]
+    fn a_short_burst_is_not_reported_as_a_colossal_rate() {
+        // The bug the first calibration run found in its own instrument.
+        // Dividing an in-progress window by the elapsed time extrapolates: two
+        // events 200 us apart read as 10,000 per second, and a connection that
+        // lived a millisecond reported a rate no traffic ever reached. Against
+        // ordinary `h2load` the gauge said 40,631 control frames/sec, which
+        // would have condemned every threshold as hopelessly tight.
+        //
+        // Bursts are the bucket's job; this measures *sustained* rate.
+        let (mut g, base) = guard(Limits::permissive());
+        for i in 0..5u64 {
+            let _ = g.on_control_frame(base + Duration::from_micros(i * 50));
+        }
+        let peak = g.peaks(base + Duration::from_micros(200)).control_per_sec;
+        assert!(
+            peak <= 5.0,
+            "five events inside a millisecond reported as {peak}/s; a partial \
+             window must be scored over a whole one, not extrapolated",
         );
     }
 

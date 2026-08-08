@@ -250,6 +250,17 @@ async fn handle_connection(
     metrics::counter!("h2proxy_flow_control_stalls_total").increment(summary.flow_control_stalls);
     metrics::gauge!("h2proxy_stream_concurrency_max")
         .set(f64::from(summary.peak_concurrent_streams));
+    // The calibration inputs (design doc §6). Published as high-water marks
+    // across the process, because what matters for a threshold is the worst any
+    // one connection reached, not an average that hides it.
+    record_guard_peaks(&summary);
+    if let Some(signal) = summary.guard_tripped {
+        metrics::counter!(
+            "h2proxy_connections_terminated_total",
+            "reason" => signal.as_str(),
+        )
+        .increment(1);
+    }
     info!(
         %peer,
         handshake = summary.handshake_completed,
@@ -262,6 +273,39 @@ async fn handle_connection(
         stalls = summary.flow_control_stalls,
         "connection closed",
     );
+}
+
+/// Publish the guard's per-connection peaks as process-wide high-water marks.
+///
+/// This is the input to threshold tuning. A threshold is only defensible next to
+/// the peak legitimate traffic actually produced — `just calibrate` runs the
+/// honest profiles in observe-only mode and reads the headroom off these gauges,
+/// which is the difference between a tuned system and a plausible one.
+fn record_guard_peaks(summary: &h2proxy_core::conn::ConnectionSummary) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // One high-water mark per signal, as bits of an f64 so the update is a plain
+    // CAS loop and the sampler needs no lock.
+    static PEAKS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    const NAMES: [&str; 3] = [
+        "h2proxy_guard_peak_reset_rate",
+        "h2proxy_guard_peak_unanswered_rate",
+        "h2proxy_guard_peak_control_rate",
+    ];
+    let observed = [
+        summary.guard_peaks.resets_per_sec,
+        summary.guard_peaks.unanswered_per_sec,
+        summary.guard_peaks.control_per_sec,
+    ];
+    for ((slot, name), value) in PEAKS.iter().zip(NAMES).zip(observed) {
+        let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (value > f64::from_bits(current)).then(|| value.to_bits())
+        });
+        metrics::gauge!(name).set(f64::from_bits(slot.load(Ordering::Relaxed)));
+    }
+    metrics::gauge!("h2proxy_guard_peak_consecutive_empty")
+        .set(f64::from(summary.guard_peaks.max_consecutive_empty));
+    metrics::gauge!("h2proxy_guard_peak_continuations")
+        .set(f64::from(summary.guard_peaks.max_continuations));
 }
 
 /// The backends to proxy to, from `H2PROXYD_UPSTREAMS` — a comma-separated list
@@ -577,6 +621,22 @@ fn init_metrics() {
     // to be made of, because the engine holds the buckets and owns no metrics
     // dependency (design doc §7).
     metrics::describe_counter!(
+        "h2proxy_connections_terminated_total",
+        "Connections closed by the abuse guard, labelled with the signal that tripped"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_guard_peak_reset_rate",
+        "Highest RST_STREAM rate any one connection reached, for threshold calibration"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_guard_peak_unanswered_rate",
+        "Highest rate of resets on unanswered streams — the Rapid Reset signature"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_guard_peak_control_rate",
+        "Highest PING+SETTINGS rate any one connection reached"
+    );
+    metrics::describe_counter!(
         "h2proxy_request_duration_seconds_bucket",
         "Cumulative count of proxied requests completing within each latency bound"
     );
@@ -632,6 +692,9 @@ fn init_metrics() {
     metrics::counter!("h2proxy_streams_reset_total").increment(0);
     metrics::gauge!("h2proxy_stream_concurrency_max").set(0.0);
     metrics::counter!("h2proxy_data_bytes_sent_total").increment(0);
+    metrics::gauge!("h2proxy_guard_peak_reset_rate").set(0.0);
+    metrics::gauge!("h2proxy_guard_peak_unanswered_rate").set(0.0);
+    metrics::gauge!("h2proxy_guard_peak_control_rate").set(0.0);
     metrics::counter!("h2proxy_flow_control_stalls_total").increment(0);
 
     info!(%addr, "metrics exporter listening at /metrics");

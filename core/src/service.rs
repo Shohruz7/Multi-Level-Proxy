@@ -349,6 +349,20 @@ pub enum ServiceEvent {
     BodyAccepted { id: StreamId, n: u32 },
     /// Abort this stream with `code` (RST_STREAM).
     Reset { id: StreamId, code: ErrorCode },
+    /// The upstream connection carrying this stream died before it could
+    /// answer — a connect failure, a socket error, a task that went away.
+    ///
+    /// Distinct from a `Head` carrying 502, which is what this used to be, and
+    /// the distinction is load-bearing: a 502 *from a backend* proves the
+    /// backend is there and answering, while this proves the opposite. Collapsed
+    /// into one event, health checking recorded every dead connection as a
+    /// successful response and never ejected anything — killing a backend under
+    /// load produced 18% 5xx with `h2proxy_backend_ejections_total` sitting at
+    /// zero.
+    ///
+    /// The connection layer turns it into a 502 (or a reset, if a `:status` has
+    /// already gone out), so what the client sees is unchanged.
+    Gone { id: StreamId },
 }
 
 /// The channel a responder answers on.

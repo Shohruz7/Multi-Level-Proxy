@@ -337,11 +337,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
                 client_id, events, ..
             } = msg
             {
-                let _ = events.send(ServiceEvent::Head {
-                    id: client_id,
-                    response: Response::status(502),
-                    end_stream: true,
-                });
+                let _ = events.send(ServiceEvent::Gone { id: client_id });
             }
         }
         self.stats.close_connection();
@@ -812,10 +808,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
     fn fail_all_routes(&mut self) {
         self.requests.clear();
         for pending in std::mem::take(&mut self.pending) {
-            let _ = pending.events.send(ServiceEvent::Head {
+            let _ = pending.events.send(ServiceEvent::Gone {
                 id: pending.client_id,
-                response: Response::status(502),
-                end_stream: true,
             });
         }
         for (_, route) in self.routes.drain() {
@@ -831,10 +825,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
                     code: ErrorCode::InternalError,
                 }
             } else {
-                ServiceEvent::Head {
+                ServiceEvent::Gone {
                     id: route.client_id,
-                    response: Response::status(502),
-                    end_stream: true,
                 }
             };
             let _ = route.events.send(event);
@@ -1445,11 +1437,7 @@ pub fn fail_pending(mut inbox: mpsc::UnboundedReceiver<ToUpstream>) {
             client_id, events, ..
         } = msg
         {
-            let _ = events.send(ServiceEvent::Head {
-                id: client_id,
-                response: Response::status(502),
-                end_stream: true,
-            });
+            let _ = events.send(ServiceEvent::Gone { id: client_id });
         }
     }
 }
