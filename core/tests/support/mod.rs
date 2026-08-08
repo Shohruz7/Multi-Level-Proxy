@@ -176,10 +176,21 @@ impl RawPeer {
     }
 
     /// The next frame, or `None` once the peer closes.
+    ///
+    /// An inbound PING is answered before it is returned. §6.7 makes that a MUST
+    /// for any endpoint, and a scripted peer that skips it is not a simplified
+    /// backend but an unresponsive one — which the proxy's liveness probe is
+    /// specifically built to disconnect. The frame is still handed to the caller,
+    /// so a test can assert on the PING as well as rely on the ACK.
     pub async fn next(&mut self) -> Option<Frame> {
         loop {
             match self.codec.decode_any(&mut self.buf) {
-                Ok(Some(Decoded::Frame(frame))) => return Some(frame),
+                Ok(Some(Decoded::Frame(frame))) => {
+                    if let Frame::Ping { data, ack: false } = frame {
+                        self.send(&Frame::Ping { data, ack: true }).await;
+                    }
+                    return Some(frame);
+                }
                 Ok(Some(Decoded::Ignored { .. })) => continue,
                 Ok(None) => {}
                 Err(e) => panic!("peer sent something we cannot decode: {e}"),
