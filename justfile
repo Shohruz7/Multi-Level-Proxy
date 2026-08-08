@@ -119,3 +119,9 @@ calibrate:
 # Rapid Reset flood and a backend kill, each against a control run.
 attack:
     bench/attack.sh
+
+# Five minutes of load with a backend dying and restarting throughout, sampling
+# the quantities that must stay flat. The leak detector: every other harness here
+# measures a moment, this one measures a trend. Fails if anything grew.
+soak seconds='300':
+    SECONDS_TOTAL={{seconds}} bench/soak.sh
