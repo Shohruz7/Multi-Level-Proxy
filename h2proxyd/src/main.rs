@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use h2proxy_core::conn::{Connection, DrainPolicy, Settings};
+use h2proxy_core::conn::{Connection, DrainPolicy, Tuning};
 use h2proxy_core::guard::Limits;
 use h2proxy_core::health;
 use h2proxy_core::lb::Backend;
@@ -33,6 +33,41 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
+
+/// The allocator, when built with `--features jemalloc` (ADR 0010).
+///
+/// The deploy target is a static musl binary, and musl's allocator contends
+/// badly across threads — which is this workload exactly: a work-stealing
+/// runtime allocating per-frame buffers, per-stream state and channel messages
+/// on every core at once. Left off by default so ordinary builds and the test
+/// suite need no C toolchain; the number it is worth is in `bench/allocator.csv`
+/// rather than in this comment, because the ADR asked for a measurement and not
+/// an assumption.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Which allocator this binary was built with, for the startup log and for the
+/// benchmark harness to record next to its numbers. An A/B whose arms cannot be
+/// told apart afterwards is not a measurement.
+const ALLOCATOR_NAME: &str = if cfg!(feature = "jemalloc") {
+    "jemalloc"
+} else {
+    "system"
+};
+
+/// Everything a connection needs that is the same for every connection.
+///
+/// One struct rather than three parameters because they arrived one per week —
+/// drain in week 7, guard limits in week 7, flow-control tuning in week 8 — and
+/// the next one would have been the fourth appended to an argument list nobody
+/// reads. `Copy`, so a connection task takes it by value with no allocation.
+#[derive(Clone, Copy)]
+struct ConnConfig {
+    drain: DrainPolicy,
+    limits: Limits,
+    tuning: Tuning,
+}
 
 /// Listen address; override with the `H2PROXYD_LISTEN` environment variable.
 const DEFAULT_LISTEN: &str = "127.0.0.1:8443";
@@ -50,12 +85,19 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("parsing H2PROXYD_LISTEN as a socket address")?;
 
+    // Published as a labelled series rather than only logged, so `bench/*.sh`
+    // can read the build it is measuring straight off `/metrics` instead of
+    // trusting that the right binary was started.
+    metrics::gauge!("h2proxy_build_info", "allocator" => ALLOCATOR_NAME).set(1.0);
+    info!(allocator = ALLOCATOR_NAME, "global allocator");
+
     let acceptor = TlsAcceptor::from(tls::server_config()?);
 
     // With backends configured the daemon is a proxy; without them it is the
     // week-5 server. Keeping both is what lets `h2spec` and the `h2load`
     // baselines run against the engine alone, with no backend in the numbers.
     let backends = upstreams()?;
+    let tuning = tuning();
     let proxy = if backends.is_empty() {
         info!("no H2PROXYD_UPSTREAMS configured; answering from the built-in responder");
         None
@@ -64,17 +106,22 @@ async fn main() -> anyhow::Result<()> {
             upstreams = ?backends.iter().map(|b| b.addr).collect::<Vec<_>>(),
             "proxying to backends over h2c",
         );
-        Some(Shared::with_policy(
+        Some(Shared::with_tuning(
             backends,
             max_conns_per_backend(),
             health_policy(),
+            tuning,
         ))
     };
     if let Some(shared) = &proxy {
         spawn_stats_sampler(shared);
     }
-    let drain = drain_policy();
-    let limits = guard_limits();
+    let config = ConnConfig {
+        drain: drain_policy(),
+        limits: guard_limits(),
+        tuning,
+    };
+    let (drain, limits) = (config.drain, config.limits);
     if limits.observe_only {
         info!("abuse guard in OBSERVE-ONLY mode: peaks recorded, nothing enforced");
     }
@@ -117,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
                 let shutdown = shutdown_tx.subscribe();
                 let proxy = proxy.clone();
                 conns.spawn(handle_connection(
-                    acceptor, stream, peer, shutdown, proxy, drain, limits,
+                    acceptor, stream, peer, shutdown, proxy, config,
                 ));
             }
         }
@@ -167,8 +214,7 @@ async fn handle_connection(
     peer: SocketAddr,
     mut shutdown: broadcast::Receiver<()>,
     proxy: Option<Arc<Shared>>,
-    drain: DrainPolicy,
-    limits: Limits,
+    config: ConnConfig,
 ) {
     // Race the handshake against shutdown so a stalled TLS negotiation can't
     // hold the drain open.
@@ -209,15 +255,16 @@ async fn handle_connection(
     // the stream table, and the outbound scheduler. What answers the requests is
     // the one thing that changes between the two modes — the engine cannot tell
     // the difference, which is the whole point of the `Service` seam.
-    let settings = Settings::server();
+    let settings = config.tuning.server_settings();
     let summary = match proxy {
         Some(shared) => {
             let service = Proxy::new(shared)
                 .with_peer(peer.ip())
                 .trusting_forwarded_headers(trust_forwarded());
             Connection::with_service(tls_stream, shutdown, settings, service)
-                .with_drain_policy(drain)
-                .with_limits(limits)
+                .with_drain_policy(config.drain)
+                .with_limits(config.limits)
+                .with_connection_window(config.tuning.connection_window)
                 .run()
                 .await
         }
@@ -228,8 +275,9 @@ async fn handle_connection(
                 settings,
                 Echo::new(default_body_size()),
             )
-            .with_drain_policy(drain)
-            .with_limits(limits)
+            .with_drain_policy(config.drain)
+            .with_limits(config.limits)
+            .with_connection_window(config.tuning.connection_window)
             .run()
             .await
         }
@@ -489,6 +537,44 @@ fn guard_limits() -> Limits {
         // The calibration run sets this; so does a cautious first rollout.
         observe_only: std::env::var("H2PROXYD_GUARD_OBSERVE_ONLY").is_ok_and(|v| v != "0"),
     }
+}
+
+/// The flow-control sizes, from `H2PROXYD_CONN_WINDOW`,
+/// `H2PROXYD_STREAM_WINDOW` (both in octets) and
+/// `H2PROXYD_MAX_CONCURRENT_STREAMS`.
+///
+/// These were compile-time constants until week 8, which was honest while there
+/// was nothing to measure them against and stopped being honest the moment there
+/// was. `bench/tune.sh` sweeps them; a constant cannot be swept without a
+/// rebuild per point, and a rebuild per point is how a sweep quietly becomes
+/// three data points and an opinion.
+///
+/// The connection window is clamped to at least the protocol default, because
+/// the handshake's stream-0 WINDOW_UPDATE is `window - 65535` and a smaller
+/// value would compute a negative increment — a nonsensical frame, from a
+/// typo, at handshake time.
+fn tuning() -> Tuning {
+    let d = Tuning::default();
+    let connection_window = env_num("H2PROXYD_CONN_WINDOW", d.connection_window)
+        .clamp(h2proxy_core::flow::DEFAULT_INITIAL_WINDOW_SIZE, i32::MAX);
+    let tuning = Tuning {
+        connection_window,
+        stream_window: env_num("H2PROXYD_STREAM_WINDOW", d.stream_window).clamp(1, i32::MAX),
+        max_concurrent_streams: env_num(
+            "H2PROXYD_MAX_CONCURRENT_STREAMS",
+            d.max_concurrent_streams,
+        )
+        .max(1),
+    };
+    if tuning != d {
+        info!(
+            connection_window = tuning.connection_window,
+            stream_window = tuning.stream_window,
+            max_concurrent_streams = tuning.max_concurrent_streams,
+            "flow control tuned away from the defaults",
+        );
+    }
+    tuning
 }
 
 /// Health-checking and ejection policy (design doc §5.2).

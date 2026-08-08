@@ -48,8 +48,19 @@ pub const STREAM_INITIAL_WINDOW: i32 = 256 * 1024;
 
 /// The stream-0 WINDOW_UPDATE that lifts the connection window from the
 /// protocol default up to [`CONNECTION_WINDOW`], sent once at handshake.
-pub const CONNECTION_WINDOW_BOOTSTRAP: u32 =
-    (CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE) as u32;
+pub const CONNECTION_WINDOW_BOOTSTRAP: u32 = connection_window_bootstrap(CONNECTION_WINDOW);
+
+/// The stream-0 increment that lifts the connection window from the protocol
+/// default to `window`.
+///
+/// A function rather than only a constant because the window is tunable
+/// (`conn::Tuning`), and the increment must be derived from whichever value is
+/// in force. Sending the *constant* increment beside a *tuned* window is the
+/// kind of mismatch that shows up as a peer overrunning a window we never
+/// granted — much later, under load, as a flow-control error.
+pub const fn connection_window_bootstrap(window: i32) -> u32 {
+    (window - DEFAULT_INITIAL_WINDOW_SIZE) as u32
+}
 
 /// The largest run of octets one stream may send before the scheduler rotates
 /// to the next (design doc §4.1). One `DEFAULT_MAX_FRAME_SIZE`, so a visit

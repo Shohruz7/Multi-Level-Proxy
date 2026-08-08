@@ -19,7 +19,7 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::broadcast;
 
-use h2proxy_core::conn::{Connection, PREFACE, Settings, setting_id};
+use h2proxy_core::conn::{Connection, PREFACE, Settings, Tuning, setting_id};
 use h2proxy_core::flow::{CONNECTION_WINDOW, DEFAULT_INITIAL_WINDOW_SIZE};
 use h2proxy_core::frame::{Frame, FrameCodec, MAX_ALLOWED_FRAME_SIZE};
 use h2proxy_core::hpack::{Header, HpackEncoder};
@@ -209,6 +209,23 @@ fn start() -> (Peer, broadcast::Sender<()>) {
     (Peer::new(client), tx)
 }
 
+/// As [`start`], with the flow-control sizes a deployment might tune to.
+fn start_tuned(tuning: Tuning) -> (Peer, broadcast::Sender<()>) {
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let (tx, rx) = broadcast::channel::<()>(1);
+    tokio::spawn(
+        Connection::with_service(
+            server,
+            rx,
+            tuning.server_settings(),
+            h2proxy_core::service::Echo::new(64),
+        )
+        .with_connection_window(tuning.connection_window)
+        .run(),
+    );
+    (Peer::new(client), tx)
+}
+
 #[tokio::test]
 async fn the_connection_window_is_raised_at_handshake() {
     // §6.9.1: SETTINGS cannot move the connection window, only WINDOW_UPDATE
@@ -221,6 +238,84 @@ async fn the_connection_window_is_raised_at_handshake() {
         increment as i32,
         CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE,
         "the bootstrap must lift the default window to CONNECTION_WINDOW",
+    );
+}
+
+#[tokio::test]
+async fn tuning_the_connection_window_moves_the_bootstrap_with_it() {
+    // The hazard this exists for: the window and the increment that opens it
+    // are two numbers that must agree, and nothing forces them to. Send the
+    // *constant* increment beside a *tuned* window and the peer is credited an
+    // amount we never reserved — which surfaces much later, under load, as a
+    // flow-control error nobody can trace back to a config change.
+    //
+    // Tuning that silently does nothing is the other failure here, and it is the
+    // one this project keeps finding: a feature that runs, passes its tests and
+    // reports nothing.
+    const TUNED: i32 = 4 * 1024 * 1024;
+    let tuning = Tuning {
+        connection_window: TUNED,
+        stream_window: 512 * 1024,
+        max_concurrent_streams: 32,
+    };
+
+    let (mut peer, _tx) = start_tuned(tuning);
+    let increment = peer.handshake(1 << 20).await;
+    assert_eq!(
+        increment as i32,
+        TUNED - DEFAULT_INITIAL_WINDOW_SIZE,
+        "the bootstrap must open exactly the window that was configured",
+    );
+    assert_ne!(
+        increment as i32,
+        CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE,
+        "and must not be the default increment in disguise",
+    );
+}
+
+#[tokio::test]
+async fn tuning_reaches_the_settings_the_peer_actually_receives() {
+    // The other half: the stream window and concurrency travel in SETTINGS, so
+    // a peer can be asked what it was told. Without this, `Tuning` could be
+    // plumbed everywhere except into the frame and every test above would still
+    // pass.
+    let tuning = Tuning {
+        connection_window: 2 * 1024 * 1024,
+        stream_window: 128 * 1024,
+        max_concurrent_streams: 17,
+    };
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let (_tx, rx) = broadcast::channel::<()>(1);
+    tokio::spawn(
+        Connection::with_service(
+            server,
+            rx,
+            tuning.server_settings(),
+            h2proxy_core::service::Echo::new(64),
+        )
+        .with_connection_window(tuning.connection_window)
+        .run(),
+    );
+
+    let mut peer = Peer::new(client);
+    peer.io.write_all(PREFACE).await.expect("preface");
+    peer.send(&Frame::Settings {
+        ack: false,
+        params: vec![],
+    })
+    .await;
+
+    let Frame::Settings { ack: false, params } = peer.recv().await else {
+        panic!("the server opens with its SETTINGS");
+    };
+    let value = |id: u16| params.iter().find(|(k, _)| *k == id).map(|(_, v)| *v);
+    assert_eq!(
+        value(setting_id::INITIAL_WINDOW_SIZE),
+        Some(tuning.stream_window as u32),
+    );
+    assert_eq!(
+        value(setting_id::MAX_CONCURRENT_STREAMS),
+        Some(tuning.max_concurrent_streams),
     );
 }
 

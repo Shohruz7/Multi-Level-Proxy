@@ -53,11 +53,9 @@ use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
 use crate::conn::{
-    ConnectionError, ErrorCode, MAX_HEADER_LIST_SIZE, MAX_WRITE_QUEUE, PREFACE, Settings,
+    ConnectionError, ErrorCode, MAX_HEADER_LIST_SIZE, MAX_WRITE_QUEUE, PREFACE, Settings, Tuning,
 };
-use crate::flow::{
-    CONNECTION_WINDOW, CONNECTION_WINDOW_BOOTSTRAP, RecvWindow, SEND_BUDGET, Window,
-};
+use crate::flow::{RecvWindow, SEND_BUDGET, Window};
 use crate::frame::{Decoded, Frame, FrameCodec, FrameType};
 use crate::hpack::{Header, HpackDecoder, HpackEncoder, HpackError};
 use crate::service::{
@@ -364,6 +362,9 @@ pub struct UpstreamConnection<IO> {
     streams: StreamTable,
     conn_send_window: Window,
     conn_recv_window: RecvWindow,
+    /// The size `conn_recv_window` was opened to; the handshake's stream-0
+    /// WINDOW_UPDATE is derived from it rather than from the default constant.
+    conn_window: i32,
     ready: VecDeque<StreamId>,
     /// Upstream stream id → the client stream waiting on it.
     routes: HashMap<StreamId, Route>,
@@ -414,7 +415,20 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
         stats: std::sync::Arc<crate::proxy::ProxyStats>,
         record: Option<std::sync::Arc<crate::pool::UpstreamRecord>>,
     ) -> Self {
-        let local_settings = Settings::client();
+        Self::with_tuning(io, inbox, stats, record, Tuning::default())
+    }
+
+    /// As [`UpstreamConnection::new`], with the flow-control sizes the
+    /// deployment tuned. The pool passes what the daemon measured; everything
+    /// else takes the defaults.
+    pub fn with_tuning(
+        io: IO,
+        inbox: mpsc::UnboundedReceiver<ToUpstream>,
+        stats: std::sync::Arc<crate::proxy::ProxyStats>,
+        record: Option<std::sync::Arc<crate::pool::UpstreamRecord>>,
+        tuning: Tuning,
+    ) -> Self {
+        let local_settings = tuning.client_settings();
         let defaults = Settings::default();
         let (reader, writer) = tokio::io::split(io);
         UpstreamConnection {
@@ -440,7 +454,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
                 local_settings.initial_window_size as i32,
             ),
             conn_send_window: Window::new(defaults.initial_window_size as i32),
-            conn_recv_window: RecvWindow::new(CONNECTION_WINDOW),
+            conn_recv_window: RecvWindow::new(tuning.connection_window),
+            conn_window: tuning.connection_window,
             ready: VecDeque::new(),
             routes: HashMap::new(),
             requests: HashMap::new(),
@@ -520,7 +535,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
         // a large response has to fit through.
         let bootstrap = Frame::WindowUpdate {
             stream_id: StreamId::CONNECTION,
-            increment: CONNECTION_WINDOW_BOOTSTRAP,
+            increment: crate::flow::connection_window_bootstrap(self.conn_window),
         };
         if let Err(e) = self.queue_frame(&bootstrap) {
             return Stop::Failed(e);

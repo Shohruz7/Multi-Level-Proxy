@@ -1,0 +1,22 @@
+[package]
+name = "loadgen"
+description = "Fixed-rate, coordinated-omission-correct HTTP/2 load generator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+# The `h2` crate drives this generator, deliberately. It is the same choice ADR
+# 0003 made for the differential oracle and for the same reason: a measuring
+# instrument built from the thing being measured cannot find a fault in it. Our
+# own client engine is what the *proxy* uses upstream; the ruler has to be
+# somebody else's.
+h2.workspace = true
+http.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+tokio-rustls.workspace = true

@@ -18,3 +18,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+tikv-jemallocator = { workspace = true, optional = true }
+
+[features]
+# Swap the global allocator (ADR 0010). Off by default so `cargo test` and the
+# dev loop need no C toolchain; on for the image the deploy actually runs, where
+# the default is musl's allocator and the workload is many threads allocating
+# small buffers constantly.
+jemalloc = ["dep:tikv-jemallocator"]

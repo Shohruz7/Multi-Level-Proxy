@@ -62,8 +62,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, trace, warn};
 
 use crate::flow::{
-    CONNECTION_WINDOW, CONNECTION_WINDOW_BOOTSTRAP, MAX_WINDOW_SIZE, RecvWindow, SEND_BUDGET,
-    STREAM_INITIAL_WINDOW, Window,
+    CONNECTION_WINDOW, MAX_WINDOW_SIZE, RecvWindow, SEND_BUDGET, STREAM_INITIAL_WINDOW, Window,
 };
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, Decoded, Frame, FrameCodec, FrameType, MAX_ALLOWED_FRAME_SIZE,
@@ -193,6 +192,66 @@ impl Drain {
 /// `SETTINGS_MAX_CONCURRENT_STREAMS` (§5.1.2). An abuse guard as much as a
 /// resource one: unlimited concurrency is what makes Rapid Reset cheap.
 pub const MAX_CONCURRENT_STREAMS: u32 = 256;
+
+/// The sizes a deployment may tune, in one place.
+///
+/// These three were compile-time constants through week 7, reasoned from the
+/// RFC and from arithmetic rather than measured — which was the honest state of
+/// them, since there was nothing to measure against until the engine existed.
+/// Week 8 measures them (`bench/tune.sh`), and measuring requires being able to
+/// change them without a rebuild.
+///
+/// They are grouped rather than passed separately because they are not
+/// independent. The connection window is the memory bound; the stream window
+/// decides how that budget is shared; concurrency decides how many claimants
+/// there are. A stream window larger than the connection window is legal and
+/// pointless — the connection window binds first — and concurrency times the
+/// stream window is the nominal credit outstanding, which is only bounded
+/// because both levels debit every octet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tuning {
+    /// The connection-level receive window (`flow::CONNECTION_WINDOW`). **This
+    /// is the bounded-memory bound** the backpressure bridge asserts: raising it
+    /// buys throughput on a fast link and raises the ceiling of octets the proxy
+    /// may hold for a client that has stopped reading.
+    pub connection_window: i32,
+    /// The per-stream receive window, advertised as `INITIAL_WINDOW_SIZE`.
+    pub stream_window: i32,
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS`, advertised to clients.
+    pub max_concurrent_streams: u32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            connection_window: CONNECTION_WINDOW,
+            stream_window: STREAM_INITIAL_WINDOW,
+            max_concurrent_streams: MAX_CONCURRENT_STREAMS,
+        }
+    }
+}
+
+impl Tuning {
+    /// The settings to advertise to clients under this tuning.
+    pub fn server_settings(&self) -> Settings {
+        Settings {
+            max_concurrent_streams: Some(self.max_concurrent_streams),
+            initial_window_size: self.stream_window as u32,
+            ..Settings::server()
+        }
+    }
+
+    /// The settings to advertise to backends under this tuning.
+    ///
+    /// Concurrency is not carried over: as the initiator we have no reason to
+    /// limit a peer who opens nothing (see [`Settings::client`]).
+    pub fn client_settings(&self) -> Settings {
+        Settings {
+            initial_window_size: self.stream_window as u32,
+            ..Settings::client()
+        }
+    }
+}
 
 /// The client connection preface (RFC 9113 §3.4). A client opens every HTTP/2
 /// connection by sending these 24 octets, immediately followed by its first
@@ -602,6 +661,10 @@ pub struct Connection<IO, S = Echo> {
     conn_send_window: Window,
     /// Connection-level credit we gave the peer.
     conn_recv_window: RecvWindow,
+    /// The size `conn_recv_window` was opened to, kept so the handshake's
+    /// stream-0 WINDOW_UPDATE can be derived from the window actually in force
+    /// rather than from the default constant.
+    conn_window: i32,
     /// Round-robin ring of streams with something to send. A stream appears at
     /// most once (`Stream::queued` guards that) and rotates to the back after
     /// each visit, whether or not it finished.
@@ -695,6 +758,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             ),
             conn_send_window: Window::new(defaults.initial_window_size as i32),
             conn_recv_window: RecvWindow::new(CONNECTION_WINDOW),
+            conn_window: CONNECTION_WINDOW,
             ready: VecDeque::new(),
             pending_reset: Vec::new(),
             guard: Guard::new(Limits::default(), Instant::now()),
@@ -720,6 +784,20 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
     /// [`Limits::permissive`].
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.guard = Guard::new(limits, Instant::now());
+        self
+    }
+
+    /// Set the connection-level receive window.
+    ///
+    /// Separate from `local_settings` because it has to be: `INITIAL_WINDOW_SIZE`
+    /// is scoped to *streams* (§6.9.1), so the connection window cannot be
+    /// advertised in SETTINGS at all and moves only by the stream-0
+    /// WINDOW_UPDATE the handshake sends. Callers pass
+    /// [`Tuning::connection_window`]; leaving it alone keeps
+    /// [`flow::CONNECTION_WINDOW`].
+    pub fn with_connection_window(mut self, window: i32) -> Self {
+        self.conn_window = window;
+        self.conn_recv_window = RecvWindow::new(window);
         self
     }
 
@@ -811,7 +889,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
         // why. `flow.rs` owns the arithmetic; this is the one place it is sent.
         let bootstrap = Frame::WindowUpdate {
             stream_id: StreamId::CONNECTION,
-            increment: CONNECTION_WINDOW_BOOTSTRAP,
+            increment: crate::flow::connection_window_bootstrap(self.conn_window),
         };
         if let Err(e) = self.queue_frame(&bootstrap) {
             return Stop::Failed(e);

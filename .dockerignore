@@ -9,3 +9,6 @@ Documentation/
 flamegraph.svg
 perf.data*
 bench/results/
+# The CDK app builds nothing the image needs, and node_modules is larger than
+# the source tree it would be shipped beside.
+infra/

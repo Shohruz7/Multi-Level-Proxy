@@ -209,6 +209,12 @@ pub struct Pool {
     /// unanswered probe. A probe with nowhere to report is a socket recycler,
     /// not a health check.
     health: Option<Arc<crate::health::Health>>,
+    /// The flow-control sizes to open upstream connections with. The upstream
+    /// receive window is the half of the bridge that bounds how much a fast
+    /// backend can push into this process, so tuning it without tuning the
+    /// client side (or the reverse) moves the memory bound in one direction
+    /// only — which is why one struct carries both.
+    tuning: crate::conn::Tuning,
 }
 
 impl Pool {
@@ -235,7 +241,16 @@ impl Pool {
             idle_timeout_ms: policy.idle_timeout.as_millis() as u64,
             policy,
             health,
+            tuning: crate::conn::Tuning::default(),
         }
+    }
+
+    /// Open upstream connections with tuned flow-control sizes. The daemon
+    /// passes what it measured; everything else keeps the defaults.
+    #[must_use]
+    pub fn with_tuning(mut self, tuning: crate::conn::Tuning) -> Self {
+        self.tuning = tuning;
+        self
     }
 
     /// Millis since this pool was built.
@@ -338,6 +353,7 @@ impl Pool {
         let task_record = Arc::clone(&record);
         let health = self.health.clone();
         let (ping_idle, ping_timeout) = (self.policy.ping_idle, self.policy.ping_timeout);
+        let tuning = self.tuning;
 
         self.stats.connect_attempt();
         tokio::spawn(async move {
@@ -348,11 +364,12 @@ impl Pool {
                     let _ = socket.set_nodelay(true);
                     stats.open_connection();
                     debug!(backend = %backend.addr, "upstream connection established");
-                    let summary = crate::upstream::UpstreamConnection::new(
+                    let summary = crate::upstream::UpstreamConnection::with_tuning(
                         socket,
                         inbox,
                         Arc::clone(&stats),
                         Some(Arc::clone(&task_record)),
+                        tuning,
                     )
                     .with_probe(ping_idle, ping_timeout)
                     .run()

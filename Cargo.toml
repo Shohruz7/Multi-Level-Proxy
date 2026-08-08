@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "h2proxyd", "backend"]
+members = ["core", "h2proxyd", "backend", "loadgen"]
 
 [workspace.package]
 version = "0.1.0"
@@ -53,7 +53,16 @@ anyhow = "1.0"
 # Self-signed certs for local runs and tests
 rcgen = "0.14"
 
+# Allocator for benchmark and production builds (ADR 0010). Optional, behind the
+# `jemalloc` feature: musl's allocator contends badly under a work-stealing
+# runtime with many concurrent streams, which is the deploy target's exact
+# workload. Off for ordinary builds and tests so local iteration stays free of a
+# C dependency.
+tikv-jemallocator = "0.6"
+
 # Test/bench only: differential-test oracle (ADR 0003), property tests, benches.
+# `h2` is also what drives `loadgen`, for the same reason it is the oracle: a
+# ruler made of the thing being measured cannot find a fault in it.
 # `http` comes with h2's public API — the differential harness builds real
 # requests to elicit HEADERS/DATA/CONTINUATION from the oracle.
 h2 = "0.4"

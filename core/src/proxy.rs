@@ -321,6 +321,24 @@ impl Shared {
         max_conns_per_backend: usize,
         policy: health::Policy,
     ) -> Arc<Self> {
+        Self::with_tuning(
+            backends,
+            max_conns_per_backend,
+            policy,
+            crate::conn::Tuning::default(),
+        )
+    }
+
+    /// Build with tuned flow-control sizes as well. The daemon passes what
+    /// `bench/tune.sh` measured; the same values go to the client leg via
+    /// [`crate::conn::Connection::with_connection_window`], because the bridge
+    /// couples the two and tuning one alone moves the bound sideways.
+    pub fn with_tuning(
+        backends: Vec<Backend>,
+        max_conns_per_backend: usize,
+        policy: health::Policy,
+        tuning: crate::conn::Tuning,
+    ) -> Arc<Self> {
         let stats = Arc::new(ProxyStats::default());
         let health = Arc::new(Health::new(policy));
         Arc::new(Shared {
@@ -329,7 +347,8 @@ impl Shared {
                 max_conns_per_backend,
                 policy,
                 Some(Arc::clone(&health)),
-            ),
+            )
+            .with_tuning(tuning),
             backends,
             balancer: Box::new(PowerOfTwoChoices::new()),
             stats,
