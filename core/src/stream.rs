@@ -202,6 +202,14 @@ pub struct Stream {
     /// Keeps a stream from being enqueued twice by two chunks arriving back to
     /// back.
     pub queued: bool,
+    /// Whether a response head has gone out on this stream.
+    ///
+    /// Read by the abuse guard (design doc §6): a RST_STREAM *before* we have
+    /// answered is the Rapid Reset signature, and a reset after we answered is
+    /// ordinary cancellation. A bool rather than an instant because the sharper
+    /// signal is "was it ever served", and the timing is already carried by the
+    /// rate. It costs nothing — it packs into the padding beside `queued`.
+    pub response_started: bool,
     /// The body length the request declared via `content-length`, if any, and
     /// how much has actually arrived. §8.1.2.6 makes a mismatch a malformed
     /// message, which cannot be judged until the body ends.
@@ -229,6 +237,7 @@ impl Stream {
             send_end_stream: false,
             pending_trailers: None,
             queued: false,
+            response_started: false,
             content_length: None,
             data_received: 0,
             pending_conn_release: 0,

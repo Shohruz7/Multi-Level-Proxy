@@ -64,7 +64,7 @@ clippy:
 fuzz-build target='frame_parser':
     cargo +nightly fuzz build {{target}} --target {{fuzz_triple}}
 
-# Fuzz a target for N seconds (default 30). Targets: frame_parser, hpack_decoder.
+# Fuzz a target for N seconds (default 30). Targets: frame_parser, hpack_decoder, guard.
 fuzz seconds='30' target='frame_parser':
     cargo +nightly fuzz run {{target}} --target {{fuzz_triple}} -- -max_total_time={{seconds}}
 
@@ -72,6 +72,7 @@ fuzz seconds='30' target='frame_parser':
 fuzz-build-all:
     just fuzz-build frame_parser
     just fuzz-build hpack_decoder
+    just fuzz-build guard
 
 # Capture the no-proxy baseline (client -> backend directly). See bench/README.md.
 baseline:

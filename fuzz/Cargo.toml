@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bytes = "1"
 h2proxy-core = { path = "../core" }
+tokio = { version = "1", features = ["time"] }
 
 # Its own workspace so the sanitizer/nightly build never touches the main
 # workspace (and `cargo build --workspace` never touches the fuzz targets).
@@ -26,6 +27,13 @@ bench = false
 [[bin]]
 name = "hpack_decoder"
 path = "fuzz_targets/hpack_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "guard"
+path = "fuzz_targets/guard.rs"
 test = false
 doc = false
 bench = false

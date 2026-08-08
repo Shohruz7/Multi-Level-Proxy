@@ -68,6 +68,7 @@ use crate::flow::{
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, Decoded, Frame, FrameCodec, FrameType, MAX_ALLOWED_FRAME_SIZE,
 };
+use crate::guard::{Guard, Limits, Verdict};
 use crate::hpack::{HpackDecoder, HpackEncoder, HpackError};
 use crate::service::{Echo, RequestHead, Response, Service, ServiceEvent};
 use crate::stream::{
@@ -597,6 +598,10 @@ pub struct Connection<IO, S = Echo> {
     /// that cannot also write (they already hold a borrow of the stream table),
     /// so the frame is queued here and flushed on the way out.
     pending_reset: Vec<StreamError>,
+    /// Per-connection abuse accounting (design doc §6). Holds no protocol
+    /// state; every trip becomes an `ENHANCE_YOUR_CALM` connection error through
+    /// the existing error model, so the blast radius is this connection alone.
+    guard: Guard,
     /// When this connection last had a stream open, so a drain can tell a parked
     /// keep-alive connection from one that is merely between requests. Only read
     /// at the moment a drain begins, so keeping it costs one store per request.
@@ -680,6 +685,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             conn_recv_window: RecvWindow::new(CONNECTION_WINDOW),
             ready: VecDeque::new(),
             pending_reset: Vec::new(),
+            guard: Guard::new(Limits::default(), Instant::now()),
             last_stream_at: Instant::now(),
             drain_policy: DrainPolicy::default(),
             draining: None,
@@ -695,6 +701,30 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
     pub fn with_drain_policy(mut self, policy: DrainPolicy) -> Self {
         self.drain_policy = policy;
         self
+    }
+
+    /// Set the abuse-guard thresholds (design doc §6). The daemon passes its
+    /// configured limits; tests that are not about abuse pass
+    /// [`Limits::permissive`].
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.guard = Guard::new(limits, Instant::now());
+        self
+    }
+
+    /// Turn a guard verdict into the connection error it implies.
+    ///
+    /// `ENHANCE_YOUR_CALM` is the code every other implementation converged on
+    /// for this, and it is the honest one: the peer is not malformed, it is
+    /// simply asking for too much. The GOAWAY carries which signal tripped, so
+    /// an operator reading the debug data learns something.
+    fn check(verdict: Verdict) -> Result<(), ConnectionError> {
+        match verdict.tripped() {
+            None => Ok(()),
+            Some(signal) => Err(ConnectionError::new(
+                ErrorCode::EnhanceYourCalm,
+                format!("abuse guard tripped: {}", signal.as_str()),
+            )),
+        }
     }
 
     /// Run the connection until the peer closes it, a shutdown signal arrives,
@@ -1216,6 +1246,25 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             None => {}
         }
 
+        // PING and SETTINGS are not flow-controlled and each *obliges us to
+        // write an ACK*, so a peer can make us do unbounded work with two tiny
+        // frame types (§6; CVE-2019-9512 "Ping Flood", CVE-2019-9515 "Settings
+        // Flood"). That mandatory reply is the asymmetry, and it is what defines
+        // the signal.
+        //
+        // WINDOW_UPDATE is deliberately **not** counted here, though the first
+        // version did count it. It obliges no reply, and its rate is a function
+        // of how fast the peer consumes data we chose to send — so it is
+        // proportional to legitimate traffic, not to abuse. Metering it made the
+        // bounded-memory test fail: a client draining 64 MiB a few KB at a time
+        // releases capacity hundreds of times, which is exactly the behaviour
+        // the proxy is built to reward. A zero-increment WINDOW_UPDATE, the one
+        // genuinely abusive shape, is already a protocol error in
+        // `recv_window_update`.
+        if matches!(&frame, Frame::Ping { .. } | Frame::Settings { .. }) {
+            Self::check(self.guard.on_control_frame(Instant::now()))?;
+        }
+
         match &frame {
             Frame::Settings { ack: false, params } => {
                 let previous_window = self.peer_settings.initial_window_size;
@@ -1376,10 +1425,16 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
         let block = if end_headers && pending == 0 {
             // The common case: one frame carries the whole block, so it decodes
             // straight out of the read buffer with no copy (ADR 0007).
+            self.guard.on_header_block_end();
             fragment.clone()
         } else {
             self.header_block.extend_from_slice(fragment);
             if !end_headers {
+                // The byte cap above bounds the *buffer*, but not the frame
+                // count: a stream of 1-octet CONTINUATIONs stays under it
+                // indefinitely while costing a decode round each. ADR 0012
+                // flagged this gap; the count is what closes it.
+                Self::check(self.guard.on_continuation())?;
                 trace!(
                     stream = stream_id.get(),
                     buffered = self.header_block.len(),
@@ -1387,6 +1442,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
                 );
                 return Ok(());
             }
+            self.guard.on_header_block_end();
             self.header_block.split().freeze()
         };
 
@@ -1592,6 +1648,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             end_stream,
             end_headers: true,
         })?;
+        // From here on a reset of this stream is ordinary cancellation rather
+        // than the Rapid Reset signature: the client asked, and was answered.
+        if let Some(stream) = self.streams.get_mut(stream_id) {
+            stream.response_started = true;
+        }
         self.apply_stream_event(
             stream_id,
             StreamEvent::SendHeaders { end_stream },
@@ -1693,6 +1754,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
     ) -> Result<(), ConnectionError> {
         let len = data.len() as u32;
 
+        // An empty DATA that does not end its stream costs a parse and debits no
+        // window, so it is unbounded work for free (§6; CVE-2019-9518). One
+        // ending a stream is how a body ends and must never count.
+        Self::check(self.guard.on_data(data.len(), end_stream))?;
+
         // The connection window is debited **before** the stream is looked up.
         // Octets that arrive for a stream we have already closed were still sent
         // and still count (§5.1); skipping them here desyncs us from the peer's
@@ -1764,7 +1830,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
         stream_id: StreamId,
         error_code: ErrorCode,
     ) -> Result<(), ConnectionError> {
-        match self.streams.lookup(stream_id) {
+        let answered = match self.streams.lookup(stream_id) {
             Lookup::Idle => {
                 return Err(ConnectionError::new(
                     ErrorCode::ProtocolError,
@@ -1774,10 +1840,18 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
                     ),
                 ));
             }
-            // A reset crossing our own close. Nothing to undo.
+            // A reset crossing our own close. Nothing to undo — and nothing to
+            // count either: the stream was already finished, so this cost us
+            // nothing and is not evidence of anything.
             Lookup::Closed => return Ok(()),
-            Lookup::Live(_) => {}
-        }
+            Lookup::Live(stream) => stream.response_started,
+        };
+
+        // The Rapid Reset accounting (§6, CVE-2023-44487). Whether we had
+        // answered is the whole signal: cancelling a stream you have been
+        // served is what browsers do all day, while abandoning streams before
+        // they can be served is the attack's entire shape.
+        Self::check(self.guard.on_reset(answered, Instant::now()))?;
 
         debug!(stream = stream_id.get(), ?error_code, "peer reset stream");
         self.summary.streams_reset += 1;
