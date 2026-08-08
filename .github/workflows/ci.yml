@@ -85,11 +85,24 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
+      # Built from source at a pinned version rather than taking the published
+      # binary, which cannot talk to this daemon at all: the 2.6.0 release was
+      # compiled with a Go old enough that its TLS client does not offer TLS 1.3,
+      # and rustls here is configured TLS 1.3-only (ADR 0004). The published
+      # binary fails at "Sends a client connection preface" with
+      # `tls: protocol version not supported` — a property of the test tool, not
+      # of the server. Compiling the same source with the runner's Go gives the
+      # behaviour Homebrew gives locally.
+      #
+      # Cloned and built rather than `go install ...@v2.6.0`, which the module
+      # proxy rejects: h2spec's go.mod declares `github.com/summerwind/h2spec`
+      # with no `/v2` suffix, so every v2.x tag is an invalid version to it.
+      # Building the checkout directly is what Homebrew does, and it keeps the
+      # version pinned.
       - name: Install h2spec
         run: |
-          version=v2.6.0
-          curl -sSfL "https://github.com/summerwind/h2spec/releases/download/${version}/h2spec_linux_amd64.tar.gz" \
-            | tar -xz -C /usr/local/bin h2spec
+          git clone --depth 1 --branch v2.6.0 https://github.com/summerwind/h2spec.git "$RUNNER_TEMP/h2spec"
+          (cd "$RUNNER_TEMP/h2spec" && go build -o /usr/local/bin/h2spec ./cmd/h2spec)
           h2spec --version
 
       - name: Build
@@ -170,15 +183,25 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      # RUSTFLAGS is cleared for this job: cargo-fuzz sets its own instrumentation
-      # flags, and the workflow-level value would be in its way for no benefit —
+      # The host triple is passed explicitly, the same workaround the justfile
+      # documents for Apple Silicon and for the same reason: left to itself
+      # cargo-fuzz does not pick the host. Here it chose
+      # `x86_64-unknown-linux-musl` — the arch of the runner with the libc from
+      # `rust-toolchain.toml`'s deployment target — and ASan cannot instrument a
+      # statically linked libc, so the build failed on `core` before reaching any
+      # of our code.
+      #
+      # RUSTFLAGS is cleared because cargo-fuzz sets its own instrumentation
+      # flags; the workflow-level value would be in its way for no benefit, and
       # clippy already holds the `-D warnings` line for this code.
       - name: Build every target
         env:
           RUSTFLAGS: ""
         run: |
+          host=$(rustc +nightly -vV | awk '/^host:/ {print $2}')
+          echo "building for $host"
           for target in frame_parser hpack_decoder guard; do
             echo "::group::$target"
-            cargo +nightly fuzz build "$target"
+            cargo +nightly fuzz build "$target" --target "$host"
             echo "::endgroup::"
           done
