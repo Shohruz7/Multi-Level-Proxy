@@ -12,6 +12,7 @@
 //! - [`stream`] — per-stream state machine (RFC 9113 §5.1)
 //! - [`flow`] — connection + stream flow-control windows (RFC 9113 §5.2)
 //! - [`guard`] — per-connection abuse accounting (design doc §6)
+//! - [`health`] — backend health, ejection, probe-back (design doc §5.2)
 //! - [`conn`] — per-connection task: demux/mux, SETTINGS, errors (§2.2, §5.4)
 //! - [`service`] — what answers a stream, and §8.3 request validation
 //! - [`upstream`] — the client-role engine: one connection to a backend (§4.3)
@@ -23,6 +24,7 @@ pub mod conn;
 pub mod flow;
 pub mod frame;
 pub mod guard;
+pub mod health;
 pub mod hpack;
 pub mod lb;
 pub mod pool;

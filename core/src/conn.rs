@@ -1078,6 +1078,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
     /// exceptional. A missing stream is therefore always a silent drop, never an
     /// error: the RST_STREAM that retired it has already been sent.
     fn handle_service_event(&mut self, event: ServiceEvent) -> Result<(), ConnectionError> {
+        // The responder's last look. It may swallow the event — a proxy
+        // retrying a refused request does exactly that, so the client never
+        // sees the first attempt fail — in which case there is nothing for the
+        // connection to do and the stream simply stays open.
+        let Some(event) = self.service.intercept(event) else {
+            return Ok(());
+        };
         match event {
             ServiceEvent::Head {
                 id,

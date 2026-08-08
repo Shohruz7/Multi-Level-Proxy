@@ -407,6 +407,28 @@ pub trait Service {
     fn released(&mut self, id: StreamId, n: u32) {
         let _ = (id, n);
     }
+
+    /// A last look at an event before the connection acts on it. Return the
+    /// event to have it delivered, or `None` to swallow it.
+    ///
+    /// This exists because of an asymmetry in the week-6 design: a responder
+    /// hands its `Events` sender *to the upstream task*, so everything the
+    /// backend produces goes straight to the client connection and the responder
+    /// never learns how any of its requests turned out. That is the right shape
+    /// for throughput — no extra hop, no extra task — but it leaves a proxy
+    /// unable to do anything that depends on an outcome.
+    ///
+    /// Two things depend on outcomes: health checking needs to know a backend
+    /// answered or failed, and a retry needs to *replace* a failure rather than
+    /// forward it. Returning `None` is what makes the second possible — the
+    /// stream stays open, the client hears nothing, and a second attempt is
+    /// already on its way to a different backend.
+    ///
+    /// The default is a pass-through, so a responder that does not care (like
+    /// [`Echo`]) is unaffected and the connection behaves exactly as before.
+    fn intercept(&mut self, event: ServiceEvent) -> Option<ServiceEvent> {
+        Some(event)
+    }
 }
 
 /// The built-in responder: enough of a server to prove the engine multiplexes,

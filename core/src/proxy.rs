@@ -31,17 +31,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tracing::debug;
 
 use crate::conn::ErrorCode;
+use crate::health::{self, Health};
 use crate::hpack::Header;
-use crate::lb::{Backend, LoadBalancer, PowerOfTwoChoices};
+use crate::lb::{Backend, BackendLoad, LoadBalancer, PowerOfTwoChoices};
 use crate::pool::{Lease, Pool};
 use crate::service::{Events, RequestHead, Response, Service, ServiceEvent};
 use crate::stream::StreamId;
 use crate::upstream::ToUpstream;
+use tokio::time::Instant;
 
 /// Live counters the daemon samples for its gauges (design doc §7).
 ///
@@ -63,7 +66,48 @@ pub struct ProxyStats {
     /// number** — the backpressure test asserts against it, and week 8's load
     /// run should show it flat while throughput climbs.
     peak_buffered: AtomicUsize,
+    /// Client streams currently being proxied. Replaces the week-2
+    /// `h2proxy_active_streams` gauge, which was described and seeded and never
+    /// once written to.
+    client_streams: AtomicUsize,
+    /// Second attempts made after a retryable failure.
+    retries: AtomicU64,
+    /// Responses by status class, indexed `status / 100 - 1`. The "E" of RED.
+    responses: [AtomicU64; 5],
+    /// Request latency, as fixed histogram buckets. The "D" of RED.
+    ///
+    /// Buckets rather than observations because the engine owns no `metrics`
+    /// dependency and never will: the daemon republishes these counts as a
+    /// Prometheus histogram. Cumulative (each bucket counts everything at or
+    /// below its bound), which is the Prometheus convention and saves the
+    /// exporter a pass.
+    latency: [AtomicU64; LATENCY_BUCKETS.len()],
+    latency_count: AtomicU64,
+    latency_sum_micros: AtomicU64,
 }
+
+/// Upper bounds, in seconds, for the request-latency histogram.
+///
+/// Sized for the claim being made: the target is a sub-3 ms p99, so the
+/// interesting region is 0.1–5 ms and it gets seven of the fourteen buckets. A
+/// default exponential ladder would put 3 ms between the 1 ms and 10 ms bounds
+/// and make the headline number unresolvable.
+pub const LATENCY_BUCKETS: [f64; 14] = [
+    0.0001,
+    0.00025,
+    0.0005,
+    0.001,
+    0.002,
+    0.003,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    1.0,
+    f64::INFINITY,
+];
 
 impl ProxyStats {
     pub fn connect_attempt(&self) {
@@ -150,6 +194,73 @@ impl ProxyStats {
     pub fn peak_buffered(&self) -> usize {
         self.peak_buffered.load(Ordering::Relaxed)
     }
+
+    pub fn open_client_stream(&self) {
+        self.client_streams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn close_client_stream(&self) {
+        let _ = self
+            .client_streams
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+
+    pub fn client_streams(&self) -> usize {
+        self.client_streams.load(Ordering::Relaxed)
+    }
+
+    pub fn retry(&self) {
+        self.retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn retries(&self) -> u64 {
+        self.retries.load(Ordering::Relaxed)
+    }
+
+    /// A response head went to a client with this status.
+    pub fn response(&self, status: u16) {
+        let class = (status / 100).clamp(1, 5) as usize - 1;
+        self.responses[class].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Responses in class `n` (1 = 1xx … 5 = 5xx).
+    pub fn responses(&self, class: usize) -> u64 {
+        self.responses
+            .get(class.saturating_sub(1))
+            .map_or(0, |c| c.load(Ordering::Relaxed))
+    }
+
+    /// Record one completed request's latency.
+    ///
+    /// Cumulative buckets, so a scrape is a read rather than a prefix sum. The
+    /// loop is over fourteen `f64` comparisons and one `fetch_add` each — a few
+    /// nanoseconds against a request that took at least microseconds.
+    pub fn observe_latency(&self, elapsed: Duration) {
+        let seconds = elapsed.as_secs_f64();
+        for (bucket, bound) in self.latency.iter().zip(LATENCY_BUCKETS) {
+            if seconds <= bound {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.latency_count.fetch_add(1, Ordering::Relaxed);
+        self.latency_sum_micros
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// The cumulative bucket counts, aligned with [`LATENCY_BUCKETS`].
+    pub fn latency_buckets(&self) -> [u64; LATENCY_BUCKETS.len()] {
+        std::array::from_fn(|i| self.latency[i].load(Ordering::Relaxed))
+    }
+
+    pub fn latency_count(&self) -> u64 {
+        self.latency_count.load(Ordering::Relaxed)
+    }
+
+    pub fn latency_sum_seconds(&self) -> f64 {
+        self.latency_sum_micros.load(Ordering::Relaxed) as f64 / 1e6
+    }
 }
 
 /// Everything the proxy shares between client connections: the pool, the load
@@ -160,19 +271,97 @@ pub struct Shared {
     pub backends: Vec<Backend>,
     pub balancer: Box<dyn LoadBalancer>,
     pub stats: Arc<ProxyStats>,
+    /// Which backends are worth sending to (design doc §5.2). Filters the
+    /// candidate list before the balancer ever sees it, so health and balancing
+    /// stay separate concerns: this decides *eligibility*, `lb` decides *which*.
+    pub health: Health,
 }
 
 impl Shared {
     /// Build the shared half of the proxy for `backends`.
     pub fn new(backends: Vec<Backend>, max_conns_per_backend: usize) -> Arc<Self> {
+        Self::with_policy(backends, max_conns_per_backend, health::Policy::default())
+    }
+
+    /// Build with an explicit health policy. The daemon passes its configured
+    /// one; tests that are not about health pass
+    /// [`health::Policy::permissive`].
+    pub fn with_policy(
+        backends: Vec<Backend>,
+        max_conns_per_backend: usize,
+        policy: health::Policy,
+    ) -> Arc<Self> {
         let stats = Arc::new(ProxyStats::default());
         Arc::new(Shared {
             pool: Pool::new(Arc::clone(&stats), max_conns_per_backend),
             backends,
             balancer: Box::new(PowerOfTwoChoices::new()),
             stats,
+            health: Health::new(policy),
         })
     }
+
+    /// Pick a backend to try, excluding any already attempted for this request.
+    ///
+    /// Health first, then balance. Filtering before the balancer rather than
+    /// inside it keeps `PowerOfTwoChoices` a pure function of its input, which
+    /// is what makes its distribution testable without a pool or a socket.
+    fn pick(&self, exclude: Option<Backend>, now: Instant) -> Option<Backend> {
+        let load = self.pool.load(&self.backends);
+        let mut eligible = self.health.eligible(&load, now);
+        if let Some(failed) = exclude {
+            // A retry must land somewhere else, or it is just the same request
+            // to the same broken backend a moment later. If that leaves nothing,
+            // fall back to the full list — one more attempt at a backend that
+            // might have been unlucky beats no attempt at all.
+            let elsewhere: Vec<BackendLoad> = eligible
+                .iter()
+                .copied()
+                .filter(|c| c.backend != failed)
+                .collect();
+            if !elsewhere.is_empty() {
+                eligible = elsewhere;
+            }
+        }
+        let chosen = self.balancer.pick(&eligible)?;
+        // Claim the probe slot only now that a backend has really been chosen.
+        // A no-op unless `chosen` is half-open.
+        self.health.claim_trial(&chosen, now);
+        Some(chosen)
+    }
+}
+
+/// Methods safe to send twice (RFC 9110 §9.2.2).
+///
+/// `POST` and `PATCH` are absent and must stay absent: a retried POST can charge
+/// a card twice, and no amount of "it probably did not arrive" makes that
+/// acceptable.
+const IDEMPOTENT: [&[u8]; 6] = [b"GET", b"HEAD", b"OPTIONS", b"TRACE", b"DELETE", b"PUT"];
+
+/// One retry, never more.
+///
+/// A single attempt with a different-backend constraint bounds amplification at
+/// 2x and needs no jitter, no budget, and no second tuning knob. A retry budget
+/// as a fraction of request rate is the right answer at a scale where one bad
+/// backend can double the load on the others; this project is not at that scale,
+/// and an unbounded-in-practice retry policy is a classic way to turn a partial
+/// failure into a self-inflicted outage.
+const MAX_ATTEMPTS: u8 = 2;
+
+/// One attempt at forwarding a request, as `attempt` needs it.
+///
+/// A struct rather than seven positional parameters, because the two call sites
+/// differ in exactly the fields that are easiest to transpose.
+struct Attempt {
+    head: Box<RequestHead>,
+    end_stream: bool,
+    /// The copy kept for a possible retry; `None` makes this attempt final.
+    spare: Option<Box<RequestHead>>,
+    /// A backend not to choose — the one that just failed.
+    exclude: Option<Backend>,
+    attempts: u8,
+    /// The original stream clock and span, when this is a retry.
+    carry: Option<(Instant, tracing::Span)>,
 }
 
 /// One client stream's upstream leg.
@@ -182,6 +371,30 @@ struct Route {
     /// Whether the request has ended, so a late body chunk is dropped rather
     /// than sent on a half-closed stream.
     request_done: bool,
+    /// Which backend this attempt went to, so a retry can avoid it and so the
+    /// outcome can be reported to the right health entry.
+    backend: Backend,
+    /// The request head, kept **only** when this request could be retried.
+    ///
+    /// `None` for anything with a body, which is the whole memory argument in
+    /// one field: a retryable request is by definition one whose HEADERS carried
+    /// END_STREAM, so there is nothing to replay but the head itself. Buffering
+    /// bodies to make more requests retryable would reintroduce exactly the
+    /// unbounded per-stream buffer that ADR 0016 exists to avoid.
+    head: Option<Box<RequestHead>>,
+    /// Attempts made so far, including the one in flight.
+    attempts: u8,
+    /// Whether a `:status` has reached the client. Once it has, no failure can
+    /// be replaced by a retry — the response has already begun.
+    response_started: bool,
+    /// When the client's request arrived, for the RED latency histogram.
+    /// Measured from dispatch to the stream ending, so a retry is inside the
+    /// number rather than hidden by it — which is the honest way to report it.
+    started: Instant,
+    /// The tracing span covering this stream's whole journey: demux → LB →
+    /// upstream → remux. Debug level, so at the default filter it is never
+    /// entered and costs a branch.
+    span: tracing::Span,
 }
 
 /// The request path, as one client connection sees it (design doc §2.1).
@@ -235,16 +448,23 @@ impl Proxy {
     fn sanitize(head: &mut RequestHead) {
         head.fields.retain(|field| field.name.as_ref() != b"te");
     }
-}
 
-impl Service for Proxy {
-    fn attach(&mut self, events: Events) {
-        self.events = Some(events);
-    }
-
-    fn dispatch(&mut self, id: StreamId, mut head: RequestHead, end_stream: bool) {
-        let load = self.shared.pool.load(&self.shared.backends);
-        let Some(backend) = self.shared.balancer.pick(&load) else {
+    /// Send one attempt of a request to a backend.
+    ///
+    /// Shared by the first dispatch and the retry, because they differ only in
+    /// what they carry forward — and a retry path that does not go through the
+    /// same code as the original is a retry path that drifts.
+    fn attempt(&mut self, id: StreamId, attempt: Attempt) {
+        let Attempt {
+            head,
+            end_stream,
+            spare,
+            exclude,
+            attempts,
+            carry,
+        } = attempt;
+        let now = Instant::now();
+        let Some(backend) = self.shared.pick(exclude, now) else {
             debug!(stream = id.get(), "no backend available");
             self.answer_locally(id, 503);
             return;
@@ -253,35 +473,133 @@ impl Service for Proxy {
             Ok(lease) => lease,
             Err(e) => {
                 debug!(stream = id.get(), error = %e, "no upstream slot");
+                // We never reached a backend, so this says nothing about its
+                // health — 503, and no failure recorded.
                 self.answer_locally(id, 503);
                 return;
             }
         };
 
-        Self::sanitize(&mut head);
         let Some(events) = self.events.clone() else {
             return;
         };
         let sent = lease.send(ToUpstream::Request {
             id: lease.id,
             client_id: id,
-            head: Box::new(head),
+            head: head.clone(),
             end_stream,
             events,
         });
         if !sent {
             // The connection died between the checkout and this send. Nothing
             // was written to a backend, so 503 is honest and the client may
-            // retry.
+            // retry — but the connection dying *is* evidence about the backend.
+            self.shared.health.failure(&backend, now);
             self.answer_locally(id, 503);
             return;
         }
         self.shared.stats.request();
+        // A retry carries the stream's original clock and span forward: the
+        // client is waiting for one request however many attempts it takes, and
+        // restarting either would report a latency that never happened.
+        let (started, span) = carry.unwrap_or_else(|| {
+            self.shared.stats.open_client_stream();
+            (
+                now,
+                tracing::debug_span!("stream", id = id.get(), backend = %backend.addr),
+            )
+        });
         self.routes.insert(
             id,
             Route {
                 lease,
                 request_done: end_stream,
+                backend,
+                head: spare,
+                attempts,
+                response_started: false,
+                started,
+                span,
+            },
+        );
+    }
+
+    /// A stream is over, however it ended: close its gauge and record what it
+    /// cost.
+    ///
+    /// Both endings go through here — completion and cancellation — because a
+    /// latency histogram that only counts successes is the one that looks
+    /// healthiest exactly when things are worst.
+    fn finished(&self, route: &Route) {
+        self.shared.stats.close_client_stream();
+        self.shared
+            .stats
+            .observe_latency(route.started.elapsed());
+    }
+
+    /// Try this stream again on a different backend, if it is safe to.
+    ///
+    /// Returns `true` when a second attempt is on its way, which is the caller's
+    /// signal to swallow the failure so the client never learns the first one
+    /// happened.
+    fn retry(&mut self, id: StreamId) -> bool {
+        let Some(route) = self.routes.get(&id) else {
+            return false;
+        };
+        if route.response_started || route.attempts >= MAX_ATTEMPTS || route.head.is_none() {
+            return false;
+        }
+
+        // Take the route out *before* the new checkout. Dropping it releases the
+        // lease, freeing the concurrency slot the balancer counts — otherwise a
+        // retry can be refused by the slot its own failed attempt is still
+        // holding, which is the shape of the week-6 leaked-lease bug wearing a
+        // different hat.
+        let route = self.routes.remove(&id).expect("checked above");
+        let head = route.head.expect("checked above");
+        let failed = route.backend;
+
+        let _entered = route.span.enter();
+        debug!(backend = %failed.addr, "retrying on another backend");
+        self.shared.stats.retry();
+        drop(_entered);
+
+        self.attempt(
+            id,
+            Attempt {
+                head: head.clone(),
+                end_stream: true,
+                spare: Some(head),
+                exclude: Some(failed),
+                attempts: route.attempts + 1,
+                carry: Some((route.started, route.span)),
+            },
+        );
+        // `attempt` answers locally if it cannot place the request, so either
+        // way the client hears something and nothing hangs.
+        true
+    }
+}
+
+impl Service for Proxy {
+    fn attach(&mut self, events: Events) {
+        self.events = Some(events);
+    }
+
+    fn dispatch(&mut self, id: StreamId, mut head: RequestHead, end_stream: bool) {
+        Self::sanitize(&mut head);
+        // Kept only if it could ever be replayed — see `Route::head`.
+        let retryable = end_stream && IDEMPOTENT.contains(&head.method.as_ref());
+        let spare = retryable.then(|| Box::new(head.clone()));
+        self.attempt(
+            id,
+            Attempt {
+                head: Box::new(head),
+                end_stream,
+                spare,
+                exclude: None,
+                attempts: 1,
+                carry: None,
             },
         );
     }
@@ -332,6 +650,7 @@ impl Service for Proxy {
                 id: route.lease.id,
                 code,
             });
+            self.finished(&route);
         }
     }
 
@@ -341,7 +660,9 @@ impl Service for Proxy {
         // the lease, and all the lease has to do is not be leaked: every request
         // that completes without this frees no slot, and after a few thousand of
         // them every pooled connection looks full.
-        self.routes.remove(&id);
+        if let Some(route) = self.routes.remove(&id) {
+            self.finished(&route);
+        }
     }
 
     fn released(&mut self, id: StreamId, n: u32) {
@@ -352,6 +673,57 @@ impl Service for Proxy {
             id: route.lease.id,
             n,
         });
+    }
+
+    /// Watch every outcome on its way to the client: report it to health, and
+    /// replace it with a retry where that is safe.
+    fn intercept(&mut self, event: ServiceEvent) -> Option<ServiceEvent> {
+        match &event {
+            ServiceEvent::Head { id, response, .. } => {
+                if let Some(route) = self.routes.get_mut(id) {
+                    let backend = route.backend;
+                    // Once a status is on the wire the response has begun, and
+                    // no later failure can be retried — there is no way to
+                    // un-send a `:status`.
+                    route.response_started = true;
+                    // A 5xx *from a backend* is a considered answer, not a
+                    // transport failure, so it is not evidence the backend is
+                    // unreachable. Anything it answers at all proves it is
+                    // there, which is what health is asking about.
+                    self.shared.health.success(&backend);
+                }
+                self.shared.stats.response(response.status);
+                Some(event)
+            }
+
+            ServiceEvent::Reset { id, code } => {
+                let Some(route) = self.routes.get(id) else {
+                    return Some(event);
+                };
+                let backend = route.backend;
+
+                // REFUSED_STREAM is a promise that nothing was processed — from
+                // §5.1.2, and from the GOAWAY rules for ids above
+                // `last_stream_id`. That promise is exactly what makes a retry
+                // safe, and it is the only reset code that carries it: CANCEL or
+                // INTERNAL_ERROR may well have run the request already.
+                if *code == ErrorCode::RefusedStream {
+                    // Not a health failure. A backend refusing a stream is
+                    // usually one at its concurrency limit or draining
+                    // gracefully — both are correct behaviour, and ejecting a
+                    // backend for being busy is how a load spike becomes an
+                    // outage.
+                    if self.retry(*id) {
+                        return None;
+                    }
+                } else {
+                    self.shared.health.failure(&backend, Instant::now());
+                }
+                Some(event)
+            }
+
+            _ => Some(event),
+        }
     }
 }
 
