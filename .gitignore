@@ -12,17 +12,21 @@
 flamegraph.svg
 perf.data*
 
-# Benchmark harness: kept local. `baseline.sh` and the promoted reference
-# number `baseline.csv` predate this rule and are already tracked, so they stay;
-# everything else under bench/ — run artifacts and notes — is ignored.
-/bench/
+# Benchmark harness: the scripts, the methodology note and the promoted
+# reference numbers are tracked — they are what makes a quoted figure
+# reproducible. Only the timestamped run artifacts are local.
+/bench/results/
 
 # macOS
 .DS_Store
 
-# Local-only planning and reference docs (kept out of git by request).
-# The per-week plans stay local; Week-1/2-tasks.md predate the rule and are
+# The per-week plans and the course spec stay local; the ADRs and RFC notes
+# under docs/ do not — the README links to them, and the reasoning they hold is
+# the most legible artifact here. Week-1/2-tasks.md predate this rule and are
 # already tracked.
-/docs/
 /Documentation/Week3-8.md
 /Documentation/*-plan.md
+
+# CDK: installed dependencies and synth output.
+/infra/node_modules/
+/infra/cdk.out/
