@@ -110,6 +110,24 @@ bench-proxy:
 bench-hot:
     cargo bench -p h2proxy-core --bench hot_path
 
+# The headline measurement: delivered rate and coordinated-omission-corrected
+# p99 against *offered* rate, stepped to and past the knee. Promotes
+# bench/curve.csv and bench/curve.svg. Uses `loadgen`, not h2load — see
+# bench/README.md for why h2load structurally cannot produce this number.
+curve:
+    bench/curve.sh
+
+# Sweep the flow-control windows and concurrency (design doc §10.5). Reports
+# throughput and the bridge's peak occupancy together, because the connection
+# window is the bounded-memory bound and buying throughput with it is a trade.
+tune:
+    bench/tune.sh
+
+# The ADR 0010 allocator A/B: system vs jemalloc, interleaved, inside the musl
+# container — the only environment where the claim means anything. Needs Docker.
+allocator:
+    bench/allocator.sh
+
 # Measure the abuse-guard thresholds against legitimate traffic (design doc §6).
 # Runs the honest profiles in observe-only mode and reports the headroom; fails
 # if any signal is within 10x of tripping on traffic that did nothing wrong.
