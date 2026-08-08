@@ -1,0 +1,3 @@
+profile,connections,streams_per_conn,requests,req_per_s,p99_request,mean_request,raw_log
+throughput,100,10,200000,82984.87,13.34ms,11.86ms,h2load-proxy-throughput-baseline-20260808T003652Z.txt
+concurrency,50,200,100000,229941.62,69.72ms,36.01ms,h2load-proxy-concurrency-baseline-20260808T003652Z.txt

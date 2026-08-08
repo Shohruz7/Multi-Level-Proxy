@@ -187,8 +187,17 @@ impl RecvWindow {
             return None;
         }
         let increment = std::mem::take(&mut self.unreleased);
-        // Restoring credit we previously issued can never exceed the ceiling.
-        debug_assert!(self.window.increase(increment).is_ok());
+        // Restoring credit we previously issued can never exceed the ceiling, so
+        // the error is genuinely unreachable — but the *increase* is not an
+        // assertion, it is the point of the call, and `debug_assert!` strips its
+        // whole expression in release builds. Writing it inline here compiled to
+        // nothing under `--release`: the window fell monotonically toward zero
+        // while the WINDOW_UPDATE still went out on the wire, until a peer
+        // spending credit we had genuinely issued looked like a flow-control
+        // violation and took the connection down with it. Bind first, assert
+        // second — never put an effect inside a `debug_assert!`.
+        let restored = self.window.increase(increment);
+        debug_assert!(restored.is_ok(), "restoring issued credit overflowed");
         Some(increment)
     }
 }
@@ -288,6 +297,29 @@ mod tests {
         assert_eq!(r.available(), 1000);
         assert_eq!(r.unreleased(), 0);
         assert_eq!(r.release(1), None);
+    }
+
+    #[test]
+    fn released_credit_is_restored_in_every_build_profile() {
+        // A regression test for a bug that only existed under `--release`: the
+        // `window.increase` that restores credit lived inside a `debug_assert!`,
+        // whose entire expression is compiled out when debug assertions are off.
+        // Every test above passed in debug and the proxy fell over in release,
+        // GOAWAYing its own backends with FLOW_CONTROL_ERROR after ~1 MiB.
+        //
+        // Sustained traffic is what exposes it: one release cycle looks fine
+        // because `unreleased` is doing the accounting. It is the *second* and
+        // later cycles, which need the restored credit to have landed, that fail.
+        let mut r = RecvWindow::new(1000);
+        for _ in 0..100 {
+            r.record(500).expect("the peer spends credit we issued");
+            assert_eq!(r.release(500), Some(500));
+            assert_eq!(
+                r.available(),
+                1000,
+                "credit must be restored locally, not only announced on the wire",
+            );
+        }
     }
 
     #[test]
