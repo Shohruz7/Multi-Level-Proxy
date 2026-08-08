@@ -197,30 +197,44 @@ pub struct Pool {
     /// When this pool was built. Idle ages are millis from here, so the record
     /// can hold a plain `AtomicU64` instead of a lock around an `Instant`.
     epoch: Instant,
-    /// How long a connection may sit unused before it is recycled.
+    /// How long a connection may sit unused before it is recycled. Cached from
+    /// `policy` in the unit the hot path compares in.
     idle_timeout_ms: u64,
+    /// Timings for idle recycling and active probing.
+    policy: crate::health::Policy,
+    /// Where a connection's own verdict on its backend goes.
+    ///
+    /// The pool is the only layer that knows both halves: which backend a
+    /// connection belongs to, and that the connection has just died of an
+    /// unanswered probe. A probe with nowhere to report is a socket recycler,
+    /// not a health check.
+    health: Option<Arc<crate::health::Health>>,
 }
 
 impl Pool {
     pub fn new(stats: Arc<ProxyStats>, max_conns_per_backend: usize) -> Self {
-        Self::with_idle_timeout(
+        Self::with_policy(
             stats,
             max_conns_per_backend,
-            crate::health::Policy::default().idle_timeout,
+            crate::health::Policy::default(),
+            None,
         )
     }
 
-    pub fn with_idle_timeout(
+    pub fn with_policy(
         stats: Arc<ProxyStats>,
         max_conns_per_backend: usize,
-        idle_timeout: std::time::Duration,
+        policy: crate::health::Policy,
+        health: Option<Arc<crate::health::Health>>,
     ) -> Self {
         Pool {
             backends: Mutex::new(HashMap::new()),
             stats,
             max_conns_per_backend: max_conns_per_backend.max(1),
             epoch: Instant::now(),
-            idle_timeout_ms: idle_timeout.as_millis() as u64,
+            idle_timeout_ms: policy.idle_timeout.as_millis() as u64,
+            policy,
+            health,
         }
     }
 
@@ -322,6 +336,8 @@ impl Pool {
         let record = Arc::new(UpstreamRecord::new(handle, now_ms));
         let stats = Arc::clone(&self.stats);
         let task_record = Arc::clone(&record);
+        let health = self.health.clone();
+        let (ping_idle, ping_timeout) = (self.policy.ping_idle, self.policy.ping_timeout);
 
         self.stats.connect_attempt();
         tokio::spawn(async move {
@@ -338,8 +354,20 @@ impl Pool {
                         Arc::clone(&stats),
                         Some(Arc::clone(&task_record)),
                     )
+                    .with_probe(ping_idle, ping_timeout)
                     .run()
                     .await;
+                    if summary.probe_timed_out {
+                        // The whole reason the probe exists. A black-holed
+                        // backend fails no request — the requests on it hang —
+                        // so this is the only report health will ever get, and
+                        // an idle connection dying silently would make active
+                        // probing a socket recycler with a metric.
+                        stats.probe_failure();
+                        if let Some(health) = &health {
+                            health.failure(&backend, tokio::time::Instant::now());
+                        }
+                    }
                     debug!(backend = %backend.addr, ?summary, "upstream connection closed");
                 }
                 Err(e) => {

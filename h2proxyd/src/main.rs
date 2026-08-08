@@ -389,6 +389,9 @@ fn spawn_stats_sampler(shared: &Arc<Shared>) {
             metrics::counter!("h2proxy_upstream_retries_total").absolute(stats.retries());
             metrics::counter!("h2proxy_backend_ejections_total")
                 .absolute(shared.health.ejections());
+            metrics::counter!("h2proxy_upstream_probes_total").absolute(stats.probes());
+            metrics::counter!("h2proxy_upstream_probe_failures_total")
+                .absolute(stats.probe_failures());
             for class in 1..=5u16 {
                 metrics::counter!("h2proxy_responses_total", "class" => format!("{class}xx"))
                     .absolute(stats.responses(class as usize));
@@ -614,6 +617,14 @@ fn init_metrics() {
     );
     metrics::describe_gauge!("h2proxy_backends_healthy", "Backends currently in rotation");
     metrics::describe_counter!(
+        "h2proxy_upstream_probes_total",
+        "Liveness PINGs sent to backends whose connection had gone quiet"
+    );
+    metrics::describe_counter!(
+        "h2proxy_upstream_probe_failures_total",
+        "Upstream connections closed because a liveness PING went unanswered"
+    );
+    metrics::describe_counter!(
         "h2proxy_responses_total",
         "Responses to clients, by status class"
     );
@@ -685,6 +696,8 @@ fn init_metrics() {
     metrics::counter!("h2proxy_upstream_retries_total").absolute(0);
     metrics::counter!("h2proxy_backend_ejections_total").absolute(0);
     metrics::gauge!("h2proxy_backends_healthy").set(0.0);
+    metrics::counter!("h2proxy_upstream_probes_total").absolute(0);
+    metrics::counter!("h2proxy_upstream_probe_failures_total").absolute(0);
     metrics::counter!("h2proxy_handshakes_total").increment(0);
     metrics::counter!("h2proxy_frames_received_total").increment(0);
     metrics::counter!("h2proxy_header_blocks_decoded_total").increment(0);

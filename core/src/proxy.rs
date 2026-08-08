@@ -72,6 +72,12 @@ pub struct ProxyStats {
     client_streams: AtomicUsize,
     /// Second attempts made after a retryable failure.
     retries: AtomicU64,
+    /// Liveness PINGs sent to backends that had gone quiet.
+    probes: AtomicU64,
+    /// Probes that went unanswered, each one a connection closed and a failure
+    /// reported to health. The ratio of these two is the whole story: a healthy
+    /// deployment probes constantly and fails never.
+    probe_failures: AtomicU64,
     /// Responses by status class, indexed `status / 100 - 1`. The "E" of RED.
     responses: [AtomicU64; 5],
     /// Request latency, as fixed histogram buckets. The "D" of RED.
@@ -219,6 +225,26 @@ impl ProxyStats {
         self.retries.load(Ordering::Relaxed)
     }
 
+    /// Counted as each probe goes out, not rolled up when the connection ends.
+    /// A connection that is alive and idle is precisely the one being asked
+    /// about, and a counter that only moved on close would read zero for it —
+    /// which is indistinguishable from probing being switched off.
+    pub fn probe_sent(&self) {
+        self.probes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn probe_failure(&self) {
+        self.probe_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn probes(&self) -> u64 {
+        self.probes.load(Ordering::Relaxed)
+    }
+
+    pub fn probe_failures(&self) -> u64 {
+        self.probe_failures.load(Ordering::Relaxed)
+    }
+
     /// A response head went to a client with this status.
     pub fn response(&self, status: u16) {
         let class = (status / 100).clamp(1, 5) as usize - 1;
@@ -274,7 +300,11 @@ pub struct Shared {
     /// Which backends are worth sending to (design doc §5.2). Filters the
     /// candidate list before the balancer ever sees it, so health and balancing
     /// stay separate concerns: this decides *eligibility*, `lb` decides *which*.
-    pub health: Health,
+    ///
+    /// Shared with the pool, which reports the one failure the request path
+    /// cannot see: a connection that died because its liveness probe went
+    /// unanswered, with no client stream on it to fail.
+    pub health: Arc<Health>,
 }
 
 impl Shared {
@@ -292,12 +322,18 @@ impl Shared {
         policy: health::Policy,
     ) -> Arc<Self> {
         let stats = Arc::new(ProxyStats::default());
+        let health = Arc::new(Health::new(policy));
         Arc::new(Shared {
-            pool: Pool::new(Arc::clone(&stats), max_conns_per_backend),
+            pool: Pool::with_policy(
+                Arc::clone(&stats),
+                max_conns_per_backend,
+                policy,
+                Some(Arc::clone(&health)),
+            ),
             backends,
             balancer: Box::new(PowerOfTwoChoices::new()),
             stats,
-            health: Health::new(policy),
+            health,
         })
     }
 

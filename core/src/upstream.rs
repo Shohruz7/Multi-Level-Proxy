@@ -44,10 +44,12 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
 use crate::conn::{
@@ -191,6 +193,149 @@ pub struct UpstreamSummary {
     pub responses_received: u64,
     pub streams_reset: u64,
     pub data_bytes_received: u64,
+    /// PINGs sent to prove the backend was still there.
+    pub probes_sent: u64,
+    /// Set when a probe went unanswered and this connection was closed for it.
+    ///
+    /// The pool reads this to report a *backend* failure to [`crate::health`].
+    /// Without that report the probe would only recycle a socket, which is not
+    /// health checking — it is the same shape as the week-7 bug where a feature
+    /// ran, detected the failure, and told nobody.
+    pub probe_timed_out: bool,
+}
+
+/// Active liveness probing for one upstream connection (design doc §5.2).
+///
+/// A backend can accept TCP, complete a handshake, and then answer nothing. No
+/// passive check sees that: the requests on it do not fail, they *hang*, and a
+/// hang is the one failure mode a proxy must never produce. A PING has an
+/// answer obliged by §6.7, so an unanswered one is evidence rather than
+/// inference.
+///
+/// **Quiet, not empty** — the same distinction the client-side drain had to
+/// learn (ADR 0018). Probing only connections with no streams in flight would
+/// skip exactly the case that matters, because a black-holed backend looks busy:
+/// its streams are open, and none of them is ever going to finish.
+struct Probe {
+    /// How long the socket must be silent before a probe is worth sending. Zero
+    /// disables probing entirely.
+    idle: Duration,
+    /// How long to wait for an answer before calling the backend dead.
+    timeout: Duration,
+    /// The last time the backend said anything at all.
+    last_heard: Instant,
+    /// The probe awaiting an answer.
+    outstanding: Option<Outstanding>,
+    next_nonce: u64,
+}
+
+/// A probe on the wire.
+#[derive(Clone, Copy, Debug)]
+struct Outstanding {
+    /// The payload, so an ACK can be matched to the PING that asked for it.
+    nonce: [u8; 8],
+    /// When it went out. Anything heard *after* this answers it — see
+    /// [`Probe::due`].
+    sent_at: Instant,
+    deadline: Instant,
+}
+
+/// What the probe timer wants done when it fires.
+#[derive(PartialEq, Eq, Debug)]
+enum ProbeAction {
+    /// Not due yet, or probing is off.
+    Nothing,
+    /// Send a PING carrying this nonce.
+    Send([u8; 8]),
+    /// The backend never answered. Give up on the connection.
+    Expired,
+}
+
+impl Probe {
+    fn new(idle: Duration, timeout: Duration, now: Instant) -> Self {
+        Probe {
+            idle,
+            timeout,
+            last_heard: now,
+            outstanding: None,
+            next_nonce: 1,
+        }
+    }
+
+    /// Probing off: the default for a connection nobody configured, so the
+    /// differential harness and the one-off `connect` helper park on their
+    /// sockets exactly as they did before.
+    fn disabled() -> Self {
+        Probe::new(Duration::ZERO, Duration::ZERO, Instant::now())
+    }
+
+    const fn enabled(&self) -> bool {
+        !self.idle.is_zero()
+    }
+
+    /// Anything from the backend counts as liveness, so an ordinary busy
+    /// connection never probes at all.
+    fn heard(&mut self, now: Instant) {
+        self.last_heard = now;
+    }
+
+    /// When the loop next needs waking for this. `None` parks it indefinitely.
+    fn next_wake(&self) -> Option<Instant> {
+        if !self.enabled() {
+            return None;
+        }
+        match self.outstanding {
+            Some(probe) => Some(probe.deadline),
+            None => Some(self.last_heard + self.idle),
+        }
+    }
+
+    fn due(&mut self, now: Instant) -> ProbeAction {
+        if !self.enabled() {
+            return ProbeAction::Nothing;
+        }
+        match self.outstanding {
+            Some(probe) if now >= probe.deadline => {
+                // Anything heard since the probe went out answers it, ACK or
+                // not. The question being asked is "is this backend still
+                // there", and a backend streaming a response has answered it —
+                // killing that connection because a PING ACK was slow behind a
+                // large write would be a false positive on a demonstrably live
+                // peer, which is the one thing a health check must not produce.
+                // What the probe really detects is *silence*.
+                if self.last_heard > probe.sent_at {
+                    self.outstanding = None;
+                    return ProbeAction::Nothing;
+                }
+                ProbeAction::Expired
+            }
+            Some(_) => ProbeAction::Nothing,
+            None if now.duration_since(self.last_heard) >= self.idle => {
+                let nonce = self.next_nonce.to_be_bytes();
+                self.next_nonce += 1;
+                self.outstanding = Some(Outstanding {
+                    nonce,
+                    sent_at: now,
+                    deadline: now + self.timeout,
+                });
+                ProbeAction::Send(nonce)
+            }
+            None => ProbeAction::Nothing,
+        }
+    }
+
+    /// A PING ACK arrived. `true` if it was the one we were waiting for, which
+    /// ends the probe early rather than waiting out its deadline.
+    fn acked(&mut self, data: &[u8; 8], now: Instant) -> bool {
+        self.heard(now);
+        match self.outstanding {
+            Some(probe) if probe.nonce == *data => {
+                self.outstanding = None;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Why the connection loop stopped.
@@ -242,6 +387,8 @@ pub struct UpstreamConnection<IO> {
     /// burst of 502s for requests the backend was still perfectly willing to
     /// answer.
     peer_draining: Option<(StreamId, tokio::time::Instant)>,
+    /// Active liveness probing. Off unless the pool turned it on.
+    probe: Probe,
     inbox: mpsc::UnboundedReceiver<ToUpstream>,
     stats: std::sync::Arc<crate::proxy::ProxyStats>,
     /// The pool's view of this connection, if it came from one. The peer's
@@ -301,11 +448,26 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
             pending: VecDeque::new(),
             next_stream_id: 1,
             peer_draining: None,
+            probe: Probe::disabled(),
             inbox,
             stats,
             record,
             summary: UpstreamSummary::default(),
         }
+    }
+
+    /// Prove the backend is still there when the socket goes quiet for `idle`,
+    /// and give up on it if the PING is unanswered for `timeout`.
+    ///
+    /// Opt-in rather than on by default because only a *pooled* connection has
+    /// anywhere to report the answer: the pool knows which backend this is, and
+    /// the health table is what the report is for. A connection built directly —
+    /// the differential harness, [`connect`] — has neither, and a probe it could
+    /// not report would be a timer that only ever loses requests.
+    #[must_use]
+    pub fn with_probe(mut self, idle: Duration, timeout: Duration) -> Self {
+        self.probe = Probe::new(idle, timeout, Instant::now());
+        self
     }
 
     /// Run until the backend closes, every client has gone, or the protocol
@@ -410,9 +572,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
     async fn tick(&mut self) -> Result<bool, ConnectionError> {
         let mut wrote = 0usize;
         let mut msg = None;
+        let mut probe_fired = false;
+        let mut heard = false;
         // Only during a peer drain, so an idle connection still parks on its
         // sockets rather than waking on a timer it has no use for.
         let drain_deadline = self.peer_draining.map(|(_, at)| at);
+        // Likewise: `None` unless probing is on, so a connection nobody
+        // configured has exactly the wake-ups it had before.
+        let probe_at = self.probe.next_wake();
 
         let keep_going = tokio::select! {
             biased;
@@ -425,6 +592,16 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
                     None => std::future::pending().await,
                 }
             } => true,
+
+            // The probe timer. A silent socket is precisely the case where no
+            // other arm will ever wake this loop, which is why the probe needs
+            // its own and why the failure it catches is invisible without one.
+            _ = async {
+                match probe_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => { probe_fired = true; true }
 
             written = self.writer.write(&self.out), if !self.out.is_empty() => {
                 match written {
@@ -449,7 +626,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
             read = self.reader.read_buf(&mut self.read_buf) => {
                 match read {
                     Ok(0) => false,
-                    Ok(_) => true,
+                    Ok(_) => { heard = true; true }
                     Err(e) => {
                         debug!(error = %e, "upstream read failed; closing");
                         false
@@ -459,6 +636,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
         };
 
         self.out.advance(wrote);
+        if heard {
+            self.probe.heard(Instant::now());
+        }
+        if probe_fired && !self.probe_timer()? {
+            return Ok(false);
+        }
         if let Some(msg) = msg {
             self.handle_message(msg)?;
             while let Ok(msg) = self.inbox.try_recv() {
@@ -466,6 +649,45 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
             }
         }
         Ok(keep_going)
+    }
+
+    /// The probe timer fired: send the PING, or conclude the backend is gone.
+    ///
+    /// `false` ends the connection. Ending it *quietly* rather than as a
+    /// protocol error is deliberate — the backend has broken no rule that we can
+    /// see, it has simply stopped talking, and the streams on it are failed by
+    /// [`Self::fail_all_routes`] on the way out exactly as they would be for any
+    /// other death. That is what turns a hang into a 502, and then — through the
+    /// pool's report to `health` — into an ejection.
+    fn probe_timer(&mut self) -> Result<bool, ConnectionError> {
+        match self.probe.due(Instant::now()) {
+            ProbeAction::Nothing => Ok(true),
+            ProbeAction::Send(nonce) => {
+                trace!("backend has gone quiet; probing with PING");
+                self.queue_frame(&Frame::Ping {
+                    data: nonce,
+                    ack: false,
+                })?;
+                self.summary.probes_sent += 1;
+                self.stats.probe_sent();
+                Ok(true)
+            }
+            ProbeAction::Expired => {
+                warn!(
+                    timeout_s = self.probe.timeout.as_secs_f64(),
+                    live = self.routes.len(),
+                    "backend did not answer a PING; closing the connection",
+                );
+                self.summary.probe_timed_out = true;
+                // Out of rotation now, not when the task finally unwinds: a
+                // checkout racing this must not be handed a socket we have
+                // already given up on.
+                if let Some(record) = &self.record {
+                    record.retire();
+                }
+                Ok(false)
+            }
+        }
     }
 
     /// Bounded for the same reason the client side's is: a backend that stops
@@ -899,7 +1121,15 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
                     ack: true,
                 })?;
             }
-            Frame::Ping { ack: true, .. } => {}
+            Frame::Ping { data, ack: true } => {
+                // The nonce is checked rather than just the flag. A backend that
+                // echoes a stale payload has proved it was alive when *that*
+                // probe went out, which is the question we already had an answer
+                // to; only a matching payload answers the one we just asked.
+                if self.probe.enabled() && !self.probe.acked(data, Instant::now()) {
+                    debug!("ignoring a PING ACK we did not ask for");
+                }
+            }
             Frame::GoAway {
                 last_stream_id,
                 error_code,
@@ -1453,4 +1683,123 @@ where
         debug!(?summary, "upstream connection closed");
     });
     handle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 5 s / 5 s probe whose clock starts exactly at `start`, so every
+    /// assertion below is about the arithmetic rather than about how long the
+    /// test itself took.
+    fn probe(start: Instant) -> Probe {
+        Probe::new(Duration::from_secs(5), Duration::from_secs(5), start)
+    }
+
+    #[tokio::test]
+    async fn a_connection_nobody_configured_never_probes_and_never_wakes() {
+        let mut off = Probe::disabled();
+        let now = Instant::now() + Duration::from_secs(3600);
+        assert_eq!(off.next_wake(), None, "a disabled probe must park forever");
+        assert_eq!(off.due(now), ProbeAction::Nothing);
+    }
+
+    #[tokio::test]
+    async fn a_quiet_socket_is_probed_and_a_busy_one_is_not() {
+        let start = Instant::now();
+        let mut p = probe(start);
+
+        assert_eq!(p.due(start + Duration::from_secs(4)), ProbeAction::Nothing);
+        // Traffic resets the clock, which is why an ordinary busy connection
+        // never sends a probe at all.
+        p.heard(start + Duration::from_secs(4));
+        assert_eq!(p.due(start + Duration::from_secs(8)), ProbeAction::Nothing);
+        assert!(matches!(
+            p.due(start + Duration::from_secs(9)),
+            ProbeAction::Send(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_probe_expires_and_an_answered_one_does_not() {
+        let start = Instant::now();
+        let mut p = probe(start);
+        let ProbeAction::Send(nonce) = p.due(start + Duration::from_secs(5)) else {
+            panic!("a probe was due and was not sent");
+        };
+        // Still waiting, not yet expired.
+        assert_eq!(p.due(start + Duration::from_secs(9)), ProbeAction::Nothing);
+        assert_eq!(p.due(start + Duration::from_secs(10)), ProbeAction::Expired);
+
+        let mut answered = probe(start);
+        let ProbeAction::Send(first) = answered.due(start + Duration::from_secs(5)) else {
+            panic!("a probe was due and was not sent");
+        };
+        assert!(answered.acked(&first, start + Duration::from_secs(6)));
+        assert_eq!(
+            answered.due(start + Duration::from_secs(10)),
+            ProbeAction::Nothing,
+            "an answered probe expired anyway; every idle backend would be ejected",
+        );
+        // The next probe carries a different payload, so this round's ACK cannot
+        // answer the next round's question.
+        let ProbeAction::Send(second) = answered.due(start + Duration::from_secs(11)) else {
+            panic!("the idle period elapsed again with no probe");
+        };
+        assert_ne!(first, second, "two probes reused a nonce");
+        assert_eq!(
+            nonce, first,
+            "unrelated probes disagreed on the first nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_ack_is_not_mistaken_for_the_answer_to_this_probe() {
+        // The payload is checked, not just the flag, so an ACK for a probe two
+        // rounds ago does not end the one in flight early. It is still traffic,
+        // though, and traffic is liveness — the connection survives on that
+        // basis rather than on a payload it never sent back.
+        let start = Instant::now();
+        let stale = 99u64.to_be_bytes();
+        let mut p = probe(start);
+        assert!(matches!(
+            p.due(start + Duration::from_secs(5)),
+            ProbeAction::Send(_)
+        ));
+        assert!(
+            !p.acked(&stale, start + Duration::from_secs(6)),
+            "a payload we never sent was matched to the probe in flight",
+        );
+        assert!(
+            p.outstanding.is_some(),
+            "a stale ACK cleared the probe it did not answer",
+        );
+        assert_eq!(
+            p.due(start + Duration::from_secs(10)),
+            ProbeAction::Nothing,
+            "the backend spoke; only silence should end a connection",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_talks_without_acking_is_left_alone() {
+        // The false-positive case that matters under load: a peer mid-response
+        // is alive whatever it does with our PING, and disconnecting it would
+        // cost real requests to defend against nothing.
+        let start = Instant::now();
+        let mut p = probe(start);
+        assert!(matches!(
+            p.due(start + Duration::from_secs(5)),
+            ProbeAction::Send(_)
+        ));
+        p.heard(start + Duration::from_secs(7));
+        assert_eq!(p.due(start + Duration::from_secs(10)), ProbeAction::Nothing);
+        // ...and the cycle restarts from the last thing it said, not from the
+        // probe, so the next probe is a full idle period away.
+        assert_eq!(p.due(start + Duration::from_secs(11)), ProbeAction::Nothing);
+        assert!(matches!(
+            p.due(start + Duration::from_secs(12)),
+            ProbeAction::Send(_)
+        ));
+    }
 }
