@@ -48,9 +48,14 @@ The parts that carry the weight:
   connections carrying 400 streams land on a handful of upstream connections,
   and the stream-id remapping between the two id spaces is the pool's job.
 - **Resilience** — connection pooling and coalescing, load balancing by
-  least-outstanding-streams, health checking with outlier ejection, and
-  mitigations for the HTTP/2 abuse patterns (Rapid Reset, control-frame and
-  empty-frame floods).
+  least-outstanding-streams, health checking with outlier ejection and
+  single-request probe-back, conservative idempotent-only retries, and a
+  graceful two-phase GOAWAY drain on both legs.
+- **Defence** — per-connection accounting for the HTTP/2 abuse patterns: Rapid
+  Reset (CVE-2023-44487), PING and SETTINGS floods, empty-DATA floods, and
+  CONTINUATION floods. The offending connection is closed with
+  `ENHANCE_YOUR_CALM`; everyone else is untouched. The thresholds are
+  **measured**, not guessed — see below.
 
 Errors follow HTTP/2's own split: a connection error emits GOAWAY and takes
 the connection down; a stream error emits RST_STREAM and leaves it up.
@@ -168,6 +173,14 @@ cargo run -p h2proxyd
 curl -s http://127.0.0.1:9090/metrics | grep h2proxy_
 ```
 
+Resilience, live:
+
+```sh
+just calibrate   # measure the abuse thresholds against legitimate traffic
+just attack      # Rapid Reset + backend-kill, with a control run to compare
+just bench-proxy # through-proxy throughput, against the committed baseline
+```
+
 Dev loop (needs [`just`](https://github.com/casey/just)): `just dev` runs a local
 h2c backend *and* the proxy wired to it — the full client → proxy → backend path.
 `just run-server` runs the engine with no backends, answering from its built-in
@@ -204,25 +217,40 @@ window while the transfer runs, instead of tracking the response size.
 
 ## Current state
 
-**It is a proxy.** Both halves of the engine are hand-built and tested: the
-server side that faces clients, and the client side that faces backends. A
-request arrives over TLS, is decoded and validated, forwarded over a pooled h2c
-connection to a backend, and the response is streamed back — with the two
-connections' flow-control windows coupled so that neither peer can outrun the
-other into this process's memory.
+**It is a proxy, and it survives things.** Both halves of the engine are
+hand-built and tested: the server side that faces clients, and the client side
+that faces backends. A request arrives over TLS, is decoded and validated,
+forwarded over a pooled h2c connection to a backend, and the response is streamed
+back — with the two connections' flow-control windows coupled so that neither
+peer can outrun the other into this process's memory.
 
-What works and is covered by tests: TLS 1.3 + ALPN, the full frame codec, HPACK
-in both directions with independent dynamic tables, the stream lifecycle,
-two-level flow control with fair interleaving, the upstream connection pool with
-coalescing and stream-id remapping, least-outstanding-streams load balancing,
-trailers across both legs, and the backpressure bridge. h2spec passes 146/146
-both as a plain server and with the proxy path in front of a real backend.
+Covered by tests: TLS 1.3 + ALPN, the full frame codec, HPACK in both directions
+with independent dynamic tables, the stream lifecycle, two-level flow control
+with fair interleaving, the upstream pool with coalescing and stream-id
+remapping, least-outstanding-streams load balancing, trailers across both legs,
+the backpressure bridge, the graceful drain, health checking with ejection and
+probe-back, idempotent retries, `x-forwarded-for`, and the abuse guard.
 
-Still to come: **week 7** — graceful GOAWAY drain, health checking with outlier
-ejection, idempotent retries, and the §6 abuse mitigations (Rapid Reset,
-control-frame and empty-frame floods). **Week 8** — the CDK stack, the deployed
-load test, and the tuning pass that turns the reasoned window sizes into
-measured ones.
+Measured, locally, in release builds:
+
+| Claim | Number |
+|---|---|
+| Backend killed mid-load, 200k requests | **0 5xx**, 2 ejections, 247 retries rescued |
+| SIGTERM mid-load, 75k requests | **0 5xx**; a 20 MB response completed in full across it |
+| Rapid Reset flood beside ordinary load | attacker GOAWAYed; bystander p99 **11.65 ms → 8.11 ms** (unharmed) |
+| Abuse guard cost per frame | **0.46%** of frame dispatch (272.1 ns → 273.4 ns) |
+| Threshold headroom vs. legitimate traffic | 12.5x–20x, measured |
+| Throughput, before vs. after all of week 7 | 82,985 → 86,711 req/s — **no measurable cost** |
+
+The last row is the one that took discipline: the through-proxy baseline was
+captured *before* any week-7 code landed, because once the guard is in the frame
+path the pre-hardening number is gone. Capturing it is also what found a
+release-only flow-control bug that six weeks of green tests had missed — the
+whole suite ran in debug, and `RecvWindow::release` credited its window back
+inside a `debug_assert!`, which `--release` compiles away entirely.
+
+Still to come: **week 8** — the CDK stack, the deployed load test, and the tuning
+pass that turns the reasoned window sizes into measured ones.
 
 ## License
 

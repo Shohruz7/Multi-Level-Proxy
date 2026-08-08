@@ -1,0 +1,6 @@
+signal,peak_observed,threshold,headroom_ratio,verdict
+reset_rate,1,20,20.0,ok
+unanswered_rate,1,15,15.0,ok
+control_rate,4,50,12.5,ok
+consecutive_empty,0,32,inf,ok
+continuations,0,64,inf,ok

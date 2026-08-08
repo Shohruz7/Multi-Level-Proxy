@@ -101,3 +101,21 @@ h2spec-proxy target='':
 # Pool coalescing and bridge occupancy, live, from a running daemon's metrics.
 coalescing:
     curl -s http://127.0.0.1:9090/metrics | grep -E 'upstream_|bridge_'
+
+# Through-proxy throughput, against the committed bench/proxy-baseline.csv.
+bench-proxy:
+    bench/proxy-baseline.sh
+
+# Micro-benchmarks: what the abuse guard and the RED histogram cost per frame.
+bench-hot:
+    cargo bench -p h2proxy-core --bench hot_path
+
+# Measure the abuse-guard thresholds against legitimate traffic (design doc §6).
+# Runs the honest profiles in observe-only mode and reports the headroom; fails
+# if any signal is within 10x of tripping on traffic that did nothing wrong.
+calibrate:
+    bench/calibrate.sh
+
+# Rapid Reset flood and a backend kill, each against a control run.
+attack:
+    bench/attack.sh
