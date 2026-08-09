@@ -116,20 +116,45 @@ column -s, -t "$CSV" >&2
 # The verdict, computed rather than eyeballed. Medians, because three runs and a
 # mean is one outlier away from a conclusion.
 awk -F, '
-  NR>1 && $4 != "NA" { rps[$1] = rps[$1] " " $4; p99[$1] = p99[$1] " " $6 }
-  function median(list,   n, a, i) {
+  NR>1 && $4 != "NA" {
+    rps[$1] = rps[$1] " " $4; p99[$1] = p99[$1] " " $6; rss[$1] = rss[$1] " " $9
+  }
+  # Every scratch variable is declared as a parameter, including the inner loop
+  # counters. An earlier version left `j` and `t` global, and the caller also
+  # used `j` to hold a result — so the loop clobbered the value being assigned
+  # and the summary reported jemalloc at "4 req/s (-100.0%)" for a run in which
+  # both arms delivered exactly 20,000. A reporting bug that invents a
+  # catastrophic regression is worse than no summary at all.
+  function median(list,   n, a, i, k, t) {
     n = split(list, a, " "); if (n == 0) return "NA"
-    for (i = 1; i < n; i++) for (j = i+1; j <= n; j++) if (a[j] < a[i]) { t=a[i]; a[i]=a[j]; a[j]=t }
-    return a[int((n+1)/2)]
+    for (i = 1; i < n; i++)
+      for (k = i + 1; k <= n; k++)
+        if (a[k] + 0 < a[i] + 0) { t = a[i]; a[i] = a[k]; a[k] = t }
+    return a[int((n + 1) / 2)]
+  }
+  function spread(list,   n, a, i, lo, hi) {
+    n = split(list, a, " "); if (n == 0) return "NA"
+    lo = a[1] + 0; hi = a[1] + 0
+    for (i = 2; i <= n; i++) { if (a[i]+0 < lo) lo = a[i]+0; if (a[i]+0 > hi) hi = a[i]+0 }
+    return sprintf("%.1f-%.1f", lo, hi)
   }
   END {
-    s = median(rps["system"]); j = median(rps["jemalloc"])
-    sp = median(p99["system"]); jp = median(p99["jemalloc"])
-    printf "\nmedian throughput: system %s req/s, jemalloc %s req/s", s, j
-    if (s > 0) printf " (%+.1f%%)", (j - s) / s * 100
+    sr = median(rps["system"]);  jr = median(rps["jemalloc"])
+    sp = median(p99["system"]);  jp = median(p99["jemalloc"])
+    printf "\nmedian throughput: system %s req/s, jemalloc %s req/s", sr, jr
+    if (sr + 0 > 0) printf " (%+.1f%%)", (jr - sr) / sr * 100
     printf "\nmedian p99:        system %s ms, jemalloc %s ms", sp, jp
-    if (sp > 0) printf " (%+.1f%%)", (jp - sp) / sp * 100
-    printf "\n\nRecord this in docs/adr/0010 whatever it says. A wash is a result.\n"
+    if (sp + 0 > 0) printf " (%+.1f%%)", (jp - sp) / sp * 100
+    printf "\n  p99 spread:      system %s, jemalloc %s", spread(p99["system"]), spread(p99["jemalloc"])
+    printf "\nRSS:               system%s, jemalloc%s", rss["system"], rss["jemalloc"]
+    printf "\n\nRead the spread before the medians. If the two arms overlap there is no\n"
+    printf "effect to report, and RSS is the other half of an allocator claim.\n"
+    printf "Record it in docs/adr/0010 whatever it says. A wash is a result.\n"
   }' "$CSV" >&2
+
+if [ "${PROMOTE:-1}" = "1" ]; then
+  cp "$CSV" "$HERE/allocator.csv"
+  echo "promoted to bench/allocator.csv — the numbers docs/adr/0010 quotes" >&2
+fi
 
 echo "written: $CSV" >&2

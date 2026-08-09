@@ -54,7 +54,7 @@ echo "building release binaries" >&2
 backend_pid=$!
 trap 'kill $backend_pid ${proxy_pid:-} 2>/dev/null || true' EXIT
 
-echo "conn_window,stream_window,max_concurrent_streams,achieved_rps,p50_ms,p99_ms,p999_ms,bridge_peak_bytes,stalls" > "$CSV"
+echo "conn_window,stream_window,max_concurrent_streams,achieved_rps,p50_ms,p99_ms,p999_ms,bulk_mbps,bridge_peak_bytes,stalls" > "$CSV"
 
 point() {
   local conn_window="$1" stream_window="$2" concurrency="$3"
@@ -85,19 +85,42 @@ point() {
   local achieved p50 p99 p999
   IFS=, read -r _ _ _ _ _ _ _ achieved p50 _ p99 p999 _ _ _ <<<"$out"
 
+  kill "$slow_pid" 2>/dev/null || true
+
+  # Bulk transfer, measured separately and *after* the rate test.
+  #
+  # This is the column that actually answers the question. A 1 KiB response
+  # never fills even the smallest window in this sweep, so the small-request
+  # profile above is blind to flow control by construction — every row of it
+  # comes out the same, which is a finding about the profile rather than about
+  # the windows. A window governs how many octets may be in flight before the
+  # sender must stop and wait for a WINDOW_UPDATE, so its effect appears in
+  # *large* transfers, at one round trip per window's worth of data.
+  #
+  # Median of three, because a single download on a shared laptop is a coin toss.
+  local speeds=""
+  for _ in 1 2 3; do
+    local bytes_per_sec
+    bytes_per_sec=$(curl -sk --http2 -o /dev/null -w '%{speed_download}' \
+      "https://$PROXY_ADDR/bytes/$BIG" 2>/dev/null || echo 0)
+    speeds="$speeds $bytes_per_sec"
+  done
+  local bulk
+  bulk=$(echo "$speeds" | tr ' ' '\n' | grep -v '^$' | sort -n | awk '
+    { v[NR]=$1 } END { if (NR) printf "%.1f", v[int((NR+1)/2)] / 1048576 }')
+
   local scrape peak stalls
   scrape=$(curl -s "http://$METRICS/metrics")
   peak=$(echo "$scrape" | awk '/^h2proxy_bridge_buffered_bytes_peak /{print $2}')
   stalls=$(echo "$scrape" | awk '/^h2proxy_flow_control_stalls_total /{print $2}')
 
-  kill "$slow_pid" 2>/dev/null || true
   # SIGTERM, not SIGKILL: the drain is part of what is being measured, and a
   # proxy killed mid-run would leave the next point's port in TIME_WAIT.
   kill "$proxy_pid" 2>/dev/null || true
   wait "$proxy_pid" 2>/dev/null || true
 
-  echo "$conn_window,$stream_window,$concurrency,${achieved:-NA},${p50:-NA},${p99:-NA},${p999:-NA},${peak:-NA},${stalls:-NA}" >> "$CSV"
-  echo "  cw=$conn_window sw=$stream_window mcs=$concurrency -> ${achieved:-NA} req/s, p99 ${p99:-NA} ms, bridge peak ${peak:-NA} B" >&2
+  echo "$conn_window,$stream_window,$concurrency,${achieved:-NA},${p50:-NA},${p99:-NA},${p999:-NA},${bulk:-NA},${peak:-NA},${stalls:-NA}" >> "$CSV"
+  echo "  cw=$conn_window sw=$stream_window mcs=$concurrency -> ${achieved:-NA} req/s, p99 ${p99:-NA} ms, bulk ${bulk:-NA} MiB/s, bridge peak ${peak:-NA} B" >&2
 }
 
 for conn_window in $CONN_WINDOWS; do
@@ -117,6 +140,13 @@ done
 echo >&2
 column -s, -t "$CSV" >&2
 echo >&2
-echo "The column to read second is bridge_peak_bytes: throughput bought with" >&2
-echo "memory is a trade, and the connection window is the bounded-memory bound." >&2
+echo "Read bulk_mbps first — a 1 KiB response cannot fill any window in this" >&2
+echo "sweep, so the request-rate columns are blind to flow control by design." >&2
+echo "Then read bridge_peak_bytes: bulk throughput bought with memory is a trade," >&2
+echo "and the connection window is the bounded-memory bound." >&2
+if [ "${PROMOTE:-1}" = "1" ]; then
+  cp "$CSV" "$HERE/tune.csv"
+  echo "promoted to bench/tune.csv — the numbers Documentation/RESULTS.md quotes" >&2
+fi
+
 echo "written: $CSV" >&2

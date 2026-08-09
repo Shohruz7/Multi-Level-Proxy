@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 460" width="860" height="460" font-family="system-ui,-apple-system,sans-serif">
+<rect width="860" height="460" fill="none"/>
+<text x="68" y="24" font-size="15" font-weight="600" fill="#1f2933">h2proxy — throughput: delivered rate and p99 vs offered load</text>
+<text x="68" y="40" font-size="11" fill="#7b8794">open loop, coordinated-omission corrected; loopback, generator and proxy sharing 10 cores</text>
+<line x1="68" y1="404.0" x2="788" y2="404.0" stroke="#d8dee6" stroke-width="1"/>
+<text x="60" y="408.0" font-size="11" fill="#7b8794" text-anchor="end">0k</text>
+<line x1="68" y1="332.0" x2="788" y2="332.0" stroke="#d8dee6" stroke-width="1"/>
+<text x="60" y="336.0" font-size="11" fill="#7b8794" text-anchor="end">12k</text>
+<line x1="68" y1="260.0" x2="788" y2="260.0" stroke="#d8dee6" stroke-width="1"/>
+<text x="60" y="264.0" font-size="11" fill="#7b8794" text-anchor="end">24k</text>
+<line x1="68" y1="188.0" x2="788" y2="188.0" stroke="#d8dee6" stroke-width="1"/>
+<text x="60" y="192.0" font-size="11" fill="#7b8794" text-anchor="end">36k</text>
+<line x1="68" y1="116.0" x2="788" y2="116.0" stroke="#d8dee6" stroke-width="1"/>
+<text x="60" y="120.0" font-size="11" fill="#7b8794" text-anchor="end">48k</text>
+<line x1="68" y1="44.0" x2="788" y2="44.0" stroke="#d8dee6" stroke-width="1"/>
+<text x="60" y="48.0" font-size="11" fill="#7b8794" text-anchor="end">60k</text>
+<text x="796" y="408.0" font-size="11" fill="#d9480f">100 µs</text>
+<text x="796" y="318.0" font-size="11" fill="#d9480f">1 ms</text>
+<text x="796" y="228.0" font-size="11" fill="#d9480f">10 ms</text>
+<text x="796" y="138.0" font-size="11" fill="#d9480f">100 ms</text>
+<text x="796" y="48.0" font-size="11" fill="#d9480f">1000 ms</text>
+<text x="68.0" y="422.0" font-size="11" fill="#7b8794" text-anchor="middle">0k</text>
+<text x="212.0" y="422.0" font-size="11" fill="#7b8794" text-anchor="middle">12k</text>
+<text x="356.0" y="422.0" font-size="11" fill="#7b8794" text-anchor="middle">24k</text>
+<text x="500.0" y="422.0" font-size="11" fill="#7b8794" text-anchor="middle">36k</text>
+<text x="644.0" y="422.0" font-size="11" fill="#7b8794" text-anchor="middle">48k</text>
+<text x="788.0" y="422.0" font-size="11" fill="#7b8794" text-anchor="middle">60k</text>
+<text x="428" y="446" font-size="12" fill="#1f2933" text-anchor="middle">offered request rate (req/s)</text>
+<line x1="68.0" y1="404.0" x2="788.0" y2="44.0" stroke="#9aa5b1" stroke-width="1.5" stroke-dasharray="5 4"/>
+<path d="M92.0,392.0 L128.0,374.0 L188.0,344.0 L248.0,314.0 L308.0,284.0 L368.0,254.0 L428.0,224.0 L548.0,164.0 L668.0,104.0" fill="none" stroke="#2a6df4" stroke-width="2.5"/>
+<path d="M92.0,344.8 L128.0,378.3 L188.0,361.5 L248.0,348.5 L308.0,323.5 L368.0,286.0 L428.0,76.6 L548.0,87.0 L668.0,94.0" fill="none" stroke="#d9480f" stroke-width="2.5"/>
+<circle cx="92.0" cy="392.0" r="3.5" fill="#2a6df4"/>
+<circle cx="128.0" cy="374.0" r="3.5" fill="#2a6df4"/>
+<circle cx="188.0" cy="344.0" r="3.5" fill="#2a6df4"/>
+<circle cx="248.0" cy="314.0" r="3.5" fill="#2a6df4"/>
+<circle cx="308.0" cy="284.0" r="3.5" fill="#2a6df4"/>
+<circle cx="368.0" cy="254.0" r="3.5" fill="#2a6df4"/>
+<circle cx="428.0" cy="224.0" r="3.5" fill="#2a6df4"/>
+<circle cx="548.0" cy="164.0" r="3.5" fill="#2a6df4"/>
+<circle cx="668.0" cy="104.0" r="3.5" fill="#2a6df4"/>
+<circle cx="92.0" cy="344.8" r="3.5" fill="#d9480f"/>
+<circle cx="128.0" cy="378.3" r="3.5" fill="#d9480f"/>
+<circle cx="188.0" cy="361.5" r="3.5" fill="#d9480f"/>
+<circle cx="248.0" cy="348.5" r="3.5" fill="#d9480f"/>
+<circle cx="308.0" cy="323.5" r="3.5" fill="#d9480f"/>
+<circle cx="368.0" cy="286.0" r="3.5" fill="#d9480f"/>
+<circle cx="428.0" cy="76.6" r="3.5" fill="#d9480f"/>
+<circle cx="548.0" cy="87.0" r="3.5" fill="#d9480f"/>
+<circle cx="668.0" cy="94.0" r="3.5" fill="#d9480f"/>
+<line x1="368.0" y1="44" x2="368.0" y2="404" stroke="#1f2933" stroke-width="1" stroke-dasharray="3 3" opacity="0.5"/>
+<text x="374.0" y="58" font-size="11" fill="#1f2933">knee ≈ 25k req/s (p99 &lt; 3 ms)</text>
+<line x1="598" y1="50" x2="620" y2="50" stroke="#2a6df4" stroke-width="2.5"/>
+<text x="626" y="54" font-size="11" fill="#7b8794">delivered rate</text>
+<line x1="598" y1="67" x2="620" y2="67" stroke="#d9480f" stroke-width="2.5"/>
+<text x="626" y="71" font-size="11" fill="#7b8794">p99 latency</text>
+<line x1="598" y1="84" x2="620" y2="84" stroke="#9aa5b1" stroke-width="2.5"/>
+<text x="626" y="88" font-size="11" fill="#7b8794">offered = delivered</text>
+</svg>

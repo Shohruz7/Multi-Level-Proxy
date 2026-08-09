@@ -52,10 +52,37 @@ def nice_ceiling(value):
     return step * (int(value / step) + 1)
 
 
+# The two profiles ask different questions, so their axes mean different things.
+# Throughput offers a *rate* and asks what is delivered; concurrency sets a
+# number of requests *in flight* and asks whether the proxy holds up. Sharing a
+# plotting routine is fine; sharing an x-axis label would be a lie.
+PROFILE = {
+    "throughput": {
+        "x_label": "offered request rate (req/s)",
+        "subtitle": "open loop, coordinated-omission corrected; "
+        "loopback, generator and proxy sharing 10 cores",
+        # Only meaningful when the x axis is a rate.
+        "diagonal": True,
+    },
+    "concurrency": {
+        "x_label": "requests in flight (connections × streams)",
+        "subtitle": "closed loop — concurrency is set, not offered "
+        "(in an open loop, live streams = rate × latency); loopback",
+        "diagonal": False,
+    },
+}
+
+# The project's own target (README, design doc §10): small payloads under a
+# 3 ms p99. The knee is marked where that stops holding, rather than where
+# throughput collapses — throughput here does not collapse, it queues.
+P99_TARGET_MS = 3.0
+
+
 def plot(rows, profile, out):
     points = [r for r in rows if r["profile"] == profile]
     if not points:
         return None
+    style = PROFILE.get(profile, PROFILE["throughput"])
 
     offered = [float(r["offered_rps"]) for r in points]
     achieved = [float(r["achieved_rps"]) for r in points]
@@ -90,8 +117,7 @@ def plot(rows, profile, out):
         f'<text x="{PAD_L}" y="24" font-size="15" font-weight="600" fill="{INK}">'
         f"h2proxy — {profile}: delivered rate and p99 vs offered load</text>",
         f'<text x="{PAD_L}" y="40" font-size="11" fill="{MUTED}">'
-        "open loop, coordinated-omission corrected; loopback, generator and proxy "
-        "sharing 10 cores</text>",
+        f"{style['subtitle']}</text>",
     ]
 
     # Horizontal grid + left axis ticks (rate).
@@ -127,15 +153,17 @@ def plot(rows, profile, out):
         )
     svg.append(
         f'<text x="{(PAD_L + W - PAD_R) / 2:.0f}" y="{H - 14}" font-size="12" '
-        f'fill="{INK}" text-anchor="middle">offered request rate (req/s)</text>'
+        f'fill="{INK}" text-anchor="middle">{style["x_label"]}</text>'
     )
 
-    # The diagonal a proxy that keeps up would trace.
-    svg.append(
-        f'<line x1="{sx(0):.1f}" y1="{sy(0):.1f}" x2="{sx(x_max):.1f}" '
-        f'y2="{sy(x_max):.1f}" stroke="{IDEAL}" stroke-width="1.5" '
-        f'stroke-dasharray="5 4"/>'
-    )
+    # The diagonal a proxy that keeps up would trace — only meaningful when the
+    # x axis is a rate that could in principle be matched.
+    if style["diagonal"]:
+        svg.append(
+            f'<line x1="{sx(0):.1f}" y1="{sy(0):.1f}" x2="{sx(x_max):.1f}" '
+            f'y2="{sy(x_max):.1f}" stroke="{IDEAL}" stroke-width="1.5" '
+            f'stroke-dasharray="5 4"/>'
+        )
 
     def path(xs, ys, mapper):
         return " ".join(
@@ -156,12 +184,18 @@ def plot(rows, profile, out):
     for x, y in zip(offered, p99):
         svg.append(f'<circle cx="{sx(x):.1f}" cy="{sl(y):.1f}" r="3.5" fill="{LATENCY}"/>')
 
-    # Mark the knee: the last offered rate still delivered within 5%.
+    # Mark the knee: the highest point still inside the p99 target.
+    #
+    # Not "where delivered stops tracking offered" — that never happens here.
+    # Past saturation the proxy keeps accepting and the requests queue, so
+    # throughput still matches while latency goes up by two orders of magnitude.
+    # A knee drawn from throughput alone would be drawn off the right edge of a
+    # chart whose whole right half is unusable.
     knee = None
-    for x, y in zip(offered, achieved):
-        if x > 0 and y / x > 0.95:
+    for x, lat in zip(offered, p99):
+        if lat <= P99_TARGET_MS:
             knee = x
-    if knee:
+    if knee and style["diagonal"]:
         svg.append(
             f'<line x1="{sx(knee):.1f}" y1="{PAD_T}" x2="{sx(knee):.1f}" '
             f'y2="{H - PAD_B}" stroke="{INK}" stroke-width="1" stroke-dasharray="3 3" '
@@ -169,10 +203,12 @@ def plot(rows, profile, out):
         )
         svg.append(
             f'<text x="{sx(knee) + 6:.1f}" y="{PAD_T + 14}" font-size="11" '
-            f'fill="{INK}">knee ≈ {knee / 1000:.0f}k req/s</text>'
+            f'fill="{INK}">knee ≈ {knee / 1000:.0f}k req/s (p99 &lt; {P99_TARGET_MS:g} ms)</text>'
         )
 
-    legend = [("delivered rate", ACHIEVED), ("p99 latency", LATENCY), ("offered = delivered", IDEAL)]
+    legend = [("delivered rate", ACHIEVED), ("p99 latency", LATENCY)]
+    if style["diagonal"]:
+        legend.append(("offered = delivered", IDEAL))
     for i, (text, color) in enumerate(legend):
         y = PAD_T + 10 + i * 17
         x = W - PAD_R - 190
@@ -197,12 +233,13 @@ def main():
         return 1
     out = Path(sys.argv[2])
     written = []
-    profiles = sorted({r["profile"] for r in rows})
-    for profile in profiles:
-        # One file per profile; the primary name goes to the first.
-        target = out if profile == profiles[0] else out.with_name(
-            f"{out.stem}-{profile}{out.suffix}"
-        )
+    present = {r["profile"] for r in rows}
+    # Throughput first, deliberately: it takes the unsuffixed filename because it
+    # is the headline chart. Sorting alphabetically put *concurrency* there.
+    profiles = [p for p in ("throughput", "concurrency") if p in present]
+    profiles += sorted(present - set(profiles))
+    for index, profile in enumerate(profiles):
+        target = out if index == 0 else out.with_name(f"{out.stem}-{profile}{out.suffix}")
         if plot(rows, profile, target):
             written.append(str(target))
     print("wrote " + ", ".join(written))

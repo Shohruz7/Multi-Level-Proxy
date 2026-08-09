@@ -159,7 +159,9 @@ surface since.
 - **Goal** — 10,000+ concurrent streams and ~85k req/s on small responses with
   sub-3 ms p99 (two figures from two test profiles; see the design doc §10).
 - **Goal** — reproducible infrastructure as code (AWS CDK) and a load-test
-  harness that reports tail latency honestly.
+  harness that reports tail latency honestly. The harness is
+  [`loadgen`](loadgen/), written for this project because `h2load` is a closed
+  loop and structurally cannot measure a tail.
 - **Non-goal** — server push (`ENABLE_PUSH = 0`), a dynamic control plane, or an
   HTTP/1.1 downgrade path in v1.
 
@@ -173,6 +175,8 @@ core/        h2proxy-core — the hand-built protocol engine (library)
 h2proxyd/    the reverse-proxy daemon (binary): TLS, sockets, config, signals
 backend/     a tiny hyper h2c upstream, for the local dev loop and baselines
 bench/       load-test harness (h2load) and the committed reference baseline
+loadgen/     fixed-rate, coordinated-omission-correct HTTP/2 load generator
+infra/       the AWS CDK stack — synth-validated, never deployed
 docs/notes/  condensed RFC 9113 / 7541 / 9218 + Rapid Reset notes
 docs/adr/    architecture decision records
 ```
@@ -196,12 +200,14 @@ cargo run -p h2proxyd
 curl -s http://127.0.0.1:9090/metrics | grep h2proxy_
 ```
 
-Resilience, live:
+Measuring it, live:
 
 ```sh
+just curve       # the latency-vs-offered-load curve, corrected for coordinated omission
+just tune        # sweep the flow-control windows: bulk throughput against memory held
 just calibrate   # measure the abuse thresholds against legitimate traffic
 just attack      # Rapid Reset + backend-kill, with a control run to compare
-just bench-proxy # through-proxy throughput, against the committed baseline
+just soak        # five minutes with a backend dying and returning throughout
 ```
 
 Dev loop (needs [`just`](https://github.com/casey/just)): `just dev` runs a local
@@ -257,7 +263,32 @@ the backpressure bridge, the graceful drain, health checking with ejection,
 active PING probing and probe-back, idempotent retries, `x-forwarded-for`, and
 the abuse guard.
 
-Measured, locally, in release builds:
+### The curve
+
+![delivered rate and p99 against offered load](bench/curve.svg)
+
+Offered load stepped past saturation, measured **open-loop** with a
+coordinated-omission correction — see
+[Documentation/RESULTS.md](Documentation/RESULTS.md) for the full tables and the
+caveats, of which the first is that these are **loopback numbers on a ten-core
+laptop where the load generator competes with the proxy for CPU**.
+
+| | Number |
+|---|---|
+| Knee, small responses | **25,000 req/s at a corrected p99 of 2.0 ms** |
+| Failed requests, every step from 2k to 50k req/s | **0** |
+| Concurrent streams held open, measured at the proxy | **17,872**, at 53,600 req/s |
+| Behaviour past the knee | queues rather than sheds; delivered still tracks offered at 2× the knee |
+
+The most interesting number is one that looks like a mistake: past the knee, p50
+latency *falls* as offered load rises — 370 ms at 30k, 257 ms at 50k. It is not
+noise. 50 connections × 256 `MAX_CONCURRENT_STREAMS` caps admission at 12,800
+streams, the live-stream gauge pins there, and with concurrency fixed Little's
+law runs backwards: latency becomes ceiling ÷ throughput. Requests wait for a
+stream slot, and more load does not lengthen the wait — it makes slots turn over
+faster.
+
+### Resilience, measured
 
 | Claim | Number |
 |---|---|
@@ -269,6 +300,8 @@ Measured, locally, in release builds:
 | Abuse guard cost per frame | **0.46%** of frame dispatch (272.1 ns → 273.4 ns) |
 | Threshold headroom vs. legitimate traffic | 12.5x–20x, measured |
 | Throughput, before vs. after all of week 7 | 82,985 → 86,711 req/s — **no measurable cost** |
+| Flow-control windows, swept | defaults kept: 96% of the best bulk throughput at ~28% of the memory |
+| jemalloc vs musl's allocator | **not adopted** — latency difference inside the noise, RSS **13× higher** |
 
 The last row is the one that took discipline: the through-proxy baseline was
 captured *before* any week-7 code landed, because once the guard is in the frame
@@ -277,17 +310,35 @@ release-only flow-control bug that six weeks of green tests had missed — the
 whole suite ran in debug, and `RecvWindow::release` credited its window back
 inside a `debug_assert!`, which `--release` compiles away entirely.
 
-Two of the three bugs found in week 7, and the one found closing it out, were the
-same shape: a feature that ran, passed its tests, and reported nothing. None was
-found by reading code or adding a unit test. All three were found by measuring —
-which is why the harnesses above (`just calibrate`, `just attack`, `just soak`)
-are part of the project rather than notes in a terminal.
+Every bug worth remembering here was found the same way: a feature that ran,
+passed its tests, and reported nothing. None was found by reading code or adding
+a unit test; all were found by measuring — which is why the harnesses are part of
+the project rather than notes in a terminal. The full list, and what the five of
+them have in common, is in [the retrospective](docs/retrospective.md).
 
-Still to come: **week 8** — the CDK stack, the deployed load test, and the tuning
-pass that turns the reasoned window sizes into measured ones. The deployed run is
-also the first sight of real traffic *shape*, so the guard's thresholds should be
-re-calibrated against it; every one of them is an environment variable for
-exactly that reason.
+### What is deliberately not claimed
+
+**The deployment did not happen.** The AWS stack in [`infra/`](infra/) — NLB
+passing TCP through to a Graviton ASG, backends behind an internal NLB, a same-AZ
+load generator — is written, synthesizes with no AWS account, and is checked by
+template assertions on every push. **It has never been deployed**
+([ADR 0022](docs/adr/0022-infrastructure-as-code.md)). What that costs is
+specific: no instance-level numbers, no view of the local-vs-deployed gap, and no
+first sight of real traffic shape to re-calibrate the abuse guard against — which
+is why every threshold is an environment variable and the container ships with
+the guard in observe-only mode.
+
+**Every performance figure here is loopback on a ten-core laptop** where the load
+generator competes with the proxy for CPU. The absolute numbers belong to this
+machine; the relative ones — before and after a change, one allocator against
+another, corrected against uncorrected — are the ones that travel.
+[Documentation/RESULTS.md](Documentation/RESULTS.md) labels every row with the
+environment that produced it.
+
+The container itself is real, at least: the `scratch` image is **3.19 MB**, built
+for `linux/arm64`, and it proxies HTTP/2 end to end between two containers. The
+`Dockerfile` had been written and cited by an ADR for five weeks without ever
+being executed, and was wrong in three independent ways when it finally was.
 
 ## License
 

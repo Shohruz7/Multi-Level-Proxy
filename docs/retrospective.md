@@ -17,12 +17,19 @@ its tests, and reported nothing.
 | Health checking | Green | A dying upstream synthesized `ServiceEvent::Head{502}` — indistinguishable from a backend answering 502 — so every dead connection was reported to health as a **success**. A killed backend gave 36,632 5xx with the ejection counter at zero. |
 | Probe-back | Green | `Health::eligible` claimed the single trial slot when a backend was *offered*, not when it was *sent to*. If the balancer picked the other candidate, the flag was set with no request behind it and nothing could clear it. A recovering backend stayed half-open forever, ejected by its own recovery path. |
 | Stream accounting on client hang-up | Green | A client that hangs up mid-stream sends neither RST_STREAM nor END_STREAM, so `cancel` and `finish` never ran. Nothing leaked but the *numbers*: the active-stream gauge could only climb, and the latency histogram silently omitted every abandoned stream. Found by a soak that watched what must stay flat. |
-| The `Dockerfile` | Nothing — it was never run | Written in week 2 with `AR=llvm-ar` (a binary the `clang` package does not ship) and `CC=clang` (which compiles against glibc headers and then fails to link against musl). Two independent errors, five weeks unnoticed, both found within a minute of the first real `docker build`. |
+| The `Dockerfile` | Nothing — it was never run | Written in week 2 and wrong in **three** independent ways, none discoverable by reading. `AR=llvm-ar` names a binary the `clang` package does not ship. `CC=clang` compiles C against glibc headers and then fails to link against musl. And aarch64 GCC's default `-moutline-atomics` links a libgcc object calling `__getauxval`, a glibc symbol musl lacks — which jemalloc's configure interprets as "this platform has no atomics". |
 
 The lesson is not "write more tests". Every one of these had tests, and the
 tests passed. It is that **a test asserts what you thought to assert, and a
 measurement shows you what is there.** The harnesses in `bench/` are in the
 repository rather than in someone's terminal history for exactly this reason.
+
+The `Dockerfile` row deserves its own sentence, because it is the cleanest case:
+it was written carefully, reviewed, referenced by an ADR, and described in the
+README — and it had never once been executed, because the machine's Docker was
+broken the week it was written. Three defects sat in nine lines of `ENV` for five
+weeks. **Every artifact that has never been run is a hypothesis**, however
+confident its author and however many documents cite it.
 
 The corollary, which is the more useful interview answer: the classes of defect
 that unit tests structurally cannot reach are (a) anything that differs between

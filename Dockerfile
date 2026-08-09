@@ -42,8 +42,19 @@ COPY . .
 # `undefined reference to __isoc23_strtol` — glibc 2.38 redirects `strtol` to a
 # symbol musl has never had. `musl-gcc` is the only one of the three that sees a
 # consistent set of headers and libraries.
+#
+# `-mno-outline-atomics` is the third thing that had to be discovered by running
+# this file, and the least guessable. GCC 10+ on aarch64 defaults to
+# `-moutline-atomics`, which links a libgcc startup object that calls
+# `__getauxval` to detect LSE atomics at runtime. `__getauxval` is a **glibc**
+# symbol; musl has only `getauxval`. So every link of a C dependency that uses
+# atomics fails with `undefined reference to __getauxval` — and jemalloc's
+# configure sees those failures as "this platform has no atomics" and emits
+# `#error "Don't have atomics implemented on this platform."` several hundred
+# lines into the build, naming nothing that would lead you here.
 ENV CC_aarch64_unknown_linux_musl=musl-gcc \
-    AR_aarch64_unknown_linux_musl=ar
+    AR_aarch64_unknown_linux_musl=ar \
+    CFLAGS_aarch64_unknown_linux_musl=-mno-outline-atomics
 
 RUN cargo build --release --locked --target "$TARGET" -p h2proxyd \
         ${FEATURES:+--features "$FEATURES"} \

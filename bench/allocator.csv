@@ -1,0 +1,13 @@
+arm,repeat,allocator_reported,achieved_rps,p50_ms,p99_ms,p999_ms,max_ms,rss_bytes
+system,1,system,20000,0.542,2.848,59.096,92.429,5.465MiB
+jemalloc,1,jemalloc,20000,0.621,5.544,25.938,45.405,69.82MiB
+system,2,system,20000,0.943,22.100,38.958,58.227,3.57MiB
+jemalloc,2,jemalloc,20000,1.153,19.241,28.080,42.938,73.3MiB
+system,3,system,20000,1.674,37.505,52.960,67.805,3.922MiB
+jemalloc,3,jemalloc,20000,1.323,88.019,116.912,194.590,65.09MiB
+system,4,system,20000,1.347,37.139,67.799,87.434,3.957MiB
+jemalloc,4,jemalloc,20000,1.156,30.715,54.283,66.989,71.51MiB
+system,5,system,20000,1.969,122.246,165.446,220.591,5.504MiB
+jemalloc,5,jemalloc,20000,1.667,28.423,78.649,149.973,67.29MiB
+system,6,system,20000,2.252,44.742,93.600,130.117,5.645MiB
+jemalloc,6,jemalloc,20000,1.790,41.906,69.051,93.170,64.85MiB
