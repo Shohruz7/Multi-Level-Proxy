@@ -275,18 +275,21 @@ laptop where the load generator competes with the proxy for CPU**.
 
 | | Number |
 |---|---|
-| Knee, small responses | **25,000 req/s at a corrected p99 of 2.0 ms** |
-| Failed requests, every step from 2k to 50k req/s | **0** |
-| Concurrent streams held open, measured at the proxy | **17,872**, at 53,600 req/s |
-| Behaviour past the knee | queues rather than sheds; delivered still tracks offered at 2× the knee |
+| Sustained throughput, closed loop | **≥210,000 req/s** (still climbing when the run stopped) |
+| Failed requests, every step measured | **0** |
+| Concurrent streams held open, measured at the proxy | **17,872** |
+| Engine + client leg alone (echo mode, open loop) | 40,000 req/s at **p99 0.216 ms** |
 
-The most interesting number is one that looks like a mistake: past the knee, p50
-latency *falls* as offered load rises — 370 ms at 30k, 257 ms at 50k. It is not
-noise. 50 connections × 256 `MAX_CONCURRENT_STREAMS` caps admission at 12,800
-streams, the live-stream gauge pins there, and with concurrency fixed Little's
-law runs backwards: latency becomes ceiling ÷ throughput. Requests wait for a
-stream slot, and more load does not lengthen the wait — it makes slots turn over
-faster.
+**A correction worth reading before any of these.** An earlier version of this
+section reported a "knee at 25,000 req/s" and blamed the proxy's admission limit.
+That was the *load generator's* limit: held at the same concurrency, the closed
+loop drove the same proxy to 169,000 req/s. The generator has since been fixed —
+its open loop spawned a task per request and now uses a worker pool — but a cliff
+between 25k and 30k *through a backend* is still unexplained, and it is not the
+generator, not CPU, not the pool cap, and not the client leg. Until it is
+understood, the closed-loop figure is the honest one.
+[Documentation/RESULTS.md](Documentation/RESULTS.md) carries the full correction
+and the discriminating experiment.
 
 ### Resilience, measured
 

@@ -83,6 +83,11 @@ struct Config {
     duration: Duration,
     warmup: Duration,
     label: String,
+    /// Long-lived workers backing the open loop. Not a concurrency cap in the
+    /// coordinated-omission sense — see `open_loop` — but it does bound how many
+    /// requests can be *in flight*, so it wants to be comfortably above
+    /// rate x latency.
+    workers: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -105,6 +110,7 @@ fn parse_args() -> anyhow::Result<Config> {
         duration: Duration::from_secs(30),
         warmup: Duration::from_secs(3),
         label: "run".to_string(),
+        workers: 8192,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -120,10 +126,12 @@ fn parse_args() -> anyhow::Result<Config> {
             "--duration" | "-D" => config.duration = Duration::from_secs_f64(value()?.parse()?),
             "--warmup" => config.warmup = Duration::from_secs_f64(value()?.parse()?),
             "--label" => config.label = value()?,
+            "--workers" => config.workers = value()?.parse()?,
             "--help" | "-h" => {
                 eprintln!(
                     "loadgen --url URL [--rate REQ/S | --closed-loop] [--connections N] \
-                     [--streams N] [--duration S] [--warmup S] [--label NAME]"
+                     [--streams N] [--duration S] [--warmup S] [--label NAME] \
+                     [--workers N]"
                 );
                 std::process::exit(0);
             }
@@ -170,6 +178,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 Arc::clone(&senders),
                 uri.clone(),
                 rate,
+                config.workers,
                 started,
                 deadline,
                 measure_from,
@@ -242,13 +251,43 @@ const BATCH_PERIOD: Duration = Duration::from_micros(500);
 
 /// The corrected loop: dispatch on a fixed schedule, never throttling.
 ///
-/// Runs on a dedicated OS thread rather than as a task, so a late wake-up
-/// delays only dispatch and never a request already in flight.
+/// # Why a worker pool rather than a task per request
+///
+/// The obvious implementation — `tokio::spawn` one task per scheduled request —
+/// is what this file did first, and it is why the project's published "knee at
+/// 25,000 req/s" was wrong. Above about 30,000 req/s the generator collapsed:
+/// p99 jumped from 6 ms to 435 ms and dispatch lag rose fiftyfold. The proxy was
+/// blamed.
+///
+/// It was not the proxy. The *closed* loop, whose only structural difference is
+/// that its tasks are long-lived, drove the same proxy over the same connections
+/// to **169,000 req/s at the same concurrency** the open loop was stuck at. The
+/// cost was in creating and tearing down tens of thousands of short-lived tasks
+/// per second, each cloning a `SendRequest` and registering a waker on a shared
+/// connection, while the runtime was already busy.
+///
+/// So the workers are pre-spawned once and live for the whole run, exactly as
+/// the closed loop's do. What changes is only where the schedule comes from.
+///
+/// # Why this is still an open loop
+///
+/// A fixed number of workers looks like a concurrency cap, and a concurrency cap
+/// is the thing this program exists to avoid. It is not one, for two reasons.
+/// The scheduler never blocks or slows down — it hands each request off and
+/// immediately computes the next due time, so the *arrival* process stays
+/// independent of how fast the target is serving, which is the whole definition.
+/// And a request that waits because every worker is busy has that wait recorded,
+/// because latency is measured from its intended time. The queue is in front of
+/// the workers instead of inside the kernel, and it is counted either way.
+///
+/// Each worker owns its own queue rather than sharing one, which avoids a
+/// contended MPMC receiver; the scheduler round-robins across them.
 #[allow(clippy::too_many_arguments)]
 fn open_loop(
     senders: Arc<Vec<h2::client::SendRequest<bytes::Bytes>>>,
     uri: http::Uri,
     rate: u64,
+    workers: usize,
     started: Instant,
     deadline: Instant,
     measure_from: Instant,
@@ -256,6 +295,29 @@ fn open_loop(
     dispatched: Arc<AtomicU64>,
 ) -> std::thread::JoinHandle<()> {
     let handle = tokio::runtime::Handle::current();
+
+    // Pre-spawn the pool. Each worker is pinned to one connection so that a
+    // connection's requests are issued by a stable set of tasks.
+    let mut queues = Vec::with_capacity(workers);
+    for w in 0..workers {
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel::<Instant>();
+        let sender = senders[w % senders.len()].clone();
+        let uri = uri.clone();
+        let out = tx.clone();
+        handle.spawn(async move {
+            while let Some(intended) = job_rx.recv().await {
+                let sample = one_request(sender.clone(), uri.clone(), intended).await;
+                if intended >= measure_from {
+                    let _ = out.send(sample);
+                }
+            }
+        });
+        queues.push(job_tx);
+    }
+    // The pool holds the only other clones; dropping ours means the sample
+    // channel closes when the workers do.
+    drop(tx);
+
     std::thread::spawn(move || {
         let interval = Duration::from_secs_f64(1.0 / rate as f64);
         let mut n: u64 = 0;
@@ -276,17 +338,10 @@ fn open_loop(
                 if intended >= deadline {
                     break 'schedule;
                 }
-                let sender = senders[(n as usize) % senders.len()].clone();
-                let uri = uri.clone();
-                let tx = tx.clone();
-                let counted = intended >= measure_from;
                 dispatched.fetch_add(1, Ordering::Relaxed);
-                handle.spawn(async move {
-                    let sample = one_request(sender, uri, intended).await;
-                    if counted {
-                        let _ = tx.send(sample);
-                    }
-                });
+                if queues[(n as usize) % queues.len()].send(intended).is_err() {
+                    break 'schedule;
+                }
                 n += 1;
             }
 
@@ -304,6 +359,8 @@ fn open_loop(
                 std::thread::sleep(wait);
             }
         }
+        // Dropping the queues ends the workers once they drain.
+        drop(queues);
     })
 }
 

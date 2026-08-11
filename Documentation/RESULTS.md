@@ -53,6 +53,42 @@ size of the correction is reported rather than asserted. It is small while the
 proxy is comfortable and grows into the dominant term as the knee approaches —
 which is exactly where a p99 gets quoted.
 
+> ## Correction (2026-08-11): the knee below is the harness's, not the proxy's
+>
+> The table in the next section reports a knee at 25,000 req/s and attributes the
+> collapse past it to the proxy's admission limit. **That attribution is wrong**,
+> and it was caught while building a chart to compare the two methodologies.
+>
+> The discriminating test: hold the *same* ~11,200 requests in flight the open
+> loop reached at its "cliff", but drive them closed-loop. If the proxy were the
+> constraint, throughput would collapse identically.
+>
+> | Measurement | Delivered | p99 |
+> |---|---:|---:|
+> | Open loop, offering 30k | 30,000 req/s | 435 ms |
+> | Closed loop, same ~11,200 in flight | **169,030 req/s** | 143 ms |
+> | Closed loop, 22,400 in flight | **209,928 req/s** | 170 ms |
+>
+> The proxy sustains **at least 210,000 req/s** and was still climbing. The
+> Little's-law arithmetic in that section is still correct — it just describes a
+> queue the *generator* was creating, not a limit the proxy was imposing.
+>
+> **What has been fixed since:** `loadgen`'s open loop spawned a task per
+> request; it now uses a pre-spawned worker pool, like the closed loop, which
+> improved the 25k point from 2.045 ms to **0.445 ms** p99.
+>
+> **What is still unexplained:** a cliff remains between 25k and 30k req/s
+> *through a backend*. It is not the generator (dispatch lag is 0.046 ms at the
+> cliff), not CPU (the box is 55% idle), not the pool cap (raising it from 8 to
+> 128 does not move it), and not the client leg or the engine — in echo mode,
+> with no upstream hop, the same rig does **40,000 req/s at p99 0.216 ms**. It is
+> something in the upstream leg, and it is open.
+>
+> Until that is understood, **no latency claim in this document below the
+> correction line should be quoted**, and the honest capability figure is the
+> closed-loop one: ≥210k req/s. The numbers are left in place rather than deleted
+> because how a benchmark misleads is worth keeping on the record.
+
 ## Throughput profile — the curve
 
 50 connections, 1 KiB responses, offered rate stepped past saturation. 12 s of

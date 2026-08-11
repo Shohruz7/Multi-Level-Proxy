@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 480" width="880" height="480" font-family="system-ui,-apple-system,sans-serif">
+<text x="74" y="26" font-size="15" font-weight="600" fill="#1f2933">The same proxy, measured two ways</text>
+<text x="74" y="45" font-size="11.5" fill="#7b8794">p99 against delivered throughput — 50 connections, identical proxy, backend and duration; only the measurement discipline differs</text>
+<text x="74" y="61" font-size="11.5" fill="#7b8794">The closed loop cannot place a point past the rate the proxy grants it, so it never reaches the region where the tail collapses.</text>
+<line x1="74" y1="422.0" x2="852" y2="422.0" stroke="#d8dee6" stroke-width="1"/>
+<text x="66" y="426.0" font-size="11" fill="#7b8794" text-anchor="end">100 µs</text>
+<line x1="74" y1="335.5" x2="852" y2="335.5" stroke="#d8dee6" stroke-width="1"/>
+<text x="66" y="339.5" font-size="11" fill="#7b8794" text-anchor="end">1 ms</text>
+<line x1="74" y1="249.0" x2="852" y2="249.0" stroke="#d8dee6" stroke-width="1"/>
+<text x="66" y="253.0" font-size="11" fill="#7b8794" text-anchor="end">10 ms</text>
+<line x1="74" y1="162.5" x2="852" y2="162.5" stroke="#d8dee6" stroke-width="1"/>
+<text x="66" y="166.5" font-size="11" fill="#7b8794" text-anchor="end">100 ms</text>
+<line x1="74" y1="76.0" x2="852" y2="76.0" stroke="#d8dee6" stroke-width="1"/>
+<text x="66" y="80.0" font-size="11" fill="#7b8794" text-anchor="end">1000 ms</text>
+<text x="74.0" y="440.0" font-size="11" fill="#7b8794" text-anchor="middle">0k</text>
+<text x="229.6" y="440.0" font-size="11" fill="#7b8794" text-anchor="middle">17k</text>
+<text x="385.2" y="440.0" font-size="11" fill="#7b8794" text-anchor="middle">34k</text>
+<text x="540.8" y="440.0" font-size="11" fill="#7b8794" text-anchor="middle">52k</text>
+<text x="696.4" y="440.0" font-size="11" fill="#7b8794" text-anchor="middle">69k</text>
+<text x="852.0" y="440.0" font-size="11" fill="#7b8794" text-anchor="middle">86k</text>
+<text x="463" y="464" font-size="12" fill="#1f2933" text-anchor="middle">delivered throughput (req/s)</text>
+<path d="M334.6,258.8 L354.4,286.1 L384.3,314.5 L435.8,242.2 L472.8,160.4 L499.4,186.9 L501.1,217.8 L815.0,161.1" fill="none" stroke="#2a6df4" stroke-width="2.5"/>
+<circle cx="334.6" cy="258.8" r="4" fill="#2a6df4"/>
+<circle cx="354.4" cy="286.1" r="4" fill="#2a6df4"/>
+<circle cx="384.3" cy="314.5" r="4" fill="#2a6df4"/>
+<circle cx="435.8" cy="242.2" r="4" fill="#2a6df4"/>
+<circle cx="472.8" cy="160.4" r="4" fill="#2a6df4"/>
+<circle cx="499.4" cy="186.9" r="4" fill="#2a6df4"/>
+<circle cx="501.1" cy="217.8" r="4" fill="#2a6df4"/>
+<circle cx="815.0" cy="161.1" r="4" fill="#2a6df4"/>
+<text x="815.0" y="149.1" font-size="11" font-weight="600" fill="#2a6df4" text-anchor="middle">closed loop (h2load shape)</text>
+<path d="M119.1,388.6 L164.3,384.7 L209.4,288.8 L254.5,360.6 L299.6,265.1 L344.8,107.2 L435.0,113.0 L525.3,120.9" fill="none" stroke="#d9480f" stroke-width="2.5"/>
+<circle cx="119.1" cy="388.6" r="4" fill="#d9480f"/>
+<circle cx="164.3" cy="384.7" r="4" fill="#d9480f"/>
+<circle cx="209.4" cy="288.8" r="4" fill="#d9480f"/>
+<circle cx="254.5" cy="360.6" r="4" fill="#d9480f"/>
+<circle cx="299.6" cy="265.1" r="4" fill="#d9480f"/>
+<circle cx="344.8" cy="107.2" r="4" fill="#d9480f"/>
+<circle cx="435.0" cy="113.0" r="4" fill="#d9480f"/>
+<circle cx="525.3" cy="120.9" r="4" fill="#d9480f"/>
+<text x="525.3" y="108.9" font-size="11" font-weight="600" fill="#d9480f" text-anchor="middle">open loop (corrected)</text>
+<line x1="815.0" y1="76" x2="815.0" y2="422" stroke="#2a6df4" stroke-width="1" stroke-dasharray="4 4" opacity="0.55"/>
+<text x="807.0" y="89" font-size="11" fill="#2a6df4" text-anchor="end">the closed loop stops here</text>
+<text x="74" y="462.0" font-size="11.5" fill="#1f2933">At ~50k req/s delivered: closed loop reports 22.96 ms, open loop 302.97 ms.</text>
+</svg>
