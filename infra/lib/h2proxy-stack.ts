@@ -42,6 +42,34 @@ const BACKEND_INSTANCE = 'c7g.large';
  */
 const LOADGEN_INSTANCE = 'c7g.2xlarge';
 
+/**
+ * Who, outside the VPC, may reach the edge listener.
+ *
+ * This exists because `preserveClientIp` and a VPC-CIDR-only ingress rule
+ * quietly contradict each other. An NLB has no security group, so a rule for
+ * "traffic the NLB forwards" has to be written against whatever source address
+ * the target sees — and with client-IP preservation on, that is the *client's*
+ * address, not the NLB node's. A stack that is `internetFacing: true` and
+ * admits only `10.20.0.0/16` therefore deploys cleanly, passes its health
+ * checks, and refuses every real client.
+ *
+ * The in-VPC load generator is unaffected, which is why this went unnoticed:
+ * the benchmark works either way. It is only wrong for anyone *else*.
+ *
+ * Left empty by default rather than opened. `0.0.0.0/0` on a benchmark rig is
+ * how a research project becomes somebody's open proxy, and the template test
+ * forbids it. Pass CIDRs explicitly — `-c edgeClients=203.0.113.4/32` — when a
+ * client outside the VPC actually needs in.
+ */
+function edgeClientCidrs(scope: Construct): string[] {
+  const raw = scope.node.tryGetContext('edgeClients');
+  if (!raw) return [];
+  return String(raw)
+    .split(',')
+    .map((cidr) => cidr.trim())
+    .filter(Boolean);
+}
+
 export class H2ProxyStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
@@ -79,6 +107,20 @@ export class H2ProxyStack extends Stack {
       emptyOnDelete: true,
     });
     const backendRepo = new ecr.Repository(this, 'BackendImage', {
+      imageScanOnPush: true,
+      removalPolicy: RemovalPolicy.DESTROY,
+      emptyOnDelete: true,
+    });
+    // The generator ships as an image for the same reason the proxy does: the
+    // alternative is a Rust toolchain on the box and a `cargo build` whose
+    // output nobody can tie back to a commit.
+    //
+    // It has to ship at all because `h2load` cannot measure a tail — it is
+    // closed-loop, so a stall is measured once instead of in everything that
+    // queued behind it (bench/README.md). Installing only h2load here, as this
+    // stack did, meant the deployed rig could not produce the one number the
+    // project exists to report.
+    const loadGenRepo = new ecr.Repository(this, 'LoadGenImage', {
       imageScanOnPush: true,
       removalPolicy: RemovalPolicy.DESTROY,
       emptyOnDelete: true,
@@ -131,6 +173,22 @@ export class H2ProxyStack extends Stack {
       ec2.Port.tcp(PORT.metrics),
       'NLB health check and Prometheus scrapes',
     );
+    // Opt-in only; see `edgeClientCidrs`. Each one is a real client address,
+    // because with `preserveClientIp` that is what the instance sees.
+    for (const cidr of edgeClientCidrs(this)) {
+      if (cidr === '0.0.0.0/0') {
+        throw new Error(
+          'edgeClients must not be 0.0.0.0/0: this rig runs an open proxy ' +
+            'with abuse mitigations in observe-only mode on its first deploy. ' +
+            'Name the addresses that need in.',
+        );
+      }
+      proxySg.addIngressRule(
+        ec2.Peer.ipv4(cidr),
+        ec2.Port.tcp(PORT.proxy),
+        'client traffic from outside the VPC, allow-listed',
+      );
+    }
     backendSg.addIngressRule(
       ec2.Peer.ipv4(vpc.vpcCidrBlock),
       ec2.Port.tcp(PORT.backend),
@@ -151,6 +209,23 @@ export class H2ProxyStack extends Stack {
       minCapacity: 2,
       maxCapacity: 4,
       requireImdsv2: true,
+      // Two things, and both exist because without them a broken bootstrap
+      // *deploys successfully*.
+      //
+      // `signals` puts a CreationPolicy on the group and cfn-signal at the end
+      // of the user data, so CloudFormation waits for the instance to say it
+      // came up and rolls back if it does not. `healthCheck` makes the group
+      // believe the load balancer rather than only the EC2 status checks: an
+      // instance whose container never started still passes its status checks
+      // forever, so the ASG would never replace it and the target group would
+      // simply sit at zero healthy.
+      signals: autoscaling.Signals.waitForMinCapacity({
+        timeout: Duration.minutes(10),
+      }),
+      healthChecks: autoscaling.HealthChecks.withAdditionalChecks({
+        additionalTypes: [autoscaling.AdditionalHealthCheckType.ELB],
+        gracePeriod: Duration.minutes(5),
+      }),
       userData: ec2.UserData.custom(
         backendUserData({
           registry: `${this.account}.dkr.ecr.${this.region}.amazonaws.com`,
@@ -193,6 +268,16 @@ export class H2ProxyStack extends Stack {
       maxCapacity: 4,
       requireImdsv2: true,
       associatePublicIpAddress: true,
+      // As on the backends: a bootstrap that dies must fail the deploy rather
+      // than leave an instance that passes its EC2 status checks forever while
+      // answering nothing.
+      signals: autoscaling.Signals.waitForMinCapacity({
+        timeout: Duration.minutes(10),
+      }),
+      healthChecks: autoscaling.HealthChecks.withAdditionalChecks({
+        additionalTypes: [autoscaling.AdditionalHealthCheckType.ELB],
+        gracePeriod: Duration.minutes(5),
+      }),
       userData: ec2.UserData.custom(
         proxyUserData({
           registry: `${this.account}.dkr.ecr.${this.region}.amazonaws.com`,
@@ -271,16 +356,14 @@ export class H2ProxyStack extends Stack {
       instanceType: new ec2.InstanceType(LOADGEN_INSTANCE),
       machineImage,
       securityGroup: loadGenSg,
-      role: new iam.Role(this, 'LoadGenRole', {
-        assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
-        managedPolicies: [
-          iam.ManagedPolicy.fromAwsManagedPolicyName(
-            'AmazonSSMManagedInstanceCore',
-          ),
-        ],
-      }),
+      role: instanceRole('LoadGen', loadGenRepo),
       requireImdsv2: true,
-      userData: ec2.UserData.custom(loadGenUserData()),
+      userData: ec2.UserData.custom(
+        loadGenUserData({
+          registry: `${this.account}.dkr.ecr.${this.region}.amazonaws.com`,
+          image: `${loadGenRepo.repositoryUri}:latest`,
+        }),
+      ),
     });
 
     Tags.of(this).add('project', 'h2proxy');
@@ -296,7 +379,13 @@ export class H2ProxyStack extends Stack {
     });
     new CfnOutput(this, 'BackendRepositoryUri', {
       value: backendRepo.repositoryUri,
-      description: 'Push the backend image here',
+      description: 'Push the backend image here (linux/arm64)',
+    });
+    new CfnOutput(this, 'LoadGenRepositoryUri', {
+      value: loadGenRepo.repositoryUri,
+      description:
+        'Push the loadgen image here (linux/arm64). Without it the generator ' +
+        'has only h2load, which cannot measure a tail.',
     });
     new CfnOutput(this, 'LoadGenInstanceId', {
       value: loadGen.instanceId,

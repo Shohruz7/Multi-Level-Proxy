@@ -142,7 +142,16 @@ test -n "$UPSTREAMS"
       {
         H2PROXYD_LISTEN: '0.0.0.0:8443',
         H2PROXYD_METRICS: '0.0.0.0:9090',
-        H2PROXYD_UPSTREAMS: '\\$UPSTREAMS',
+        // No backslash. The unit file is written by an *unquoted* heredoc, where
+        // `\$` suppresses expansion — so escaping this wrote the literal string
+        // `$UPSTREAMS` into ExecStart. systemd does not run ExecStart through a
+        // shell; it expands `$VAR` from the unit's own Environment=, this unit
+        // sets none, and an unset unbraced variable expands to *zero words*.
+        // The result was `docker run ... -e -e H2PROXYD_DRAIN_GRACE=5 ...`,
+        // which fails, restarts forever, and never answers /metrics. Expanding
+        // here instead bakes the resolved addresses into the unit, which is
+        // what the comment above this function describes.
+        H2PROXYD_UPSTREAMS: '$UPSTREAMS',
         // Under the NLB's 45-second docker stop; see `unit` above.
         H2PROXYD_DRAIN_GRACE: '5',
         H2PROXYD_DRAIN_DEADLINE: '30',
@@ -169,21 +178,33 @@ export function backendUserData(opts: {
 }
 
 /**
- * Load-generator bootstrap: h2load and nothing else.
+ * Load-generator bootstrap: `loadgen` **and** h2load.
  *
- * No service is installed. The generator is driven by hand over SSM Session
+ * Both, because they answer different questions and only one of them can answer
+ * the interesting one. h2load is closed-loop — it issues the next request when
+ * the last completes — so it cannot offer a fixed rate and cannot suffer a
+ * queue: a stall is measured once instead of in everything that piled up behind
+ * it. That is coordinated omission, and it makes h2load structurally unable to
+ * report a tail (bench/README.md). It stays because it is the right tool for
+ * peak throughput and it is what the week-7 baselines used.
+ *
+ * `loadgen` is the open-loop one and is where any p99 must come from. Shipping
+ * it as a container keeps the binary tied to a commit; the alternative is a
+ * Rust toolchain on the box and a build nobody can trace.
+ *
+ * No service is installed: the generator is driven by hand over SSM Session
  * Manager, because a load test that starts itself at boot produces a number
- * nobody was watching.
+ * nobody was watching. The image is pulled at boot so the run does not begin
+ * with a download, and `loadgen` is put on PATH as a wrapper so that the
+ * recipes in bench/README.md read the same here as they do on a laptop.
  */
-export function loadGenUserData(): string {
-  return `#!/bin/bash
-set -euxo pipefail
-
-cat >/etc/sysctl.d/99-loadgen.conf <<'SYSCTL'
-${SYSCTLS}
-SYSCTL
-sysctl --system
-
+export function loadGenUserData(opts: {
+  registry: string;
+  image: string;
+}): string {
+  return (
+    prologue(opts.registry, opts.image) +
+    `
 # h2load ships in the nghttp2 package on Amazon Linux 2023.
 dnf install -y nghttp2
 
@@ -191,5 +212,15 @@ cat >/etc/security/limits.d/99-loadgen.conf <<'LIMITS'
 * soft nofile ${NOFILE}
 * hard nofile ${NOFILE}
 LIMITS
-`;
+
+# --network host: the generator has to see the NLB address directly, and a
+# bridge network would put a NAT hop inside the thing doing the measuring.
+cat >/usr/local/bin/loadgen <<'WRAP'
+#!/bin/bash
+exec /usr/bin/docker run --rm --network host \\
+  --ulimit nofile=${NOFILE}:${NOFILE} ${opts.image} "$@"
+WRAP
+chmod +x /usr/local/bin/loadgen
+`
+  );
 }

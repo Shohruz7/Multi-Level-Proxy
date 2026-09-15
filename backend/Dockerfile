@@ -1,8 +1,15 @@
 # syntax=docker/dockerfile:1
-# Dev-only image for the h2c backend (backend/src/main.rs). This is NOT the
-# proxy — the proxy's production image is the top-level Dockerfile (aarch64
-# static-musl). Kept simple on purpose: it exists to give `docker compose up` a
-# stable upstream on a fixed port.
+# Dev-only image for the h2c backend (backend/src/main.rs), for `docker compose
+# up` on a laptop. Glibc, host architecture, no platform pinning.
+#
+# **Not** the deployed image. The infra stack runs backends on Graviton, and
+# this file built on an x86 laptop produces an amd64 image that will not start
+# there. The deployed one comes from the top-level Dockerfile:
+#
+#     docker buildx build --platform linux/arm64 --build-arg PACKAGE=backend .
+#
+# Kept separate because a compose-up should not pay for a cross-arch static musl
+# build to hand a laptop a stable upstream on a fixed port.
 FROM rust:1.96-slim AS build
 WORKDIR /src
 COPY . .

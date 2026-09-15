@@ -11,6 +11,7 @@
  * a property nothing would ever get wrong is a test that can only ever pass.
  */
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -89,13 +90,31 @@ function instanceTypes(): Record<string, string> {
   return found;
 }
 
-/** The bootstrap script of the launch template whose logical id starts with `prefix`. */
+/**
+ * The bootstrap script of the resource whose logical id starts with `prefix`.
+ *
+ * Two places again, and for the same reason as `instanceTypes`: an ASG's user
+ * data lives on its launch template, while a standalone `ec2.Instance` keeps it
+ * on the instance and uses its launch template only to carry the IMDSv2
+ * requirement. Reading only launch templates finds an empty one for the load
+ * generator and reports nothing rather than failing, which is the worst of the
+ * available outcomes.
+ */
 function userDataOf(prefix: string): string {
-  const found = Object.entries(
+  const template_ = Object.entries(
     template.findResources('AWS::EC2::LaunchTemplate'),
+  ).find(
+    ([id, res]) =>
+      id.startsWith(prefix) && res.Properties.LaunchTemplateData.UserData,
+  );
+  if (template_) {
+    return flatten(template_[1].Properties.LaunchTemplateData.UserData);
+  }
+  const instance = Object.entries(
+    template.findResources('AWS::EC2::Instance'),
   ).find(([id]) => id.startsWith(prefix));
-  assert.ok(found, `no launch template for ${prefix}`);
-  return flatten(found[1].Properties.LaunchTemplateData.UserData);
+  assert.ok(instance, `no user data for ${prefix}`);
+  return flatten(instance[1].Properties.UserData);
 }
 
 describe('the edge', () => {
@@ -231,6 +250,113 @@ describe('the instances', () => {
     const decoded = userDataOf('Proxies');
     assert.match(decoded, /getent ahostsv4/);
     assert.match(decoded, /H2PROXYD_UPSTREAMS=/);
+  });
+
+  it('writes the resolved addresses into the unit, not the literal $UPSTREAMS', () => {
+    // The assertion above passes whether the value is right or not, and for a
+    // while it was wrong: the unit file is written by an *unquoted* heredoc,
+    // where a backslash-dollar suppresses expansion, so `\$UPSTREAMS` put the
+    // seven-character string `$UPSTREAMS` into ExecStart. systemd does not run
+    // ExecStart through a shell — it substitutes from the unit's own
+    // Environment=, this unit sets none, and an unset unbraced variable expands
+    // to *zero words*. `docker run` then received a dangling `-e`, failed,
+    // restarted forever, and never answered /metrics. Nothing in CI noticed,
+    // because the script was only ever matched as text.
+    //
+    // So this test stops reading the script and runs it. Only the heredoc that
+    // writes the unit is extracted and evaluated — the rest installs packages
+    // and talks to ECR — which is enough to pin the escaping, the thing that
+    // was wrong and the thing a future edit would get wrong the same way.
+    const decoded = userDataOf('Proxies');
+    const heredoc = decoded.match(
+      /cat >\/etc\/systemd\/system\/h2proxyd\.service <<UNIT\n([\s\S]*?)\nUNIT\n/,
+    );
+    assert.ok(heredoc, 'the proxy unit must be written by a UNIT heredoc');
+
+    const addresses = '10.20.1.5:8080,10.20.2.7:8080';
+    const rendered = execFileSync(
+      'bash',
+      ['-c', `UPSTREAMS=${JSON.stringify(addresses)}\ncat <<UNIT\n${heredoc[1]}\nUNIT\n`],
+      { encoding: 'utf8' },
+    );
+
+    assert.ok(
+      rendered.includes(`H2PROXYD_UPSTREAMS=${addresses}`),
+      `the unit must carry the addresses resolved at boot, got:\n${rendered}`,
+    );
+    assert.ok(
+      !rendered.includes('$UPSTREAMS'),
+      'an unexpanded $UPSTREAMS in ExecStart is the bug this test exists for',
+    );
+  });
+});
+
+describe('failing loudly', () => {
+  it('fails the deploy when a bootstrap fails, rather than reporting success', () => {
+    // Without a CreationPolicy, CloudFormation considers an ASG created as soon
+    // as the API call returns. An instance whose user data died still passes its
+    // EC2 status checks forever, so the group never replaces it, the target
+    // group sits at zero healthy, and `cdk deploy` prints CREATE_COMPLETE. That
+    // is how the $UPSTREAMS bug above could have survived a real deploy.
+    const groups = template.findResources('AWS::AutoScaling::AutoScalingGroup');
+    const ids = Object.keys(groups);
+    assert.equal(ids.length, 2, 'proxies and backends');
+    for (const [id, res] of Object.entries(groups)) {
+      assert.ok(
+        res.CreationPolicy?.ResourceSignal,
+        `${id} must wait for cfn-signal, or a broken bootstrap deploys green`,
+      );
+    }
+  });
+
+  it('lets the load balancer, not just EC2, decide an instance is healthy', () => {
+    // EC2 status checks say the virtual machine is alive. They say nothing about
+    // whether the container inside it ever started, which is the failure that
+    // actually happens here.
+    for (const [id, res] of Object.entries(
+      template.findResources('AWS::AutoScaling::AutoScalingGroup'),
+    )) {
+      const types: string[] = res.Properties.HealthCheckType
+        ? [res.Properties.HealthCheckType]
+        : [];
+      assert.ok(
+        types.includes('ELB'),
+        `${id} must take the load balancer's word for health, got ${JSON.stringify(types)}`,
+      );
+    }
+  });
+});
+
+describe('the load generator', () => {
+  it('ships loadgen, not just h2load', () => {
+    // h2load is closed-loop and structurally cannot measure a tail
+    // (bench/README.md). A rig that can only run h2load cannot produce the p99
+    // this project reports, and for a while that is exactly what this stack
+    // deployed: `dnf install -y nghttp2` and nothing else.
+    const decoded = userDataOf('LoadGen');
+    assert.match(decoded, /nghttp2/, 'h2load is still wanted for throughput');
+    assert.match(
+      decoded,
+      /\/usr\/local\/bin\/loadgen/,
+      'loadgen must be on PATH, or the tail is unmeasurable from here',
+    );
+  });
+
+  it('can pull the image it is told to run', () => {
+    // The role used to carry SSM only, so the generator could be handed an image
+    // reference it had no permission to fetch.
+    template.resourceCountIs('AWS::ECR::Repository', 3);
+    const policies = template.findResources('AWS::IAM::Policy');
+    const pulls = Object.values(policies).filter((p) =>
+      JSON.stringify(p.Properties.PolicyDocument).includes(
+        'ecr:BatchGetImage',
+      ),
+    );
+    assert.equal(
+      pulls.length,
+      3,
+      'proxy, backend and generator each need pull on their own repository',
+    );
   });
 });
 

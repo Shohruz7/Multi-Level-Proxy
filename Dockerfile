@@ -1,9 +1,18 @@
 # syntax=docker/dockerfile:1
 #
-# Production image for h2proxyd: one static aarch64 (Graviton) binary on
-# `scratch`. Build it for arm64 — the target arch of the week-8 deploy:
+# Production image for any binary in this workspace: one static aarch64
+# (Graviton) binary on `scratch`. Build it for arm64 — the target arch of the
+# week-8 deploy:
 #
 #     docker buildx build --platform linux/arm64 -t h2proxyd:arm64 .
+#     docker buildx build --platform linux/arm64 --build-arg PACKAGE=backend .
+#     docker buildx build --platform linux/arm64 --build-arg PACKAGE=loadgen .
+#
+# One recipe for all three because the deploy needs all three and they must not
+# differ in libc, allocator or toolchain. `backend/Dockerfile` is a separate,
+# glibc, host-arch image that exists only for `docker compose up` on a laptop;
+# building *that* for a Graviton instance produces an amd64 image that will not
+# start, which is the mistake this parameterisation removes.
 #
 # The binary is statically linked against musl (aarch64-unknown-linux-musl, the
 # target pinned in rust-toolchain.toml), so the runtime layer needs no libc and
@@ -28,6 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ARG TARGET=aarch64-unknown-linux-musl
 ARG FEATURES=""
+# Which workspace binary to build. The default keeps `docker build .` meaning
+# what it has always meant.
+ARG PACKAGE=h2proxyd
 RUN rustup target add "$TARGET"
 
 WORKDIR /src
@@ -56,14 +68,17 @@ ENV CC_aarch64_unknown_linux_musl=musl-gcc \
     AR_aarch64_unknown_linux_musl=ar \
     CFLAGS_aarch64_unknown_linux_musl=-mno-outline-atomics
 
-RUN cargo build --release --locked --target "$TARGET" -p h2proxyd \
+RUN cargo build --release --locked --target "$TARGET" -p "$PACKAGE" \
         ${FEATURES:+--features "$FEATURES"} \
-    && cp "target/${TARGET}/release/h2proxyd" /h2proxyd
+    && cp "target/${TARGET}/release/${PACKAGE}" /app
 
 FROM scratch
-COPY --from=build /h2proxyd /h2proxyd
-# 8443: TLS + h2 listener (H2PROXYD_LISTEN); 9090: Prometheus /metrics.
+# A fixed path, because ENTRYPOINT's exec form cannot expand a build argument.
+COPY --from=build /app /app
+# 8443: TLS + h2 listener (H2PROXYD_LISTEN); 9090: Prometheus /metrics. Both
+# are metadata and the defaults below are read only by h2proxyd — the other two
+# binaries ignore them, which is why one final stage serves all three.
 EXPOSE 8443 9090
 ENV H2PROXYD_LISTEN=0.0.0.0:8443 \
     H2PROXYD_METRICS=0.0.0.0:9090
-ENTRYPOINT ["/h2proxyd"]
+ENTRYPOINT ["/app"]
