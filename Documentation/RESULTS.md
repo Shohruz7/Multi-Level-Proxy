@@ -53,6 +53,65 @@ size of the correction is reported rather than asserted. It is small while the
 proxy is comfortable and grows into the dominant term as the knee approaches —
 which is exactly where a p99 gets quoted.
 
+> ## Correction (2026-09-15): the 210k figure below is also wrong, and the open defect is closed
+>
+> Two things in the 2026-08-11 correction immediately below need correcting in
+> turn. The pattern is not an accident and is the reason both are left standing:
+> every number in this file that was *quoted* rather than *committed* has so far
+> turned out to be wrong.
+>
+> **The "≥210,000 req/s" is not reproducible.** It appears in this document, in
+> the README and in a commit message, and in no artifact — `git log` shows
+> `bench/curve.csv` was never regenerated after it was claimed, and the only
+> committed closed-loop table, `bench/methodology.csv`, tops out at 82,091.
+> Re-measured closed-loop through a backend:
+>
+> | Shape | Delivered |
+> |---|---:|
+> | 50 conns × 20 streams (the standard shape) | 52,967 req/s |
+> | 50 conns × 40 streams | 47,625 req/s |
+> | 10 conns × 100 streams (best observed) | **76,919 req/s** |
+>
+> Throughput varies **2.4× at identical concurrency** purely by how it is
+> distributed across connections, which is a result worth having on its own: the
+> per-connection cost dominates, and "requests in flight" is not by itself a
+> description of a load.
+>
+> **The unexplained cliff was ordinary saturation with no admission control.**
+> Six hypotheses, each killed by a measurement rather than an argument:
+>
+> | Hypothesis | Test | Result |
+> |---|---|---|
+> | The load generator | `--workers 65536` | no change |
+> | Client-leg admission | `H2PROXYD_MAX_CONCURRENT_STREAMS=2048` | no change |
+> | Backend capacity | backend alone, the proxy's exact shape | **464,315 req/s** — 15× the cliff |
+> | Read starvation in `tick`'s biased select | deleted `biased` | no change |
+> | Lock convoy in `Pool::checkout` | 8 s profile under load | mutex wait 2.8%; workers parked 4,787/5,082 |
+> | Upstream slot scarcity | `BACKEND_MAX_CONCURRENT_STREAMS=2000` | queue eliminated, latency **unchanged** at 281 ms |
+>
+> The last is conclusive: removing the queue's *location* did not remove the
+> queue. The proxy used **1.14 of 10 cores** throughout, so it was never
+> CPU-bound. What was missing was a bound: past capacity, nothing stopped the
+> proxy accepting work, so overload was converted into latency and stayed
+> converted for as long as it lasted. The tell was that *fewer* upstream
+> connections were better — one connection gave p99 21 ms where eight gave
+> 297 ms — because the 200-slot stream limit was acting as accidental admission
+> control.
+>
+> **Fixed.** The upstream queue is bounded and refuses past it with a 503
+> (`h2proxy_upstream_shed_total`), and the pool now opens a connection when the
+> existing ones are backing up rather than when they merely reach the backend's
+> `MAX_CONCURRENT_STREAMS` — a protocol fact that says nothing about throughput.
+> At 20,000 req/s the pool settles on one upstream connection instead of eight,
+> p99 0.36 ms.
+>
+> **What is still not claimed.** Nothing about the saturation regime. The box
+> these runs happen on is a laptop running an editor, a VPN and Docker; its load
+> average sat at 4.5 with none of ours running, and interleaved A/B runs at
+> 30k–50k req/s disagreed with each other by more than the effect under test. A
+> number for that regime needs a quiet machine, and a third harness-shaped
+> retraction in this file is not wanted.
+
 > ## Correction (2026-08-11): the knee below is the harness's, not the proxy's
 >
 > The table in the next section reports a knee at 25,000 req/s and attributes the
@@ -257,9 +316,9 @@ atomics. The ADR's claim of "no new build-image cost" was simply wrong.
 | Backend killed mid-load, 200k requests | **0 5xx**, 2 ejections, 247 retries rescued | `just attack` |
 | Backend that accepts and then answers nothing | detected and ejected in ~2× `ping_idle`; requests get an answer instead of hanging | `core/tests/probe.rs` |
 | 5-minute soak, backend killed and restarted every 30 s | 13.0M requests, **0 5xx**, 1,177 retries, 16 ejections, 126 probes / 0 probe failures; RSS plateaued, every in-flight gauge settled to **0** | `just soak` |
-| SIGTERM mid-load, 75k requests | **0 5xx**; a 20 MB response completed in full across it | `just attack` |
+| SIGTERM mid-load, 75k requests | **0 5xx**; a 20 MB response completed in full across it | manual; see `docs/adr/0018` — `just attack` has no SIGTERM section |
 | Rapid Reset flood beside ordinary load | attacker GOAWAYed; bystander p99 **11.65 → 8.11 ms** (unharmed) | `just attack` |
-| Abuse-guard cost per frame | **0.46%** of frame dispatch (272.1 → 273.4 ns) | `just bench-hot` |
+| Abuse-guard cost per frame | **below the noise floor**: 5.6 / 5.4 / 0.59 ns per call, and the guarded arm of `frame_dispatch` measured 272.6 ns against 273.7 ns unguarded — overlapping intervals, so the honest claim is "not measurable", not a percentage | `just bench-hot` |
 | Threshold headroom vs. legitimate traffic | **12.5×–20×**, measured | `just calibrate` |
 | Accounting invariants, 3,000 requests over every ending | 0 leases outstanding, 0 streams, 0 buffered, `latency_count == 3000` | `core/tests/invariants.rs` |
 
@@ -269,9 +328,9 @@ atomics. The ADR's claim of "no new build-image cost" was simply wrong.
 |---|---|
 | h2spec (RFC 9113), engine only | **146/146** |
 | h2spec, through the proxy to a real backend | **146/146** |
-| Test suite, debug | 258 passing |
-| Test suite, release | 258 passing |
-| Fuzz targets (frame parser, HPACK decoder, guard) | build clean; 8.5M+ executions clean |
+| Test suite, debug | 260 passing |
+| Test suite, release | 260 passing |
+| Fuzz targets (frame parser, HPACK decoder, guard) | build clean; **14.2M executions, zero crashes** on the unshaped frame-parser target (`docs/adr/0011`). The "8.5M+" previously quoted here is real but is the *week-2* number from a 10-second run (`docs/progress/week-2-completion.md`) — smaller, older, and not what the row was describing |
 | Abuse guard during conformance | `h2proxy_connections_terminated_total` = 0 — no false positive on legitimate traffic |
 
 ## Reproducing all of it

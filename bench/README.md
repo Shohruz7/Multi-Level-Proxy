@@ -7,7 +7,7 @@ different ways.
 
 | Profile | Question it answers | Shape |
 |---|---|---|
-| **Throughput** | How many small requests/sec at an honest tail? | Many short requests over a moderate connection count; push the offered rate to the saturation knee. Target ≈ **85k req/s** on small payloads with **p99 < 3 ms**. |
+| **Throughput** | How many small requests/sec at an honest tail? | Many short requests over a moderate connection count; push the offered rate to the saturation knee. The original week-2 target was ≈ **85k req/s** with **p99 < 3 ms**, taken from a closed-loop h2load run; it is kept here only as history. Quote what `curve.sh` last produced, not this. |
 | **Concurrency** | How many simultaneous streams hold up? | Long-lived streams ramped to **10,000+** concurrent, memory and fairness watched, rate secondary. |
 
 ### The harnesses

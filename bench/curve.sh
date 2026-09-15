@@ -23,13 +23,24 @@
 #   bench/curve.sh                       # both profiles, promotes bench/curve.csv
 #   RATES="10000 20000 30000" bench/curve.sh
 #   PROFILE=throughput bench/curve.sh
+#   MODE=echo bench/curve.sh             # no upstream hop; promotes curve-echo.*
+#   BODY_SIZE=16384 bench/curve.sh       # sizes both ends together
+#   LABEL=experiment bench/curve.sh      # writes to bench/results/, promotes nothing
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 RESULTS="$HERE/results"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-LABEL="${LABEL:-curve}"
+# proxy: client -> proxy -> backend, the whole path.
+# echo:  client -> proxy, answered by the daemon's built-in responder with no
+#        upstream hop at all. The difference between the two is the cost of the
+#        upstream leg, and it is the only way to attribute a latency to one side
+#        or the other. Until this existed, the "engine and client leg alone do
+#        40k at p99 0.216 ms" claim came from a hand-run daemon and no committed
+#        script could reproduce it.
+MODE="${MODE:-proxy}"
+LABEL="${LABEL:-$([ "$MODE" = echo ] && echo curve-echo || echo curve)}"
 CSV="$RESULTS/curve-$LABEL-$STAMP.csv"
 
 BACKEND_ADDR="${BACKEND_ADDR:-127.0.0.1:8080}"
@@ -44,19 +55,30 @@ CONNECTIONS="${CONNECTIONS:-50}"
 STEP_SECONDS="${STEP_SECONDS:-15}"
 WARMUP="${WARMUP:-3}"
 PROFILE="${PROFILE:-both}"
+# Both ends are sized from one variable on purpose. `backend` and `h2proxyd`
+# default to 1024 independently, and an echo-vs-proxy comparison only means
+# anything if both legs return the same number of octets.
+BODY_SIZE="${BODY_SIZE:-1024}"
 
 mkdir -p "$RESULTS"
 
 echo "building release binaries (a debug measurement is not a measurement)" >&2
 (cd "$ROOT" && cargo build --release -p backend -p h2proxyd -p loadgen)
 
-"$ROOT/target/release/backend" &
-backend_pid=$!
-H2PROXYD_UPSTREAMS="$BACKEND_ADDR" H2PROXYD_LISTEN="$PROXY_ADDR" \
-  H2PROXYD_METRICS="$METRICS" \
+if [ "$MODE" = "proxy" ]; then
+  BACKEND_BODY_SIZE="$BODY_SIZE" "$ROOT/target/release/backend" &
+  backend_pid=$!
+  upstreams="$BACKEND_ADDR"
+else
+  backend_pid=""
+  # No upstreams configured: h2proxyd answers from its built-in responder.
+  upstreams=""
+fi
+H2PROXYD_UPSTREAMS="$upstreams" H2PROXYD_LISTEN="$PROXY_ADDR" \
+  H2PROXYD_METRICS="$METRICS" H2PROXYD_BODY_SIZE="$BODY_SIZE" \
   "$ROOT/target/release/h2proxyd" >"$RESULTS/curve-$LABEL-$STAMP-proxy.log" 2>&1 &
 proxy_pid=$!
-trap 'kill $backend_pid $proxy_pid 2>/dev/null || true' EXIT
+trap 'kill ${backend_pid:-} $proxy_pid 2>/dev/null || true' EXIT
 
 # Wait for the listener rather than sleeping a guess: a step that starts before
 # the proxy is up measures the connect retry.
@@ -127,8 +149,14 @@ step() {
 
 if [ "$PROFILE" = "throughput" ] || [ "$PROFILE" = "both" ]; then
   # Small responses over a moderate connection count: the request-rate question.
+  #
+  # The profile name doubles as the series name. bench/plot-curve.py writes the
+  # first known profile to the primary SVG and any other to curve-<profile>.svg,
+  # so an echo run produces its own chart with no change to the plotter — and a
+  # new *column* would have broken its fixed-column reader.
+  profile_name=$([ "$MODE" = echo ] && echo echo || echo throughput)
   for rate in $RATES; do
-    step throughput "$rate" "$CONNECTIONS"
+    step "$profile_name" "$rate" "$CONNECTIONS"
   done
 fi
 
@@ -174,7 +202,10 @@ concurrency_step() {
   echo "  -> ${achieved:-NA} req/s, p99 ${p99:-NA} ms, proxy saw ${peak:-NA} streams live" >&2
 }
 
-if [ "$PROFILE" = "concurrency" ] || [ "$PROFILE" = "both" ]; then
+# Skipped in echo mode: the concurrency profile asks how the pool and the
+# coalescing behave with five figures of streams open, and in echo mode there is
+# no pool.
+if [ "$MODE" = "proxy" ] && { [ "$PROFILE" = "concurrency" ] || [ "$PROFILE" = "both" ]; }; then
   # The concurrency question cannot be asked with the open loop above.
   #
   # In an open loop, live streams = rate x latency (Little's law), so at 25,000
@@ -192,11 +223,11 @@ if [ "$PROFILE" = "concurrency" ] || [ "$PROFILE" = "both" ]; then
   done
 fi
 
-if [ "$LABEL" = "curve" ]; then
-  cp "$CSV" "$HERE/curve.csv"
-  "$ROOT/bench/plot-curve.py" "$HERE/curve.csv" "$HERE/curve.svg"
+if [ "$LABEL" = "curve" ] || [ "$LABEL" = "curve-echo" ]; then
+  cp "$CSV" "$HERE/$LABEL.csv"
+  "$ROOT/bench/plot-curve.py" "$HERE/$LABEL.csv" "$HERE/$LABEL.svg"
   echo >&2
-  echo "promoted to bench/curve.csv and bench/curve.svg" >&2
+  echo "promoted to bench/$LABEL.csv and bench/$LABEL.svg" >&2
 fi
 
 echo >&2

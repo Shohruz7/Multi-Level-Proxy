@@ -117,6 +117,19 @@ bench-hot:
 curve:
     bench/curve.sh
 
+# The same ladder with no upstream hop: the daemon answers from its built-in
+# responder, so the difference from `just curve` is the cost of the upstream
+# leg. Promotes bench/curve-echo.csv and bench/curve-echo.svg.
+curve-echo:
+    MODE=echo bench/curve.sh
+
+# Two methodologies against one proxy: what a closed-loop generator reports, and
+# what was actually happening at the same delivered rate. This is the experiment
+# behind the claim that h2load cannot measure a tail. Promotes
+# bench/methodology.csv and bench/methodology.svg; PROMOTE=0 leaves them alone.
+methodology:
+    bench/methodology.sh
+
 # Sweep the flow-control windows and concurrency (design doc §10.5). Reports
 # throughput and the bridge's peak occupancy together, because the connection
 # window is the bounded-memory bound and buying throughput with it is a trade.

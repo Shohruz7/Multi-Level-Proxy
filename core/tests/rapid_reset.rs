@@ -11,8 +11,12 @@
 //! that kills the proxy also stops the attack. (2) is what makes the blast
 //! radius one connection.
 //!
-//! The false-positive side of the same line lives in `legitimate.rs`, and is the
-//! harder half: a guard that trips on a browser is worse than no guard.
+//! The false-positive side of the same line is the harder half — a guard that
+//! trips on a browser is worse than no guard — and it is not tested here. It is
+//! enforced by `bench/calibrate.sh`, which runs 100,000 ordinary requests with
+//! the guard in observe-only mode and fails the build if any signal came within
+//! 10x of tripping, and by the conformance job, which asserts the guard
+//! terminated nothing across all 146 h2spec cases.
 
 mod support;
 

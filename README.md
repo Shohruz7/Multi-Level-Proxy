@@ -156,8 +156,12 @@ surface since.
 - **Goal** — a correct HTTP/2 intermediary that negotiates `h2` over TLS via
   ALPN, multiplexes streams, honors flow control in both directions, and keeps
   **bounded memory** under any speed mismatch between client and upstream.
-- **Goal** — 10,000+ concurrent streams and ~85k req/s on small responses with
-  sub-3 ms p99 (two figures from two test profiles; see the design doc §10).
+- **Goal** — 10,000+ concurrent streams and a tail that survives an honest
+  open-loop measurement (two figures from two test profiles; see the design doc
+  §10). The concurrency goal was met at 17,872. The original throughput target
+  of ~85k req/s was set in week 2 from a closed-loop h2load run and is not a
+  like-for-like comparison with anything measured since; the numbers that
+  replaced it are below.
 - **Goal** — reproducible infrastructure as code (AWS CDK) and a load-test
   harness that reports tail latency honestly. The harness is
   [`loadgen`](loadgen/), written for this project because `h2load` is a closed
@@ -275,21 +279,33 @@ laptop where the load generator competes with the proxy for CPU**.
 
 | | Number |
 |---|---|
-| Sustained throughput, closed loop | **≥210,000 req/s** (still climbing when the run stopped) |
-| Failed requests, every step measured | **0** |
-| Concurrent streams held open, measured at the proxy | **17,872** |
-| Engine + client leg alone (echo mode, open loop) | 40,000 req/s at **p99 0.216 ms** |
+| Concurrent streams held open, measured at the proxy's own gauge | **17,872** at 53,600 req/s, **0 failed** |
+| Peak throughput, closed loop through a backend | **76,919 req/s** (10 connections × 100 streams) |
+| …at the standard 50-connection shape | 52,967 req/s |
+| Upstream connections at 20,000 req/s, after the pool fix | **1**, at p99 0.36 ms |
 
-**A correction worth reading before any of these.** An earlier version of this
-section reported a "knee at 25,000 req/s" and blamed the proxy's admission limit.
-That was the *load generator's* limit: held at the same concurrency, the closed
-loop drove the same proxy to 169,000 req/s. The generator has since been fixed —
-its open loop spawned a task per request and now uses a worker pool — but a cliff
-between 25k and 30k *through a backend* is still unexplained, and it is not the
-generator, not CPU, not the pool cap, and not the client leg. Until it is
-understood, the closed-loop figure is the honest one.
-[Documentation/RESULTS.md](Documentation/RESULTS.md) carries the full correction
-and the discriminating experiment.
+**Two corrections worth reading before any of these**, and they are the reason
+the table above is shorter than it used to be.
+
+An earlier version reported a "knee at 25,000 req/s" and blamed the proxy's
+admission limit. That was the *load generator's* limit. The generator was fixed;
+the claim was retracted.
+
+The figure that replaced it — "≥210,000 req/s" — was also wrong. It was quoted,
+never committed, and does not reproduce: the real peak is 76,919 req/s. The
+cliff it was covering for turned out to be ordinary saturation with no admission
+control, found by eliminating six hypotheses, including the appealing ones. The
+proxy now bounds its upstream queue and refuses past it with a 503 rather than
+absorbing overload as unbounded latency, and the pool opens connections when
+they are backing up rather than when they reach a protocol limit that says
+nothing about throughput.
+
+The rule that produced both retractions, now applied deliberately: **every
+number in this README is traceable to a committed file**, and nothing about the
+saturation regime is claimed at all, because the machine these run on is a
+laptop with an editor, a VPN and Docker on it.
+[Documentation/RESULTS.md](Documentation/RESULTS.md) carries both corrections
+and the discriminating experiments.
 
 ### Resilience, measured
 
@@ -298,9 +314,9 @@ and the discriminating experiment.
 | Backend killed mid-load, 200k requests | **0 5xx**, 2 ejections, 247 retries rescued |
 | Backend that accepts and then answers nothing | detected and ejected in ~2× `ping_idle`; the request gets an answer instead of hanging |
 | 5-minute soak, a backend killed and restarted every 30 s | 13.0M requests, **0 5xx**, 1,177 retries, 16 ejections, 126 probes / 0 probe failures; RSS plateaued and every in-flight gauge settled to **0** |
-| SIGTERM mid-load, 75k requests | **0 5xx**; a 20 MB response completed in full across it |
+| SIGTERM mid-load, 75k requests (manual run, see ADR 0018 — not `just attack`) | **0 5xx**; a 20 MB response completed in full across it |
 | Rapid Reset flood beside ordinary load | attacker GOAWAYed; bystander p99 **11.65 ms → 8.11 ms** (unharmed) |
-| Abuse guard cost per frame | **0.46%** of frame dispatch (272.1 ns → 273.4 ns) |
+| Abuse guard cost per frame | **below the noise floor** of frame dispatch — 5.6 / 5.4 / 0.59 ns per call, confidence intervals overlapping |
 | Threshold headroom vs. legitimate traffic | 12.5x–20x, measured |
 | Throughput, before vs. after all of week 7 | 82,985 → 86,711 req/s — **no measurable cost** |
 | Flow-control windows, swept | defaults kept: 96% of the best bulk throughput at ~28% of the memory |

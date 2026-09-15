@@ -102,7 +102,8 @@ jobs:
       #
       # It self-reports "2.0.0 (Unknown)": the real version string is injected by
       # ldflags at release time and a source build has neither. The 146-test
-      # count below is what actually confirms the pinned suite.
+      # count asserted in both steps below is what actually confirms the pinned
+      # suite.
       - name: Install h2spec
         run: |
           git clone --depth 1 --branch v2.6.0 https://github.com/summerwind/h2spec.git "$RUNNER_TEMP/h2spec"
@@ -123,6 +124,9 @@ jobs:
       # threshold and re-running `just calibrate` (design doc §6).
       - name: h2spec (engine only)
         run: |
+          # Without this, `h2spec | tee` reports tee's exit status and a failing
+          # suite passes the job silently.
+          set -o pipefail
           ./target/release/h2proxyd &
           proxy=$!
           trap 'kill $proxy 2>/dev/null || true' EXIT
@@ -130,7 +134,13 @@ jobs:
             curl -sk --http2 -o /dev/null https://127.0.0.1:8443/ && break
             sleep 0.2
           done
-          h2spec -t -k -h 127.0.0.1 -p 8443
+          h2spec -t -k -h 127.0.0.1 -p 8443 | tee h2spec.txt
+          # The count, asserted rather than described. h2spec exits 0 on a
+          # suite that ran fewer cases than it should — a bad pin, a build that
+          # silently dropped a section — and "146/146" is quoted in the README
+          # and RESULTS.md. A claim that appears in the docs and nowhere in CI
+          # is a claim nobody is checking.
+          grep -qE '^146 tests, 146 passed, 0 skipped, 0 failed' h2spec.txt
           # Scraped to a file and checked for a series known to exist first.
           # Summing a missing series gives 0, which is also what "nothing
           # tripped" looks like — so without this, a dead exporter or a renamed
@@ -147,6 +157,7 @@ jobs:
       # back.
       - name: h2spec (through the proxy)
         run: |
+          set -o pipefail
           ./target/release/backend &
           backend=$!
           H2PROXYD_UPSTREAMS=127.0.0.1:8080 ./target/release/h2proxyd &
@@ -156,7 +167,13 @@ jobs:
             curl -sk --http2 -o /dev/null https://127.0.0.1:8443/ && break
             sleep 0.2
           done
-          h2spec -t -k -h 127.0.0.1 -p 8443
+          h2spec -t -k -h 127.0.0.1 -p 8443 | tee h2spec.txt
+          # The count, asserted rather than described. h2spec exits 0 on a
+          # suite that ran fewer cases than it should — a bad pin, a build that
+          # silently dropped a section — and "146/146" is quoted in the README
+          # and RESULTS.md. A claim that appears in the docs and nowhere in CI
+          # is a claim nobody is checking.
+          grep -qE '^146 tests, 146 passed, 0 skipped, 0 failed' h2spec.txt
 
   # A build, not a run. Fuzzing finds bugs on a timescale CI does not have, but a
   # target that stops *compiling* is a different failure: it happens silently the

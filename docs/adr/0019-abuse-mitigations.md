@@ -107,6 +107,16 @@ by that — bursts are what `burst` is for; this measures the sustained rate the
 - **Cost, measured** (`cargo bench --bench hot_path`): 5.6 ns for a reset check,
   5.4 ns for a control frame, 0.59 ns for the per-DATA check. Against frame
   dispatch the guard adds **0.46%** (272.1 ns → 273.4 ns).
+
+  **Amended 2026-09-15.** That percentage does not survive a look at the
+  retained criterion data, which has `decode_only` at 273.70 ns and
+  `decode_and_guard` at 272.56 ns — the *guarded* arm marginally faster, with
+  confidence intervals that overlap ([271.9, 276.81] against [271.86, 273.44]).
+  The difference is inside the noise of the measurement, and quoting a signed
+  percentage from it implies a precision that is not there. The defensible claim
+  is the per-call cost, which is measured cleanly and is the stronger statement
+  anyway: **5.6 ns, 5.4 ns and 0.59 ns** for the reset, control-frame and data
+  paths, against a frame dispatch of ~273 ns.
 - **The false-positive suite is the real gate.** h2spec passes 146/146 in both
   modes with the guard enforcing, and 200,000 requests through the proxy trip
   nothing. A trip on legitimate traffic is never fixed by exempting the workload.
