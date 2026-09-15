@@ -62,6 +62,8 @@ pub enum PoolError {
     Unreachable(Backend),
     #[error("no backend is configured")]
     NoBackend,
+    #[error("backend {0:?} is at capacity")]
+    AtCapacity(Backend),
 }
 
 /// One pooled upstream connection, as the pool sees it.
@@ -86,6 +88,14 @@ pub struct UpstreamRecord {
     /// than an `Instant` so the hot path stays lock-free and the record stays
     /// `Sync` without a mutex.
     last_used_ms: AtomicU64,
+    /// How many requests are waiting for a stream slot on this connection,
+    /// published by the connection task.
+    ///
+    /// This is the pool's only view of whether a full connection is *coping*.
+    /// `live` says it is at the backend's stream limit, which is a fact about
+    /// the protocol; this says whether the queue behind that limit is draining,
+    /// which is the fact about throughput the pool actually needs.
+    queued: AtomicUsize,
 }
 
 impl UpstreamRecord {
@@ -97,6 +107,7 @@ impl UpstreamRecord {
             max_concurrent: AtomicUsize::new(ASSUMED_MAX_CONCURRENT),
             closed: AtomicBool::new(false),
             last_used_ms: AtomicU64::new(now_ms),
+            queued: AtomicUsize::new(0),
         }
     }
 
@@ -119,6 +130,42 @@ impl UpstreamRecord {
 
     fn has_room(&self) -> bool {
         self.live.load(Ordering::Relaxed) < self.max_concurrent.load(Ordering::Relaxed)
+    }
+
+    /// Publish this connection's wait-for-a-slot queue depth. Called by the
+    /// connection task whenever the queue changes.
+    pub fn set_queued(&self, depth: usize) {
+        self.queued.store(depth, Ordering::Relaxed);
+    }
+
+    fn queued(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    /// Whether this connection's queue has grown past the point where another
+    /// connection would help.
+    ///
+    /// Deliberately not "the queue is non-empty". A connection at the backend's
+    /// stream limit *always* has a queue for as long as it is busy — that is
+    /// what the limit means — and treating a transient one as distress is the
+    /// mistake this predicate exists to avoid.
+    fn backed_up(&self, threshold: usize) -> bool {
+        self.queued() >= threshold
+    }
+
+    /// Whether this connection is already holding every request it agreed to
+    /// queue, and would shed the next one.
+    ///
+    /// Asked of the published queue depth rather than computed from `live` and
+    /// `max_concurrent`. Those two are the pool's *belief* about the
+    /// connection, and the belief starts as [`ASSUMED_MAX_CONCURRENT`] — a
+    /// guess that stands until the backend's SETTINGS arrives and may never be
+    /// corrected, because a backend is entitled to advertise no limit at all.
+    /// Refusing on the guess means refusing requests a connection would have
+    /// been happy to take. The queue depth is not a belief: it is what the
+    /// connection task last reported about itself.
+    fn saturated(&self, max_pending: usize) -> bool {
+        self.queued() >= max_pending
     }
 
     /// Claim a slot on this connection for one request.
@@ -253,6 +300,15 @@ impl Pool {
         self
     }
 
+    /// The queue depth at which a connection counts as failing to cope.
+    ///
+    /// Half the shed bound: deep enough that an ordinary burst does not trigger
+    /// a new socket, shallow enough that a connection genuinely falling behind
+    /// gets help well before it starts refusing requests.
+    fn queue_threshold(&self) -> usize {
+        (self.tuning.max_pending / 2).max(1)
+    }
+
     /// Millis since this pool was built.
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
@@ -284,15 +340,40 @@ impl Pool {
             return Ok(record.lease(now_ms));
         }
 
-        if pool.conns.len() < self.max_conns_per_backend {
+        // Every warm connection is at the backend's stream limit. That is *not*
+        // by itself a reason to open another, and treating it as one is what
+        // made this policy expensive.
+        //
+        // The limit is a protocol fact, not a throughput signal: a connection
+        // holding its 200 streams and retiring them promptly is keeping up, and
+        // giving it a sibling does not make it finish sooner. What it does is
+        // admit another 200 streams to the same backend, and by Little's law
+        // concurrency that buys no throughput is bought entirely with latency.
+        // Measured at 30,000 req/s on the dev box, raising the ceiling from 1 to
+        // 8 moved p99 from 21 ms to 297 ms while *lowering* delivered rate —
+        // worse on both axes, for more sockets.
+        //
+        // So the question asked here is whether the existing connections are
+        // failing to cope, which is what a queue that will not drain looks like.
+        let threshold = self.queue_threshold();
+        let coping = pool
+            .conns
+            .iter()
+            .any(|record| !record.backed_up(threshold));
+        // The first connection is not a growth decision — there is nothing to
+        // reuse and nothing to have an opinion about yet.
+        let first = pool.conns.is_empty();
+        if pool.conns.len() < self.max_conns_per_backend && (first || !coping) {
             let record = self.open(*backend, now_ms);
             pool.conns.push(Arc::clone(&record));
             return Ok(record.lease(now_ms));
         }
 
-        // At the connection ceiling with every connection full: lease from the
-        // least-loaded one anyway and let it **queue** the request until a
-        // stream frees up.
+        // Either the connections are coping, or we are at the ceiling. Lease
+        // from the one with the least work waiting and let it **queue** the
+        // request until a stream frees up — bounded by `Tuning::max_pending`,
+        // past which the connection sheds rather than promising what it cannot
+        // deliver.
         //
         // Refusing here instead is what the first version did, and it turned a
         // busy moment into a 503 — including at start-up, before any backend
@@ -300,11 +381,35 @@ impl Pool {
         // enforced. A saturated pool should cost latency, not errors: the
         // backend's real limit is enforced by the connection task, which is the
         // only thing that knows it.
-        pool.conns
+        // Shortest queue first, with load as the tie-break: among connections
+        // that are all at the stream limit, the one with least waiting is the
+        // one that will start this request soonest.
+        let Some(record) = pool
+            .conns
             .iter()
-            .min_by_key(|record| record.live.load(Ordering::Relaxed))
-            .map(|record| record.lease(now_ms))
-            .ok_or(PoolError::Unreachable(*backend))
+            .min_by_key(|record| (record.queued(), record.live.load(Ordering::Relaxed)))
+        else {
+            return Err(PoolError::Unreachable(*backend));
+        };
+
+        // Even the least-loaded connection is holding everything it agreed to
+        // hold. Refuse here, in the caller's task, rather than accepting the
+        // request and letting the connection task discover the same thing.
+        //
+        // Where the refusal happens turns out to matter as much as that it
+        // happens. Shedding inside the connection task puts the cost of
+        // overload on the one task the overload is already starving: every
+        // refusal is a message it must receive, match and answer, competing
+        // with the requests it is trying to finish. Measured at 40,000 req/s
+        // that regime delivered 6,068 req/s, because the connection spent
+        // itself saying no. Refusing at checkout spreads the same work across
+        // the client connections that caused it, and leaves the upstream task
+        // doing nothing but upstream work.
+        if record.saturated(self.tuning.max_pending) {
+            self.stats.shed();
+            return Err(PoolError::AtCapacity(*backend));
+        }
+        Ok(record.lease(now_ms))
     }
 
     /// Each backend with its current load — the input the load balancer works
@@ -480,12 +585,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_connection_opens_a_second_one() {
+    async fn a_full_connection_that_is_keeping_up_does_not_get_a_sibling() {
+        // Being at `MAX_CONCURRENT_STREAMS` is a fact about the protocol, not a
+        // complaint. A connection retiring streams as fast as it takes them is
+        // working perfectly, and giving it a sibling does not make it finish
+        // sooner — it admits another connection's worth of streams to the same
+        // backend, which by Little's law is latency bought with no throughput.
         let stats = Arc::new(ProxyStats::default());
         let pool = Pool::new(Arc::clone(&stats), 4);
         let first = pool.checkout(&backend(2)).expect("a lease");
         first.record.set_max_concurrent(1);
+        first.record.set_queued(0);
+
         let _second = pool.checkout(&backend(2)).expect("a second lease");
+        assert_eq!(
+            pool.connection_count(),
+            1,
+            "a full but draining connection must absorb the request, not spawn a socket",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backed_up_connection_gets_a_sibling() {
+        // The case the ceiling exists for: the queue will not drain, so the
+        // request is going to wait either way. Another connection is the only
+        // thing that can raise the number of streams this backend will accept.
+        let stats = Arc::new(ProxyStats::default());
+        let pool = Pool::new(Arc::clone(&stats), 4);
+        let first = pool.checkout(&backend(3)).expect("a lease");
+        first.record.set_max_concurrent(1);
+        first.record.set_queued(usize::from(u8::MAX));
+
+        let _second = pool.checkout(&backend(3)).expect("a second lease");
         assert_eq!(pool.connection_count(), 2);
     }
 

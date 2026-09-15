@@ -46,6 +46,10 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::time::Duration;
 
+/// How many client messages one pass of the connection loop may absorb
+/// before it goes back to the socket. See the drain in `tick`.
+const INBOX_BATCH: usize = 1024;
+
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
@@ -662,8 +666,25 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
         }
         if let Some(msg) = msg {
             self.handle_message(msg)?;
-            while let Ok(msg) = self.inbox.try_recv() {
+            // Bounded, because this loop performs no I/O. Draining the whole
+            // inbox here means the socket is neither read nor written for as
+            // long as the drain lasts, and under overload the inbox refills as
+            // fast as it empties — the connection stops answering the backend
+            // in order to keep accepting work it cannot do. Measured, that
+            // regime delivered 2,728 req/s out of 40,000 offered.
+            //
+            // Two bounds because two things run away. The byte bound is the
+            // real one: every request in the batch becomes HEADERS in `out`,
+            // and `MAX_WRITE_QUEUE` is already the answer to how much may wait
+            // there — the same limit `pump_outbound` has always applied and the
+            // request path never had. The count is the backstop for messages
+            // that add no octets at all, which would otherwise spin here
+            // without ever tripping the byte bound.
+            let mut taken = 1usize;
+            while taken < INBOX_BATCH && self.out.len() < MAX_WRITE_QUEUE {
+                let Ok(msg) = self.inbox.try_recv() else { break };
                 self.handle_message(msg)?;
+                taken += 1;
             }
         }
         Ok(keep_going)
@@ -787,6 +808,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
                     // if it is waiting, and remember the id in case the request
                     // itself is still in the inbox behind this message.
                     self.pending.retain(|p| p.request != id);
+                    self.sync_queued();
                     self.cancelled.insert(id);
                     return Ok(());
                 };
@@ -856,6 +878,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
                 body: VecDeque::new(),
                 trailers: None,
             });
+            self.sync_queued();
             return Ok(());
         }
         let id = StreamId::new(self.next_stream_id);
@@ -905,11 +928,25 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
     /// Called wherever a stream retires, because that is the only thing that
     /// frees a slot. A queue with nothing draining it is just a slower way to
     /// hang.
+    /// Publish the queue depth to the pool's record.
+    ///
+    /// The pool decides whether to open another connection to this backend from
+    /// this number, so a stale one is not a cosmetic problem: it is the pool
+    /// either opening sockets nobody needed or withholding one from a
+    /// connection that is drowning.
+    fn sync_queued(&self) {
+        if let Some(record) = &self.record {
+            record.set_queued(self.pending.len());
+        }
+    }
+
     fn drain_pending(&mut self) -> Result<(), ConnectionError> {
         while self.streams.can_open_local() {
             let Some(pending) = self.pending.pop_front() else {
+                self.sync_queued();
                 return Ok(());
             };
+            self.sync_queued();
             let Pending {
                 request,
                 client_id,
