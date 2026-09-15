@@ -375,6 +375,8 @@ pub struct UpstreamConnection<IO> {
     cancelled: std::collections::HashSet<RequestId>,
     /// Requests waiting for a stream slot, oldest first.
     pending: VecDeque<Pending>,
+    /// The bound on `pending`. Past it the connection sheds rather than queues.
+    max_pending: usize,
     /// The next id to open. Odd and strictly increasing, because we are the
     /// client here (§5.1.1).
     next_stream_id: u32,
@@ -461,6 +463,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
             requests: HashMap::new(),
             cancelled: std::collections::HashSet::new(),
             pending: VecDeque::new(),
+            max_pending: tuning.max_pending,
             next_stream_id: 1,
             peer_draining: None,
             probe: Probe::disabled(),
@@ -830,8 +833,20 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
             });
             return Ok(());
         }
-        // No slot at the backend's limit: wait for one rather than refuse.
+        // No slot at the backend's limit: wait for one rather than refuse —
+        // but only up to a bound, because a queue with no bound does not
+        // protect the client, it just relocates the failure into latency.
         if !self.streams.can_open_local() {
+            if self.pending.len() >= self.max_pending {
+                debug!(
+                    stream = client_id.get(),
+                    pending = self.pending.len(),
+                    "upstream queue at its bound; shedding"
+                );
+                self.stats.shed();
+                let _ = events.send(ServiceEvent::Shed { id: client_id });
+                return Ok(());
+            }
             self.pending.push_back(Pending {
                 request,
                 client_id,

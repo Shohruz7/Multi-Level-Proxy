@@ -72,6 +72,9 @@ pub struct ProxyStats {
     client_streams: AtomicUsize,
     /// Second attempts made after a retryable failure.
     retries: AtomicU64,
+    /// Requests refused because an upstream's wait-for-a-slot queue was full.
+    /// The number that says overload was *handled* rather than absorbed.
+    shed: AtomicU64,
     /// Liveness PINGs sent to backends that had gone quiet.
     probes: AtomicU64,
     /// Probes that went unanswered, each one a connection closed and a failure
@@ -223,6 +226,14 @@ impl ProxyStats {
 
     pub fn retries(&self) -> u64 {
         self.retries.load(Ordering::Relaxed)
+    }
+
+    pub fn shed(&self) {
+        self.shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn shed_total(&self) -> u64 {
+        self.shed.load(Ordering::Relaxed)
     }
 
     /// Counted as each probe goes out, not rolled up when the connection ends.
@@ -835,6 +846,16 @@ impl Service for Proxy {
                 self.shared.health.failure(&backend, Instant::now());
                 if self.retry(*id) {
                     return None;
+                }
+                Some(event)
+            }
+            ServiceEvent::Shed { id } => {
+                // No backend was asked, so there is nothing to record against
+                // one — the opposite of `Gone` directly above. Retrying is
+                // pointless for the same reason: the queue that refused this is
+                // the queue every retry would land in.
+                if self.routes.remove(id).is_some() {
+                    self.shared.stats.close_client_stream();
                 }
                 Some(event)
             }

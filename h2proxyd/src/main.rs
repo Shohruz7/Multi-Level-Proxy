@@ -435,6 +435,7 @@ fn spawn_stats_sampler(shared: &Arc<Shared>) {
                 .absolute(stats.connect_failures());
             metrics::counter!("h2proxy_upstream_requests_total").absolute(stats.requests());
             metrics::counter!("h2proxy_upstream_retries_total").absolute(stats.retries());
+            metrics::counter!("h2proxy_upstream_shed_total").absolute(stats.shed_total());
             metrics::counter!("h2proxy_backend_ejections_total")
                 .absolute(shared.health.ejections());
             metrics::counter!("h2proxy_upstream_probes_total").absolute(stats.probes());
@@ -565,12 +566,14 @@ fn tuning() -> Tuning {
             d.max_concurrent_streams,
         )
         .max(1),
+        max_pending: env_num("H2PROXYD_MAX_PENDING", d.max_pending as i64).max(0) as usize,
     };
     if tuning != d {
         info!(
             connection_window = tuning.connection_window,
             stream_window = tuning.stream_window,
             max_concurrent_streams = tuning.max_concurrent_streams,
+            max_pending = tuning.max_pending,
             "flow control tuned away from the defaults",
         );
     }
@@ -698,6 +701,11 @@ fn init_metrics() {
         "Second attempts made after a retryable upstream failure"
     );
     metrics::describe_counter!(
+        "h2proxy_upstream_shed_total",
+        "Requests refused with 503 because an upstream's queue was at its bound; \
+         the number that says overload was handled rather than absorbed as latency"
+    );
+    metrics::describe_counter!(
         "h2proxy_backend_ejections_total",
         "Times a backend was removed from rotation by health checking"
     );
@@ -780,6 +788,7 @@ fn init_metrics() {
     metrics::gauge!("h2proxy_client_streams_active").set(0.0);
     metrics::counter!("h2proxy_upstream_requests_total").absolute(0);
     metrics::counter!("h2proxy_upstream_retries_total").absolute(0);
+    metrics::counter!("h2proxy_upstream_shed_total").absolute(0);
     metrics::counter!("h2proxy_backend_ejections_total").absolute(0);
     metrics::gauge!("h2proxy_backends_healthy").set(0.0);
     metrics::counter!("h2proxy_upstream_probes_total").absolute(0);

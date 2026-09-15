@@ -363,6 +363,26 @@ pub enum ServiceEvent {
     /// The connection layer turns it into a 502 (or a reset, if a `:status` has
     /// already gone out), so what the client sees is unchanged.
     Gone { id: StreamId },
+    /// Refused for want of capacity: the upstream's queue was already at its
+    /// bound, so this request was never put on it.
+    ///
+    /// Distinct from [`ServiceEvent::Gone`] for the same reason `Gone` is
+    /// distinct from a 502 `Head` — the cause has to survive the trip, or the
+    /// layers above draw the wrong conclusion. `Gone` proves a backend failed
+    /// and *must* count against its health; this proves only that we were busy,
+    /// and counting it as a backend failure would eject a perfectly healthy
+    /// backend for the crime of being popular.
+    ///
+    /// It is also not a retry candidate. A retry answers "that path was
+    /// broken, try another"; shedding says "there is no capacity anywhere right
+    /// now", and retrying it merely spends work to arrive at the same answer
+    /// one queue later.
+    ///
+    /// The connection layer turns it into a **503**, per the rule the rest of
+    /// the proxy follows: 502 means we tried a backend and it let us down, 503
+    /// means we had no backend to try — and a queue at its bound is exactly
+    /// that, said about capacity instead of about reachability.
+    Shed { id: StreamId },
 }
 
 /// The channel a responder answers on.

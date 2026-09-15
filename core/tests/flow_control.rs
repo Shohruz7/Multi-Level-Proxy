@@ -257,6 +257,7 @@ async fn tuning_the_connection_window_moves_the_bootstrap_with_it() {
         connection_window: TUNED,
         stream_window: 512 * 1024,
         max_concurrent_streams: 32,
+        ..Tuning::default()
     };
 
     let (mut peer, _tx) = start_tuned(tuning);
@@ -283,6 +284,7 @@ async fn tuning_reaches_the_settings_the_peer_actually_receives() {
         connection_window: 2 * 1024 * 1024,
         stream_window: 128 * 1024,
         max_concurrent_streams: 17,
+        ..Tuning::default()
     };
     let (client, server) = tokio::io::duplex(1 << 20);
     let (_tx, rx) = broadcast::channel::<()>(1);

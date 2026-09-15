@@ -193,6 +193,25 @@ impl Drain {
 /// resource one: unlimited concurrency is what makes Rapid Reset cheap.
 pub const MAX_CONCURRENT_STREAMS: u32 = 256;
 
+/// How many requests one upstream connection may hold *waiting for a stream
+/// slot* before it starts refusing them.
+///
+/// The queue exists because a backend's `MAX_CONCURRENT_STREAMS` is a hard
+/// ceiling and a burst above it is better delayed than failed. Leaving it
+/// unbounded is what turns a busy moment into an unbounded one: with no bound,
+/// offered load above capacity does not become errors, it becomes latency, and
+/// it keeps becoming latency for as long as the overload lasts. Measured on the
+/// dev box, 30,000 req/s into a proxy whose comfortable rate was lower parked
+/// 6,400 requests inside it and answered in 274 ms while using 1.1 of 10 cores
+/// — not busy, just queued.
+///
+/// 128 is deliberately smaller than the 200-odd streams a backend typically
+/// admits: the queue is meant to absorb a burst, not to store a backlog. What
+/// it buys is a *stated* worst case — a request either enters service within
+/// roughly `(live + max_pending) / throughput` or is refused — instead of a
+/// latency that is whatever the overload decides.
+pub const MAX_PENDING: usize = 128;
+
 /// The sizes a deployment may tune, in one place.
 ///
 /// These three were compile-time constants through week 7, reasoned from the
@@ -219,6 +238,11 @@ pub struct Tuning {
     pub stream_window: i32,
     /// `SETTINGS_MAX_CONCURRENT_STREAMS`, advertised to clients.
     pub max_concurrent_streams: u32,
+    /// How deep an upstream connection's wait-for-a-slot queue may get before it
+    /// sheds ([`MAX_PENDING`]). Grouped here because it is not independent of
+    /// the others: the queue is only ever entered once the backend's concurrency
+    /// limit is reached, so what this bounds is the overshoot past that limit.
+    pub max_pending: usize,
 }
 
 impl Default for Tuning {
@@ -227,6 +251,7 @@ impl Default for Tuning {
             connection_window: CONNECTION_WINDOW,
             stream_window: STREAM_INITIAL_WINDOW,
             max_concurrent_streams: MAX_CONCURRENT_STREAMS,
+            max_pending: MAX_PENDING,
         }
     }
 }
@@ -1228,6 +1253,23 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
                     self.write_rst_stream(id, ErrorCode::InternalError)?;
                 } else {
                     self.reject_stream(id, 502)?;
+                }
+            }
+            ServiceEvent::Shed { id } => {
+                // Refused for capacity, and refused *before* anything went to a
+                // backend — so unlike `Gone` above there is no half-sent
+                // response to worry about, and 503 is the honest code: we had
+                // nothing to try this with, and trying again later may well
+                // work. The `is_some_and` guard is kept anyway because the
+                // alternative to checking is un-sending a `:status`.
+                let started = self
+                    .streams
+                    .get_mut(id)
+                    .is_some_and(|stream| stream.response_started);
+                if started {
+                    self.write_rst_stream(id, ErrorCode::InternalError)?;
+                } else {
+                    self.reject_stream(id, 503)?;
                 }
             }
             ServiceEvent::Reset { id, code } => {
