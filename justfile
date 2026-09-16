@@ -136,6 +136,14 @@ methodology:
 tune:
     bench/tune.sh
 
+# Both arms from one binary (H2PROXYD_POOL_GROWTH), interleaved, with a
+# pre-registered decision rule: if the two arms' observed ranges overlap the
+# script states no ratio at all. Re-measures the two numbers that rest on a
+# single run each - the p99 at 20k, and the pool-growth pair quoted in
+# core/src/pool.rs. Promotes bench/confirm.csv.
+confirm:
+    bench/confirm.sh
+
 # The ADR 0010 allocator A/B: system vs jemalloc, interleaved, inside the musl
 # container — the only environment where the claim means anything. Needs Docker.
 allocator:
