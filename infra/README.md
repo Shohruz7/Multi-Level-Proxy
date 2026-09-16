@@ -158,3 +158,23 @@ lib/h2proxy-stack.ts  the topology
 lib/user-data.ts      host bootstrap: sysctls, fd limits, systemd units
 test/stack.test.ts    the template assertions above
 ```
+
+## If `tsc` hangs locally
+
+On at least one dev machine `npm test` (and any `tsc` run over this project)
+**hangs at 0% CPU**, with the main thread parked in
+`node::Realm::ExecuteBootstrapper`. It is an environment fault, not a code one:
+CI on node 22 compiles the same tree fine, and `tsc --version` and a one-file
+compile both work. Reproduced under node v26 and v24, inside and outside the
+sandbox, and with `NODE_OPTIONS` cleared. Root cause unknown.
+
+`just synth` handles it: it gives the local compile a bounded amount of time and
+falls back to `just synth-docker`, which runs the same checks inside `node:22`.
+The source is piped in over **stdin** rather than bind-mounted, because mounting
+this directory into a container fails separately with `Unknown system error -35`
+(EAGAIN) while reading typescript's 5.9 MB `_tsc.js`.
+
+```sh
+just synth          # local, falling back to the container if it stalls
+just synth-docker   # skip straight to the container
+```

@@ -162,14 +162,47 @@ attack:
 # Synthesize the CDK stack and run its template assertions. Needs no AWS
 # account: the stack is environment-agnostic and does no context lookups, which
 # is what makes this the substitute for having deployed it (docs/adr/0022).
-synth:
+#
+# Falls back to the container when the local toolchain hangs. On this machine
+# `tsc` stalls at 0% CPU inside node's bootstrap for this project specifically
+# (see infra/README.md); CI on node 22 compiles it fine, so it is an environment
+# fault rather than a code one. A recipe that hangs forever teaches you to stop
+# running it, which is the real cost.
+synth timeout='240':
     #!/usr/bin/env bash
     set -euo pipefail
     cd infra
     [ -d node_modules ] || npm ci
+    if command -v gtimeout >/dev/null; then TO=gtimeout
+    elif command -v timeout >/dev/null; then TO=timeout
+    else TO=""; fi
+    if [ -n "$TO" ] && ! $TO {{timeout}} npx tsc --noEmit -p tsconfig.json; then
+      echo "local tsc did not finish in {{timeout}}s; falling back to the container" >&2
+      cd "$(git rev-parse --show-toplevel)"
+      just synth-docker
+      exit 0
+    fi
     npm test
     npx cdk synth > /dev/null
     echo "stack synthesized and template assertions passed"
+
+# The same checks inside node:22, for when the local toolchain will not run them.
+#
+# The source goes in over **stdin** rather than a bind mount: mounting this
+# directory into the container fails separately with `Unknown system error -35`
+# (EAGAIN) reading typescript's 5.9 MB `_tsc.js`. Tarring it in avoids the mount
+# entirely. This is how the template assertions were verified while the local
+# hang was unresolved.
+synth-docker:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd infra
+    tar czf - --exclude=node_modules --exclude=dist --exclude=cdk.out --exclude=.git . \
+      | docker run --rm -i node:22-slim bash -c \
+        'mkdir -p /w && tar xzf - -C /w && cd /w \
+         && npm ci --no-audit --no-fund --loglevel=error \
+         && npm test && npx cdk synth > /dev/null \
+         && echo "stack synthesized and template assertions passed (container)"'
 
 # Five minutes of load with a backend dying and restarting throughout, sampling
 # the quantities that must stay flat. The leak detector: every other harness here
