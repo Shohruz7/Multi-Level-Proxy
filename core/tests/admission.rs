@@ -170,7 +170,8 @@ async fn past_the_queue_bound_the_proxy_sheds_with_503() {
 
     // One more than the proxy can hold. This is the request under test.
     let shed_id = id;
-    peer.send_headers(shed_id, &get("/one-too-many"), true).await;
+    peer.send_headers(shed_id, &get("/one-too-many"), true)
+        .await;
 
     let frame = tokio::time::timeout(
         TIMEOUT,
@@ -186,13 +187,19 @@ async fn past_the_queue_bound_the_proxy_sheds_with_503() {
     .expect("an answer");
 
     let Frame::Headers { block, .. } = frame else {
-        panic!("expected a response head, got a reset: shedding must be a status the client can read");
+        panic!(
+            "expected a response head, got a reset: shedding must be a status the client can read"
+        );
     };
     let fields = peer.decode(&block);
     let status = fields
         .iter()
         .find(|h| h.name.as_ref() == b":status")
-        .map(|h| String::from_utf8_lossy(&h.value).parse::<u16>().unwrap_or(0))
+        .map(|h| {
+            String::from_utf8_lossy(&h.value)
+                .parse::<u16>()
+                .unwrap_or(0)
+        })
         .unwrap_or(0);
 
     assert_eq!(
@@ -211,7 +218,9 @@ async fn past_the_queue_bound_the_proxy_sheds_with_503() {
     // been recorded against it. This is the assertion that stops a popular
     // backend from being ejected for being popular.
     assert_eq!(
-        shared.health.state(&Backend::new(backend), tokio::time::Instant::now()),
+        shared
+            .health
+            .state(&Backend::new(backend), tokio::time::Instant::now()),
         health::State::Healthy,
         "shedding is our decision about our own capacity, not evidence about a backend",
     );

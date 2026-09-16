@@ -356,10 +356,7 @@ impl Pool {
         // So the question asked here is whether the existing connections are
         // failing to cope, which is what a queue that will not drain looks like.
         let threshold = self.queue_threshold();
-        let coping = pool
-            .conns
-            .iter()
-            .any(|record| !record.backed_up(threshold));
+        let coping = pool.conns.iter().any(|record| !record.backed_up(threshold));
         // The first connection is not a growth decision — there is nothing to
         // reuse and nothing to have an opinion about yet.
         let first = pool.conns.is_empty();

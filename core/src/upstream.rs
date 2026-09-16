@@ -682,7 +682,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
             // without ever tripping the byte bound.
             let mut taken = 1usize;
             while taken < INBOX_BATCH && self.out.len() < MAX_WRITE_QUEUE {
-                let Ok(msg) = self.inbox.try_recv() else { break };
+                let Ok(msg) = self.inbox.try_recv() else {
+                    break;
+                };
                 self.handle_message(msg)?;
                 taken += 1;
             }
