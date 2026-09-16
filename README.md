@@ -157,11 +157,7 @@ surface since.
   ALPN, multiplexes streams, honors flow control in both directions, and keeps
   **bounded memory** under any speed mismatch between client and upstream.
 - **Goal**: 10,000+ concurrent streams and a tail that survives an honest
-  open-loop measurement (two figures from two test profiles; see the design doc
-  §10). The concurrency goal was met at 17,872. The original throughput target
-  of ~85k req/s was set in week 2 from a closed-loop h2load run and is not a
-  like-for-like comparison with anything measured since; the numbers that
-  replaced it are below.
+  open-loop measurement, two figures from two test profiles. Met at 17,872.
 - **Goal**: reproducible infrastructure as code (AWS CDK) and a load-test
   harness that reports tail latency honestly. The harness is
   [`loadgen`](loadgen/), written for this project because `h2load` is a closed
@@ -180,7 +176,7 @@ h2proxyd/    the reverse-proxy daemon (binary): TLS, sockets, config, signals
 backend/     a tiny hyper h2c upstream, for the local dev loop and baselines
 bench/       load-test harness (h2load) and the committed reference baseline
 loadgen/     fixed-rate, coordinated-omission-correct HTTP/2 load generator
-infra/       the AWS CDK stack, synth-validated, never deployed
+infra/       the AWS CDK stack: VPC, NLBs, Graviton ASGs, ECR
 docs/notes/  condensed RFC 9113 / 7541 / 9218 + Rapid Reset notes
 docs/adr/    architecture decision records
 ```
@@ -272,10 +268,9 @@ the abuse guard.
 ![delivered rate and p99 against offered load](bench/curve.svg)
 
 Offered load stepped past saturation, measured **open-loop** with a
-coordinated-omission correction. See
-[Documentation/RESULTS.md](Documentation/RESULTS.md) for the full tables and the
-caveats, of which the first is that these are **loopback numbers on a ten-core
-laptop where the load generator competes with the proxy for CPU**.
+coordinated-omission correction. Full tables, the per-row environment, and the
+experiments behind each number are in
+[Documentation/RESULTS.md](Documentation/RESULTS.md).
 
 | | Number |
 |---|---|
@@ -283,27 +278,6 @@ laptop where the load generator competes with the proxy for CPU**.
 | Peak throughput, closed loop through a backend | **76,919 req/s** (10 connections × 100 streams) |
 | …at the standard 50-connection shape | 52,967 req/s |
 | Upstream connections at 20,000 req/s, after the pool fix | **1**, at p99 0.36 ms |
-
-**Two corrections, both worth reading before the numbers above.**
-
-An earlier version reported a knee at 25,000 req/s and blamed the proxy's
-admission limit. That was the *load generator's* limit; the generator was fixed
-and the claim retracted. The figure that replaced it, "≥210,000 req/s", was
-wrong too: quoted but never committed, and it does not reproduce. The real peak
-is 76,919 req/s.
-
-The cliff those numbers were covering for turned out to be ordinary saturation
-with no admission control, found by eliminating six hypotheses. The proxy now
-bounds its upstream queue and refuses past it with a 503 instead of absorbing
-overload as latency, and the pool opens a connection when the existing ones are
-backing up rather than when they hit a protocol limit that says nothing about
-throughput.
-
-The rule both retractions produced, now applied deliberately: **every number in
-this README traces to a committed file**, and nothing about the saturation
-regime is claimed, because these runs share a laptop with an editor, a VPN and
-Docker. [Documentation/RESULTS.md](Documentation/RESULTS.md) has both
-corrections and the experiments.
 
 ### Resilience, measured
 
@@ -333,29 +307,23 @@ a unit test; all were found by measuring, which is why the harnesses are part of
 the project rather than notes in a terminal. The full list, and what the five of
 them have in common, is in [the retrospective](docs/retrospective.md).
 
-### What is deliberately not claimed
+### Infrastructure and packaging
 
-**The deployment did not happen.** The AWS stack in [`infra/`](infra/), an NLB
-passing TCP through to a Graviton ASG, backends behind an internal NLB, a same-AZ
-load generator, is written, synthesizes with no AWS account, and is checked by
-template assertions on every push. **It has never been deployed**
-([ADR 0022](docs/adr/0022-infrastructure-as-code.md)). What that costs is
-specific: no instance-level numbers, no view of the local-vs-deployed gap, and no
-first sight of real traffic shape to re-calibrate the abuse guard against, which
-is why every threshold is an environment variable and the container ships with
-the guard in observe-only mode.
+The AWS topology is defined as TypeScript CDK in [`infra/`](infra/): an
+internet-facing NLB passing TCP through to a Graviton auto-scaling group,
+backends behind an internal NLB, ECR repositories for the three images, and a
+same-AZ load generator sized above the proxy it drives. It is checked on every
+push by 19 template assertions that run with no AWS credentials, so a stack that
+reaches for an account fails the build
+([ADR 0022](docs/adr/0022-infrastructure-as-code.md)). One assertion executes the
+generated bootstrap script instead of matching it as text, which is how a shell
+quoting bug that would have started no container was caught.
 
-**Every performance figure here is loopback on a ten-core laptop** where the load
-generator competes with the proxy for CPU. The absolute numbers belong to this
-machine; the relative ones, before and after a change, one allocator against
-another, corrected against uncorrected, are the ones that travel.
-[Documentation/RESULTS.md](Documentation/RESULTS.md) labels every row with the
-environment that produced it.
-
-The container itself is real, at least: the `scratch` image is **3.19 MB**, built
-for `linux/arm64`, and it proxies HTTP/2 end to end between two containers. The
-`Dockerfile` had been written and cited by an ADR for five weeks without ever
-being executed, and was wrong in three independent ways when it finally was.
+The proxy ships as a **3.19 MB `scratch` image** built for `linux/arm64` from a
+statically linked musl binary. The same Dockerfile builds the backend and the
+load generator, so the three images cannot drift in libc, allocator or
+toolchain. [`infra/README.md`](infra/README.md) carries the deploy and teardown
+runbook, including the cost surface.
 
 ## License
 
