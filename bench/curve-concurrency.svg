@@ -5,15 +5,15 @@
 <line x1="68" y1="404.0" x2="788" y2="404.0" stroke="#d8dee6" stroke-width="1"/>
 <text x="60" y="408.0" font-size="11" fill="#7b8794" text-anchor="end">0k</text>
 <line x1="68" y1="332.0" x2="788" y2="332.0" stroke="#d8dee6" stroke-width="1"/>
-<text x="60" y="336.0" font-size="11" fill="#7b8794" text-anchor="end">12k</text>
+<text x="60" y="336.0" font-size="11" fill="#7b8794" text-anchor="end">10k</text>
 <line x1="68" y1="260.0" x2="788" y2="260.0" stroke="#d8dee6" stroke-width="1"/>
-<text x="60" y="264.0" font-size="11" fill="#7b8794" text-anchor="end">24k</text>
+<text x="60" y="264.0" font-size="11" fill="#7b8794" text-anchor="end">20k</text>
 <line x1="68" y1="188.0" x2="788" y2="188.0" stroke="#d8dee6" stroke-width="1"/>
-<text x="60" y="192.0" font-size="11" fill="#7b8794" text-anchor="end">36k</text>
+<text x="60" y="192.0" font-size="11" fill="#7b8794" text-anchor="end">30k</text>
 <line x1="68" y1="116.0" x2="788" y2="116.0" stroke="#d8dee6" stroke-width="1"/>
-<text x="60" y="120.0" font-size="11" fill="#7b8794" text-anchor="end">48k</text>
+<text x="60" y="120.0" font-size="11" fill="#7b8794" text-anchor="end">40k</text>
 <line x1="68" y1="44.0" x2="788" y2="44.0" stroke="#d8dee6" stroke-width="1"/>
-<text x="60" y="48.0" font-size="11" fill="#7b8794" text-anchor="end">60k</text>
+<text x="60" y="48.0" font-size="11" fill="#7b8794" text-anchor="end">50k</text>
 <text x="796" y="408.0" font-size="11" fill="#d9480f">10 ms</text>
 <text x="796" y="228.0" font-size="11" fill="#d9480f">100 ms</text>
 <text x="796" y="48.0" font-size="11" fill="#d9480f">1000 ms</text>
@@ -24,16 +24,16 @@
 <text x="644.0" y="422.0" font-size="11" fill="#7b8794" text-anchor="middle">24k</text>
 <text x="788.0" y="422.0" font-size="11" fill="#7b8794" text-anchor="middle">30k</text>
 <text x="428" y="446" font-size="12" fill="#1f2933" text-anchor="middle">requests in flight (connections × streams)</text>
-<path d="M92.0,260.2 L164.0,220.2 L308.0,86.4 L548.0,82.4" fill="none" stroke="#2a6df4" stroke-width="2.5"/>
-<path d="M92.0,286.3 L164.0,193.5 L308.0,162.9 L548.0,113.4" fill="none" stroke="#d9480f" stroke-width="2.5"/>
-<circle cx="92.0" cy="260.2" r="3.5" fill="#2a6df4"/>
-<circle cx="164.0" cy="220.2" r="3.5" fill="#2a6df4"/>
-<circle cx="308.0" cy="86.4" r="3.5" fill="#2a6df4"/>
-<circle cx="548.0" cy="82.4" r="3.5" fill="#2a6df4"/>
-<circle cx="92.0" cy="286.3" r="3.5" fill="#d9480f"/>
-<circle cx="164.0" cy="193.5" r="3.5" fill="#d9480f"/>
-<circle cx="308.0" cy="162.9" r="3.5" fill="#d9480f"/>
-<circle cx="548.0" cy="113.4" r="3.5" fill="#d9480f"/>
+<path d="M92.0,298.8 L164.0,227.3 L308.0,195.2 L548.0,83.0" fill="none" stroke="#2a6df4" stroke-width="2.5"/>
+<path d="M92.0,227.3 L164.0,165.3 L308.0,115.6 L548.0,84.2" fill="none" stroke="#d9480f" stroke-width="2.5"/>
+<circle cx="92.0" cy="298.8" r="3.5" fill="#2a6df4"/>
+<circle cx="164.0" cy="227.3" r="3.5" fill="#2a6df4"/>
+<circle cx="308.0" cy="195.2" r="3.5" fill="#2a6df4"/>
+<circle cx="548.0" cy="83.0" r="3.5" fill="#2a6df4"/>
+<circle cx="92.0" cy="227.3" r="3.5" fill="#d9480f"/>
+<circle cx="164.0" cy="165.3" r="3.5" fill="#d9480f"/>
+<circle cx="308.0" cy="115.6" r="3.5" fill="#d9480f"/>
+<circle cx="548.0" cy="84.2" r="3.5" fill="#d9480f"/>
 <line x1="598" y1="50" x2="620" y2="50" stroke="#2a6df4" stroke-width="2.5"/>
 <text x="626" y="54" font-size="11" fill="#7b8794">delivered rate</text>
 <line x1="598" y1="67" x2="620" y2="67" stroke="#d9480f" stroke-width="2.5"/>
