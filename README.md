@@ -204,6 +204,8 @@ Measuring it, live:
 
 ```sh
 just curve       # the latency-vs-offered-load curve, corrected for coordinated omission
+just confirm     # re-measure a claim: both arms from one binary, and it refuses
+                 # to state a ratio when the arms' observed ranges overlap
 just tune        # sweep the flow-control windows: bulk throughput against memory held
 just calibrate   # measure the abuse thresholds against legitimate traffic
 just attack      # Rapid Reset + backend-kill, with a control run to compare
@@ -277,7 +279,7 @@ experiments behind each number are in
 | Concurrent streams held open, measured at the proxy's own gauge | **17,872** at 53,600 req/s, **0 failed** |
 | Peak throughput, closed loop through a backend | **76,919 req/s** (10 connections × 100 streams) |
 | …at the standard 50-connection shape | 52,967 req/s |
-| Upstream connections at 20,000 req/s, after the pool fix | **1**, at p99 0.36 ms |
+| Upstream connections at 10,000 req/s, after the pool fix | **1**, at p99 **0.39 ms** (median of 6, 0.21-0.63) |
 
 ### Resilience, measured
 

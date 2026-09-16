@@ -53,6 +53,64 @@ size of the correction is reported rather than asserted. It is small while the
 proxy is comfortable and grows into the dominant term as the knee approaches —
 which is exactly where a p99 gets quoted.
 
+> ## Correction (2026-09-16): the pool-fix numbers below are a single run, and they do not reproduce
+>
+> This is the third correction in this file and it follows the same pattern as
+> the first two exactly: a number that was *quoted* rather than *committed*
+> turned out to be wrong. The previous correction, immediately below, closes with
+> a promise that nothing about the saturation regime would be claimed. It then
+> claims two things anyway - "one connection gave p99 21 ms where eight gave
+> 297 ms", and "at 20,000 req/s the pool settles on one upstream connection,
+> p99 0.36 ms" - both from one run each, on the same contended laptop the
+> paragraph warns about.
+>
+> Re-measured properly. `bench/confirm.sh` runs both pool policies from **one
+> binary with one flag different** (`H2PROXYD_POOL_GROWTH=queue|eager`), six
+> alternating pairs at each of three offered rates, and applies a decision rule
+> fixed before the run: if the arms' observed ranges overlap, no ratio is
+> reported. Every row is in [`bench/confirm.csv`](../bench/confirm.csv).
+>
+> | Offered | queue p99 (median, range) | eager p99 (median, range) | Pool | Verdict |
+> |---|---|---|---|---|
+> | 10,000 | 0.393 ms (0.205-0.630) | 0.511 ms (0.293-0.878) | 1 vs 1 | no effect |
+> | 20,000 | 209 ms (22.1-409) | 215 ms (18.4-439) | 8 vs 8 | no effect |
+> | 30,000 | 568 ms (434-793) | 451 ms (279-650) | 8 vs 8 | no effect |
+>
+> **The 14x is retracted.** The two policies could not be separated at any rate.
+> At 20,000 and 30,000 req/s `eager` won 4 of 6 pairs - if anything the wrong
+> direction. The original pair was one run per arm with `queue` going first, and
+> the first version of this harness reproduced that artefact perfectly: `queue`
+> won 5/5 at 30,000 req/s while the sequence degraded monotonically as it ran, so
+> whichever arm went first would have swept. The order now alternates.
+>
+> **The 0.36 ms is real but the rate attached to it is wrong.** It reproduces at
+> **10,000** req/s, not 20,000: median 0.393 ms over six runs, one upstream
+> connection, zero shed, every time. At 20,000 req/s this proxy is at its
+> capacity edge on this machine, and which side it falls on depends on how long
+> the box has been under load:
+>
+> | Run | Delivered | p99 | Pool | Shed |
+> |---|---|---|---|---|
+> | first at 20,000 | 20,000 | 22.1 ms | 1 conn | 0 |
+> | twelfth at 20,000 | 16,736 | 409 ms | 8 conns | 57,641 |
+>
+> Same binary, same flag, same offered rate, twelve runs apart. That is the most
+> useful thing this run produced, and it is a statement about the measurement
+> environment rather than about the proxy.
+>
+> **The noise floor, finally measured.** At 10,000 req/s neither policy ever
+> opens a second connection, so the two arms are *identical by construction* -
+> and their median p99 still differs by 30%. Any effect smaller than that is not
+> visible on this hardware, which is why single-run comparisons kept producing
+> numbers that evaporated.
+>
+> **What the pool change is still worth.** Sockets, not latency: one upstream
+> connection instead of eight at rates the proxy is keeping up with. The two
+> policies differ only while a connection sits at the backend's stream limit
+> *and* the pool is below its ceiling; outside that band they are the same
+> policy. That is a narrower claim than the one it replaces, and it is the one
+> the evidence supports.
+
 > ## Correction (2026-09-15): the 210k figure below is also wrong, and the open defect is closed
 >
 > Two things in the 2026-08-11 correction immediately below need correcting in

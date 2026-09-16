@@ -350,15 +350,32 @@ impl Pool {
         // admit another 200 streams to the same backend, and by Little's law
         // concurrency that buys no throughput is bought entirely with latency.
         //
-        // How much that is worth is an open question at this commit, and the
-        // point of making the old policy reachable is to be able to answer it
-        // rather than assert it:
+        // That is the argument. The measurement does **not** currently support
+        // it, and this comment says so rather than quoting the run that did.
         //
-        //     H2PROXYD_POOL_GROWTH=eager|queue
+        // An earlier version of these lines read: "raising the ceiling from 1 to
+        // 8 moved p99 from 21 ms to 297 ms while lowering delivered rate". That
+        // came from one pair of runs. `bench/confirm.sh` re-ran both policies
+        // from this binary — `H2PROXYD_POOL_GROWTH=eager|queue`, six alternating
+        // pairs at each of three rates — and could not separate them at any
+        // rate (`bench/confirm.csv`):
         //
-        // An earlier version of these lines answered it from one pair of runs -
-        // "raising the ceiling from 1 to 8 moved p99 from 21 ms to 297 ms" - and
-        // that number is not quoted here until something can reproduce it.
+        //   10,000 req/s  neither policy ever opens a second connection, so the
+        //                 arms are identical by construction. They still differ
+        //                 by 30% in median p99, which is this machine's noise
+        //                 floor and the reason the 14x was never safe to quote.
+        //   20,000 req/s  both arms reach the 8-connection ceiling and shed.
+        //   30,000 req/s  likewise, and `eager` won 4 of 6 pairs — if anything
+        //                 the wrong direction.
+        //
+        // So the default is kept on the argument above, not on a measured
+        // latency win, and the honest scope of the change is narrow: the two
+        // policies differ only while a connection is at the backend's stream
+        // limit *and* the pool is below its ceiling. Outside that band they are
+        // the same policy. What `Queue` reliably does buy is **sockets** — one
+        // connection instead of eight at rates the proxy is keeping up with —
+        // which is worth having on its own and does not need a latency claim
+        // propping it up.
         //
         // The first connection is not a growth decision — there is nothing to
         // reuse and nothing to have an opinion about yet. Past that, `Queue`
