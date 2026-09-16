@@ -560,6 +560,22 @@ impl Pool {
     }
 
     /// Warm connections currently held, for the pool-utilization gauge (§7).
+    /// Whether any connection to any backend has a queue that is not draining.
+    ///
+    /// The distress signal admission control reacts to (ADR 0023). Deliberately
+    /// the same predicate the growth policy uses, and for the same reason: a
+    /// connection at the backend's stream limit is not in trouble - that is what
+    /// the limit means - but one whose wait-for-a-slot queue keeps growing is.
+    pub fn backed_up(&self) -> bool {
+        let threshold = self.queue_threshold();
+        self.backends
+            .lock()
+            .expect("pool mutex poisoned")
+            .values()
+            .flat_map(|pool| pool.conns.iter())
+            .any(|record| record.backed_up(threshold))
+    }
+
     /// One live sample per upstream connection.
     ///
     /// Sampled from the connections that exist *now*, never accumulated at
@@ -762,7 +778,11 @@ mod tests {
         let pool = Pool::new(Arc::clone(&stats), 4);
         let first = pool.checkout(&backend(3)).expect("a lease");
         first.record.set_max_concurrent(1);
-        first.record.set_queued(usize::from(u8::MAX));
+        // Derived from the bound rather than written as a number: the threshold
+        // is half of `MAX_PENDING`, and an earlier version of this test hardcoded
+        // 255 against a `MAX_PENDING` of 128. When that constant was re-derived
+        // the test started asserting the opposite of what it says.
+        first.record.set_queued(crate::conn::MAX_PENDING);
 
         let _second = pool.checkout(&backend(3)).expect("a second lease");
         assert_eq!(pool.connection_count(), 2);

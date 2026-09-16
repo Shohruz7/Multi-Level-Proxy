@@ -258,6 +258,9 @@ async fn handle_connection(
     let settings = config.tuning.server_settings();
     let summary = match proxy {
         Some(shared) => {
+            // Taken before `Proxy::new`, which counts this connection against
+            // the budget the handle publishes.
+            let admission = shared.admission();
             let service = Proxy::new(shared)
                 .with_peer(peer.ip())
                 .trusting_forwarded_headers(trust_forwarded());
@@ -265,6 +268,7 @@ async fn handle_connection(
                 .with_drain_policy(config.drain)
                 .with_limits(config.limits)
                 .with_connection_window(config.tuning.connection_window)
+                .with_admission(admission)
                 .run()
                 .await
         }
@@ -411,6 +415,14 @@ fn spawn_stats_sampler(shared: &Arc<Shared>) {
                 return;
             };
             let stats = &shared.stats;
+
+            // Admission first: the budget every client connection advertises is
+            // recomputed here rather than on the request path, because it takes
+            // the pool mutex and the request path already contends for it
+            // (ADR 0023).
+            let budget = shared.recompute_admission();
+            metrics::gauge!("h2proxy_admission_streams_per_conn").set(budget as f64);
+            metrics::gauge!("h2proxy_client_connections").set(stats.client_conns() as f64);
 
             // Gauges: quantities that go up and down.
             metrics::gauge!("h2proxy_upstream_pool_connections")
@@ -720,6 +732,13 @@ fn init_metrics() {
         "h2proxy_upstream_streams_active",
         "Streams currently in flight to backends"
     );
+    // Admission (ADR 0023). The pair to watch together: if shed_total moves
+    // while this is above its floor, a client is ignoring SETTINGS.
+    metrics::describe_gauge!(
+        "h2proxy_admission_streams_per_conn",
+        "Streams each client connection is currently advertised as able to open"
+    );
+    metrics::describe_gauge!("h2proxy_client_connections", "Live client connections");
     // Per-connection state, reduced to the worst connection. These exist because
     // the week-9 latency cliff was argued for a dozen experiments before it was
     // measured, and most of what was being argued about is on this list.
@@ -865,6 +884,7 @@ fn init_metrics() {
     // alarm condition; publishing it before any traffic exists would be a
     // standing false alarm. Absent-until-there-is-data is the honest default for
     // a gauge whose zero is meaningful.
+    metrics::gauge!("h2proxy_client_connections").set(0.0);
     metrics::gauge!("h2proxy_upstream_conn_queue_peak").set(0.0);
     metrics::gauge!("h2proxy_upstream_conn_out_peak_bytes").set(0.0);
     metrics::gauge!("h2proxy_upstream_conn_streams_max").set(0.0);

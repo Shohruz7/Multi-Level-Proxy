@@ -205,12 +205,31 @@ pub const MAX_CONCURRENT_STREAMS: u32 = 256;
 /// 6,400 requests inside it and answered in 274 ms while using 1.1 of 10 cores
 /// — not busy, just queued.
 ///
-/// 128 is deliberately smaller than the 200-odd streams a backend typically
-/// admits: the queue is meant to absorb a burst, not to store a backlog. What
-/// it buys is a *stated* worst case — a request either enters service within
-/// roughly `(live + max_pending) / throughput` or is refused — instead of a
-/// latency that is whatever the overload decides.
-pub const MAX_PENDING: usize = 128;
+/// **Sized to one period of the admission control loop**, which is what it is
+/// actually for once admission exists (ADR 0023).
+///
+/// 128 was the first value here, chosen as "a burst, not a backlog" and never
+/// measured. It is smaller than the 200-odd streams a backend typically admits,
+/// so the queue could not even hold one slot-turnover, and with the pool's eight
+/// connections the whole proxy could buffer 1,024 requests against a workload
+/// offering sixteen times that. Measured, it refused 93% of offered work.
+///
+/// The bound that matters is a *time*: how long overshoot must be absorbed
+/// before admission reacts to it. The control loop samples once a second, so the
+/// queue has to hold one second of arrivals at full rate, divided across the
+/// pool — at the ~50,000 req/s this proxy sustains over eight connections, about
+/// 6,000 each. 4,096 is that, rounded down to a power of two.
+///
+/// It is a memory bound, not a throughput control: a queued request holds a
+/// request head, not a body. Admission is what limits load now, and shedding
+/// past this bound should never happen against a conforming client — if
+/// `h2proxy_upstream_shed_total` moves, that is an alarm rather than a
+/// statistic.
+///
+/// The other way to buy the same headroom is a faster control loop. That is the
+/// better lever and it is not taken here only because the one-second period is
+/// shared with the metrics sampler.
+pub const MAX_PENDING: usize = 4096;
 
 /// How the pool decides to open an *additional* connection to a backend.
 ///
@@ -688,6 +707,14 @@ pub struct Connection<IO, S = Echo> {
     /// What we advertised. Our `MAX_FRAME_SIZE` is what bounds the *decoder*:
     /// it is the limit we imposed on the peer.
     local_settings: Settings,
+    /// How many streams this connection currently advertises, and the shared
+    /// budget it follows (ADR 0023).
+    ///
+    /// `None` when nothing is driving admission - the echo responder, and every
+    /// test that is not about admission - in which case the advertised limit
+    /// never moves from `local_settings`.
+    admission: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    advertised_streams: u32,
     /// The peer's settings as applied. Bounds what we may send.
     peer_settings: Settings,
     /// Set while a header block is open — a HEADERS or CONTINUATION arrived
@@ -792,6 +819,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             encode_buf: BytesMut::with_capacity(1024),
             codec: FrameCodec::new(local_settings.max_frame_size),
             local_settings,
+            admission: None,
+            advertised_streams: local_settings.max_concurrent_streams.unwrap_or(u32::MAX),
             peer_settings: defaults,
             open_header_block: None,
             open_header_end_stream: false,
@@ -854,6 +883,49 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
         self.conn_window = window;
         self.conn_recv_window = RecvWindow::new(window);
         self
+    }
+
+    /// Follow a shared admission budget: advertise what upstream capacity can
+    /// actually absorb, rather than a constant (ADR 0023).
+    ///
+    /// The engine deliberately learns nothing about pools from this. It is
+    /// handed an integer that may change, and its only job is to tell the peer
+    /// when it does — which is what `SETTINGS_MAX_CONCURRENT_STREAMS` is for and
+    /// what this proxy was not using.
+    #[must_use]
+    pub fn with_admission(mut self, budget: std::sync::Arc<std::sync::atomic::AtomicU32>) -> Self {
+        let initial = budget.load(std::sync::atomic::Ordering::Relaxed);
+        self.advertised_streams = initial;
+        self.local_settings.max_concurrent_streams = Some(initial);
+        self.streams.set_max_concurrent(initial);
+        self.admission = Some(budget);
+        self
+    }
+
+    /// Re-advertise if the shared budget has moved. One relaxed load per pass.
+    ///
+    /// Sends a SETTINGS frame rather than only updating the local table, because
+    /// a limit the peer is not told about is not admission control: the peer
+    /// keeps opening streams and keeps being refused, which is the refusal storm
+    /// this exists to stop.
+    fn sync_admission(&mut self) -> Result<(), ConnectionError> {
+        let Some(budget) = &self.admission else {
+            return Ok(());
+        };
+        let want = budget.load(std::sync::atomic::Ordering::Relaxed);
+        if want == self.advertised_streams {
+            return Ok(());
+        }
+        self.advertised_streams = want;
+        self.local_settings.max_concurrent_streams = Some(want);
+        // Lowering the local table immediately is correct even though the peer
+        // has not acked: §6.5.2 makes a reduced limit apply to *new* streams,
+        // and streams already open are never retroactively refused.
+        self.streams.set_max_concurrent(want);
+        self.queue_frame(&Frame::Settings {
+            ack: false,
+            params: vec![(setting_id::MAX_CONCURRENT_STREAMS, want)],
+        })
     }
 
     /// Turn a guard verdict into the connection error it implies.
@@ -1010,6 +1082,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             // a blocked sender looks like. A WINDOW_UPDATE from the peer or a
             // chunk from the responder is what wakes us, so reading is never
             // what blocks and there is no deadlock.
+            // Re-advertise before flushing, so a changed budget rides out with
+            // whatever else is already queued rather than waiting for the next
+            // thing to write.
+            if let Err(e) = self.sync_admission() {
+                return Stop::Failed(e);
+            }
+
             if let Err(e) = self.pump_outbound() {
                 return Stop::Failed(e);
             }

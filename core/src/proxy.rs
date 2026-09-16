@@ -70,6 +70,12 @@ pub struct ProxyStats {
     /// `h2proxy_active_streams` gauge, which was described and seeded and never
     /// once written to.
     client_streams: AtomicUsize,
+    /// Live client connections, counted by `Proxy`'s construction and drop.
+    ///
+    /// Needed because admission is advertised *per connection* while capacity is
+    /// a property of the *pool*: turning one into the other requires knowing how
+    /// many claimants there are (ADR 0023).
+    client_conns: AtomicUsize,
     /// Second attempts made after a retryable failure.
     retries: AtomicU64,
     /// Requests refused because an upstream's wait-for-a-slot queue was full.
@@ -220,6 +226,18 @@ impl ProxyStats {
         self.client_streams.load(Ordering::Relaxed)
     }
 
+    pub fn client_connected(&self) {
+        self.client_conns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn client_disconnected(&self) {
+        self.client_conns.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn client_conns(&self) -> usize {
+        self.client_conns.load(Ordering::Relaxed)
+    }
+
     pub fn retry(&self) {
         self.retries.fetch_add(1, Ordering::Relaxed);
     }
@@ -302,6 +320,24 @@ impl ProxyStats {
 
 /// Everything the proxy shares between client connections: the pool, the load
 /// balancer, the backend list, and the counters.
+/// The fewest streams a client connection is ever told it may open.
+///
+/// Never zero, and not one: a budget of zero stalls the connection completely,
+/// and a budget of one serialises it. Two is enough for a client to have a
+/// request in flight while it prepares the next, which is what keeps a ramp-up
+/// from looking like a stall.
+pub const MIN_ADMIT: u32 = 2;
+
+/// How many streams a connection wins back per sample once the level is known.
+///
+/// **One**, and the reason is the difference between one flow and many. This
+/// budget is per connection, so a step of `n` admits `n x connections` more
+/// streams at once: at 500 clients a step of 8 was +4,000 streams in one sample,
+/// which overshot capacity every single time and left the loop shedding in a
+/// comfortable-looking sawtooth. Additive increase has to be additive in the
+/// quantity that is actually shared, and the shared quantity is the total.
+const ADMIT_STEP: u32 = 1;
+
 #[derive(Debug)]
 pub struct Shared {
     pub pool: Pool,
@@ -316,6 +352,20 @@ pub struct Shared {
     /// cannot see: a connection that died because its liveness probe went
     /// unanswered, with no client stream on it to fail.
     pub health: Arc<Health>,
+    /// Streams each client connection is currently allowed to open (ADR 0023).
+    ///
+    /// Shared with every `Connection` so the engine can advertise it without
+    /// knowing what a pool is. One relaxed load per I/O pass; a stale read costs
+    /// one pass of over-commitment and nothing else.
+    admission: Arc<std::sync::atomic::AtomicU32>,
+    /// `stats.shed_total()` as of the previous admission sample, so the control
+    /// loop can react to shedding *having happened* rather than to a proxy for
+    /// it.
+    last_shed: AtomicU64,
+    /// Whether admission is still doubling to find the level (see
+    /// [`Shared::recompute_admission`]).
+    slow_start: std::sync::atomic::AtomicBool,
+    tuning: crate::conn::Tuning,
 }
 
 impl Shared {
@@ -364,7 +414,86 @@ impl Shared {
             balancer: Box::new(PowerOfTwoChoices::new()),
             stats,
             health,
+            // Starts at the floor and climbs, rather than starting at the
+            // ceiling and retreating. Opening at `max_concurrent_streams` means
+            // the first second of every busy period is spent maximally
+            // over-committed, which measured 54,000 shed requests before the
+            // loop had taken its first sample. It is always safe to admit too
+            // little for one sample; admitting too much cannot be taken back.
+            admission: Arc::new(std::sync::atomic::AtomicU32::new(MIN_ADMIT)),
+            last_shed: AtomicU64::new(0),
+            slow_start: std::sync::atomic::AtomicBool::new(true),
+            tuning,
         })
+    }
+
+    /// The handle a `Connection` advertises from.
+    pub fn admission(&self) -> Arc<std::sync::atomic::AtomicU32> {
+        Arc::clone(&self.admission)
+    }
+
+    /// Recompute what one client connection may open, and return it.
+    ///
+    /// **Additive increase, multiplicative decrease**, driven by whether the
+    /// upstream queues are draining - not by a capacity estimate. The first
+    /// version of this divided a capacity estimate by the connection count, and
+    /// it was wrong in a way worth recording: capacity was counted in upstream
+    /// *stream slots*, but a client stream spends most of its life not holding
+    /// one. Sizing admission to slot count left the upstream idle for every
+    /// client round trip, and measured 22,000 req/s where the same box did
+    /// 55,000 with no admission control at all - while latency got *worse*,
+    /// because the queue simply moved to the client.
+    ///
+    /// That is the general result, and it is why this reacts rather than
+    /// predicts: against a client with fixed demand, admission control cannot
+    /// reduce latency. It can only move the queue and, if it throttles below
+    /// what the system can serve, lose throughput. So the budget stays as
+    /// generous as it can be and only retreats from evidence of distress.
+    ///
+    /// AIMD because it is the shape that is known to converge under exactly this
+    /// kind of shared-bottleneck feedback, and because neither constant needs to
+    /// be right for it to work - they set how fast it finds the level, not what
+    /// the level is.
+    pub fn recompute_admission(&self) -> u32 {
+        let ceiling = self.tuning.max_concurrent_streams;
+        let current = self.admission.load(Ordering::Relaxed);
+
+        // Two distress signals, and the first one is the one that matters.
+        //
+        // Shedding is not a proxy for trouble, it *is* the failure this exists
+        // to remove: a shed request is one the proxy accepted, charged itself
+        // for, and then refused. Reacting to queue depth alone was measured
+        // shedding 38,000 requests a second while the depth signal read clear
+        // between samples - the loop settled into a comfortable sawtooth around
+        // a level that was still refusing most of the offered work.
+        //
+        // Queue depth stays as the early warning: it trips before anything has
+        // been refused, which is where a control loop would rather act.
+        let shed_now = self.stats.shed_total();
+        let shed_before = self.last_shed.swap(shed_now, Ordering::Relaxed);
+        let shedding = shed_now > shed_before;
+
+        let distressed = shedding || self.pool.backed_up();
+
+        // Slow start, for the same reason TCP has one: additive increase from
+        // the floor would take a hundred samples to find a level that doubling
+        // reaches in seven, and a proxy that needs two minutes to come up to
+        // speed after a quiet period is not usable. Doubling ends at the first
+        // sign of distress and never resumes - from then on the level is known
+        // to within a factor of two and AIMD refines it.
+        let next = if distressed {
+            self.slow_start.store(false, Ordering::Relaxed);
+            (current / 2).max(MIN_ADMIT)
+        } else if self.slow_start.load(Ordering::Relaxed) {
+            current.saturating_mul(2).min(ceiling)
+        } else {
+            current.saturating_add(ADMIT_STEP).min(ceiling)
+        };
+
+        if next != current {
+            self.admission.store(next, Ordering::Relaxed);
+        }
+        next
     }
 
     /// Pick a backend to try, excluding any already attempted for this request.
@@ -482,6 +611,7 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new(shared: Arc<Shared>) -> Self {
+        shared.stats.client_connected();
         Proxy {
             shared,
             events: None,
@@ -909,6 +1039,7 @@ impl Drop for Proxy {
         for route in self.routes.values() {
             self.finished(route);
         }
+        self.shared.stats.client_disconnected();
     }
 }
 
