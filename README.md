@@ -1,6 +1,6 @@
-# h2proxy — an HTTP/2 multiplexing reverse proxy, from scratch in Rust
+# h2proxy: an HTTP/2 multiplexing reverse proxy, from scratch in Rust
 
-A reverse proxy that speaks HTTP/2 on **both** sides — terminating TLS,
+A reverse proxy that speaks HTTP/2 on **both** sides, terminating TLS,
 negotiating `h2` via ALPN, multiplexing thousands of client streams, and
 coalescing them onto a handful of warm upstream connections. The HTTP/2
 protocol engine is hand-built against the wire format; the point of the
@@ -12,7 +12,7 @@ right.
 A client opens one TLS connection and multiplexes many concurrent requests
 over it. h2proxy terminates that connection, decodes the HTTP/2 framing and
 compressed headers itself, and forwards each request onto a small pool of
-long-lived upstream connections — many streams in, few connections out.
+long-lived upstream connections: many streams in, few connections out.
 
 ```
                    ┌──────────────── h2proxy ────────────────┐
@@ -26,38 +26,38 @@ long-lived upstream connections — many streams in, few connections out.
 
 The parts that carry the weight:
 
-- **Framing** — a streaming codec over a reassembly buffer that advances only
+- **Framing**: a streaming codec over a reassembly buffer that advances only
   on a complete frame, so a frame split across TCP segments is never
   mis-parsed. All eight frame types the proxy uses, with their length,
   stream-id and flag rules, and each violation mapped to the error code the
   RFC mandates.
-- **HPACK** — the stateful one. Integer and string primitives, the Huffman
+- **HPACK**: the stateful one. Integer and string primitives, the Huffman
   code as a derived state machine, the 61-entry static table, and the dynamic
   table with its eviction accounting. Encoder and decoder tables must stay in
   lockstep across a whole connection: a single desync corrupts every later
   header block.
-- **Streams and flow control** — the lifecycle state machine, fair outbound
+- **Streams and flow control**: the lifecycle state machine, fair outbound
   interleaving so one large response cannot starve small ones, and two-level
   (connection + stream) windows.
-- **Backpressure bridging** — the centerpiece. The proxy withholds the
+- **Backpressure bridging**: the centerpiece. The proxy withholds the
   upstream's `WINDOW_UPDATE` until bytes have drained to the client, so a slow
   client transitively throttles a fast upstream and proxy memory stays bounded
   under any speed mismatch. Nothing is buffered and nothing blocks: credit is
   relayed, so the bound is the *window* (1 MiB) rather than the response size.
-- **Coalescing** — a shared pool behind every client connection. Twenty client
+- **Coalescing**: a shared pool behind every client connection. Twenty client
   connections carrying 400 streams land on a handful of upstream connections,
   and the stream-id remapping between the two id spaces is the pool's job.
-- **Resilience** — connection pooling and coalescing, load balancing by
+- **Resilience**: connection pooling and coalescing, load balancing by
   least-outstanding-streams, health checking with outlier ejection, active PING
   probing and single-request probe-back, conservative idempotent-only retries,
   and a graceful two-phase GOAWAY drain on both legs. The probe is the part that
   catches a backend which accepts connections and then answers nothing: it fails
   no request, it *hangs* them, so nothing passive can see it.
-- **Defence** — per-connection accounting for the HTTP/2 abuse patterns: Rapid
+- **Defence**: per-connection accounting for the HTTP/2 abuse patterns: Rapid
   Reset (CVE-2023-44487), PING and SETTINGS floods, empty-DATA floods, and
   CONTINUATION floods. The offending connection is closed with
   `ENHANCE_YOUR_CALM`; everyone else is untouched. The thresholds are
-  **measured**, not guessed — see below.
+  **measured**, not guessed. See below.
 
 Errors follow HTTP/2's own split: a connection error emits GOAWAY and takes
 the connection down; a stream error emits RST_STREAM and leaves it up.
@@ -69,8 +69,8 @@ expensive resources: TCP connections, TLS sessions, file descriptors. HTTP/1.1
 forces one in-flight request per connection; HTTP/2 carries many interleaved
 streams over one long-lived connection. A proxy that speaks h2 on both sides
 takes thousands of client streams arriving over a few hundred connections and
-fans them onto a few warm upstream connections. That collapse — fewer
-connections doing more work — is the source of the latency and throughput wins
+fans them onto a few warm upstream connections. That collapse, fewer
+connections doing more work, is the source of the latency and throughput wins
 this project targets.
 
 ## Scope of "from scratch" (the honest version)
@@ -85,12 +85,12 @@ connection-management logic that bridges the client and upstream sides.
 different project and a security liability.
 
 **Used for tests only:** the mature [`h2`](https://github.com/hyperium/h2) crate,
-as a **differential-testing oracle** — the hand-written codec is fuzzed and
+as a **differential-testing oracle**: the hand-written codec is fuzzed and
 round-tripped against it so that "from scratch" never means "subtly wrong on
 the wire."
 
-The reasoning behind each of these — and tokio-vs-glommio, NLB-vs-ALB,
-aarch64-musl, the error model, and more — is recorded as
+The reasoning behind each of these, and tokio-vs-glommio, NLB-vs-ALB,
+aarch64-musl, the error model, and more, is recorded as
 [Architecture Decision Records](docs/adr/). Condensed notes on the relevant
 RFCs (9113, 7541, 9218) and the Rapid Reset CVE are in [docs/notes/](docs/notes/).
 
@@ -102,40 +102,40 @@ Correctness here is not self-reported. The engine is checked in layers:
 - **Differential tests** against the `h2` crate: a real `h2` client runs a full
   session against our engine, and every frame it puts on the wire is decoded
   and re-encoded to **byte-identical** octets.
-- **RFC vectors** — HPACK's Appendix C sequences pass byte-for-byte in both
+- **RFC vectors**: HPACK's Appendix C sequences pass byte-for-byte in both
   directions, including the dynamic-table evictions they were designed to
   provoke.
-- **Property tests** — encode/decode identity, in-order decoding of a frame
+- **Property tests**: encode/decode identity, in-order decoding of a frame
   stream, byte-at-a-time reads never mis-parsing, and encoder/decoder tables
   staying in lockstep over arbitrary header sequences.
-- **Property tests over flow control** — that a window never wraps or exceeds
+- **Property tests over flow control**: that a window never wraps or exceeds
   2³¹−1, that a closed stream leaves no entry behind, and the one that matters:
   we never emit more octets than the peer credited, at either level.
-- **Fuzzing** — `cargo-fuzz` targets for the frame parser and the HPACK
+- **Fuzzing**: `cargo-fuzz` targets for the frame parser and the HPACK
   decoder, both fed wholly unconstrained input. The contract is total: any
-  input yields `Err`, `Ok(None)` or a frame — never a panic.
-- **Differential tests in both roles** — the `h2` crate is the oracle on each
+  input yields `Err`, `Ok(None)` or a frame, never a panic.
+- **Differential tests in both roles**: the `h2` crate is the oracle on each
   side: a real `h2` client runs against our server engine, and a real
   `h2::server` runs against our hand-built *client* engine. A session only
   progresses if the frames we synthesize are ones a mature implementation
   accepts.
-- **A bounded-memory test** — a backend producing 64 MiB against a client
+- **A bounded-memory test**: a backend producing 64 MiB against a client
   reading a few KB at a time, asserting that the octets held between them stay
   under one connection window *and* that the backend provably stopped. Both
   halves matter: flat memory alone would also describe a proxy that dropped data.
-- **Accounting invariants at scale** — 3,000 requests through every ending a
+- **Accounting invariants at scale**: 3,000 requests through every ending a
   stream has (served, refused-and-retried, failed, cancelled mid-download, and a
   backend killed under live traffic), then the assertion that the books balance:
   zero pool leases outstanding, zero streams open, zero octets in the bridge.
-  These are the bugs that no single request exposes — the worst two of the last
+  These are the bugs that no single request exposes; the worst two of the last
   fortnight were both invisible below a few thousand requests.
-- **A soak** (`just soak`) — five minutes of load with a backend killed and
+- **A soak** (`just soak`): five minutes of load with a backend killed and
   restarted every 30 s, sampling the quantities that must stay *flat* rather than
   the ones that must be fast. It found a real leak on its first run: the
   active-stream gauge counted every stream of every client that hung up
   mid-request, forever. Nothing broke and nothing leaked but the numbers, which
   is exactly why a week of feature tests missed it.
-- **Conformance** — [h2spec](https://github.com/summerwind/h2spec)'s RFC 9113
+- **Conformance**: [h2spec](https://github.com/summerwind/h2spec)'s RFC 9113
   suite runs against the live daemon: **146/146, with and without the proxy path
   in front of a real backend**. It earned its place by finding six real defects
   the suites above did not, including a duplicate END_STREAM that every
@@ -153,26 +153,26 @@ surface since.
 
 ## Goals and non-goals
 
-- **Goal** — a correct HTTP/2 intermediary that negotiates `h2` over TLS via
+- **Goal**: a correct HTTP/2 intermediary that negotiates `h2` over TLS via
   ALPN, multiplexes streams, honors flow control in both directions, and keeps
   **bounded memory** under any speed mismatch between client and upstream.
-- **Goal** — 10,000+ concurrent streams and a tail that survives an honest
+- **Goal**: 10,000+ concurrent streams and a tail that survives an honest
   open-loop measurement (two figures from two test profiles; see the design doc
   §10). The concurrency goal was met at 17,872. The original throughput target
   of ~85k req/s was set in week 2 from a closed-loop h2load run and is not a
   like-for-like comparison with anything measured since; the numbers that
   replaced it are below.
-- **Goal** — reproducible infrastructure as code (AWS CDK) and a load-test
+- **Goal**: reproducible infrastructure as code (AWS CDK) and a load-test
   harness that reports tail latency honestly. The harness is
   [`loadgen`](loadgen/), written for this project because `h2load` is a closed
   loop and structurally cannot measure a tail.
-- **Non-goal** — server push (`ENABLE_PUSH = 0`), a dynamic control plane, or an
+- **Non-goal**: server push (`ENABLE_PUSH = 0`), a dynamic control plane, or an
   HTTP/1.1 downgrade path in v1.
 
 ## Workspace layout
 
 ```
-core/        h2proxy-core — the hand-built protocol engine (library)
+core/        h2proxy-core, the hand-built protocol engine (library)
   frame  hpack  stream  flow          the protocol primitives
   conn  upstream                      the two connection engines: server, client
   service  proxy  pool  lb            what answers a stream, and where it goes
@@ -180,7 +180,7 @@ h2proxyd/    the reverse-proxy daemon (binary): TLS, sockets, config, signals
 backend/     a tiny hyper h2c upstream, for the local dev loop and baselines
 bench/       load-test harness (h2load) and the committed reference baseline
 loadgen/     fixed-rate, coordinated-omission-correct HTTP/2 load generator
-infra/       the AWS CDK stack — synth-validated, never deployed
+infra/       the AWS CDK stack, synth-validated, never deployed
 docs/notes/  condensed RFC 9113 / 7541 / 9218 + Rapid Reset notes
 docs/adr/    architecture decision records
 ```
@@ -215,7 +215,7 @@ just soak        # five minutes with a backend dying and returning throughout
 ```
 
 Dev loop (needs [`just`](https://github.com/casey/just)): `just dev` runs a local
-h2c backend *and* the proxy wired to it — the full client → proxy → backend path.
+h2c backend *and* the proxy wired to it: the full client → proxy → backend path.
 `just run-server` runs the engine with no backends, answering from its built-in
 responder. `just baseline` captures the no-proxy baseline (see
 [bench/README.md](bench/README.md)). Fuzzing: `just fuzz 60 frame_parser` or
@@ -256,7 +256,7 @@ window while the transfer runs, instead of tracking the response size.
 hand-built and tested: the server side that faces clients, and the client side
 that faces backends. A request arrives over TLS, is decoded and validated,
 forwarded over a pooled h2c connection to a backend, and the response is streamed
-back — with the two connections' flow-control windows coupled so that neither
+back, with the two connections' flow-control windows coupled so that neither
 peer can outrun the other into this process's memory.
 
 Covered by tests: TLS 1.3 + ALPN, the full frame codec, HPACK in both directions
@@ -272,7 +272,7 @@ the abuse guard.
 ![delivered rate and p99 against offered load](bench/curve.svg)
 
 Offered load stepped past saturation, measured **open-loop** with a
-coordinated-omission correction — see
+coordinated-omission correction. See
 [Documentation/RESULTS.md](Documentation/RESULTS.md) for the full tables and the
 caveats, of which the first is that these are **loopback numbers on a ten-core
 laptop where the load generator competes with the proxy for CPU**.
@@ -284,28 +284,26 @@ laptop where the load generator competes with the proxy for CPU**.
 | …at the standard 50-connection shape | 52,967 req/s |
 | Upstream connections at 20,000 req/s, after the pool fix | **1**, at p99 0.36 ms |
 
-**Two corrections worth reading before any of these**, and they are the reason
-the table above is shorter than it used to be.
+**Two corrections, both worth reading before the numbers above.**
 
-An earlier version reported a "knee at 25,000 req/s" and blamed the proxy's
-admission limit. That was the *load generator's* limit. The generator was fixed;
-the claim was retracted.
+An earlier version reported a knee at 25,000 req/s and blamed the proxy's
+admission limit. That was the *load generator's* limit; the generator was fixed
+and the claim retracted. The figure that replaced it, "≥210,000 req/s", was
+wrong too: quoted but never committed, and it does not reproduce. The real peak
+is 76,919 req/s.
 
-The figure that replaced it — "≥210,000 req/s" — was also wrong. It was quoted,
-never committed, and does not reproduce: the real peak is 76,919 req/s. The
-cliff it was covering for turned out to be ordinary saturation with no admission
-control, found by eliminating six hypotheses, including the appealing ones. The
-proxy now bounds its upstream queue and refuses past it with a 503 rather than
-absorbing overload as unbounded latency, and the pool opens connections when
-they are backing up rather than when they reach a protocol limit that says
-nothing about throughput.
+The cliff those numbers were covering for turned out to be ordinary saturation
+with no admission control, found by eliminating six hypotheses. The proxy now
+bounds its upstream queue and refuses past it with a 503 instead of absorbing
+overload as latency, and the pool opens a connection when the existing ones are
+backing up rather than when they hit a protocol limit that says nothing about
+throughput.
 
-The rule that produced both retractions, now applied deliberately: **every
-number in this README is traceable to a committed file**, and nothing about the
-saturation regime is claimed at all, because the machine these run on is a
-laptop with an editor, a VPN and Docker on it.
-[Documentation/RESULTS.md](Documentation/RESULTS.md) carries both corrections
-and the discriminating experiments.
+The rule both retractions produced, now applied deliberately: **every number in
+this README traces to a committed file**, and nothing about the saturation
+regime is claimed, because these runs share a laptop with an editor, a VPN and
+Docker. [Documentation/RESULTS.md](Documentation/RESULTS.md) has both
+corrections and the experiments.
 
 ### Resilience, measured
 
@@ -314,43 +312,43 @@ and the discriminating experiments.
 | Backend killed mid-load, 200k requests | **0 5xx**, 2 ejections, 247 retries rescued |
 | Backend that accepts and then answers nothing | detected and ejected in ~2× `ping_idle`; the request gets an answer instead of hanging |
 | 5-minute soak, a backend killed and restarted every 30 s | 13.0M requests, **0 5xx**, 1,177 retries, 16 ejections, 126 probes / 0 probe failures; RSS plateaued and every in-flight gauge settled to **0** |
-| SIGTERM mid-load, 75k requests (manual run, see ADR 0018 — not `just attack`) | **0 5xx**; a 20 MB response completed in full across it |
+| SIGTERM mid-load, 75k requests (manual run, see ADR 0018, not `just attack`) | **0 5xx**; a 20 MB response completed in full across it |
 | Rapid Reset flood beside ordinary load | attacker GOAWAYed; bystander p99 **11.65 ms → 8.11 ms** (unharmed) |
-| Abuse guard cost per frame | **below the noise floor** of frame dispatch — 5.6 / 5.4 / 0.59 ns per call, confidence intervals overlapping |
+| Abuse guard cost per frame | **below the noise floor** of frame dispatch: 5.6 / 5.4 / 0.59 ns per call, confidence intervals overlapping |
 | Threshold headroom vs. legitimate traffic | 12.5x–20x, measured |
-| Throughput, before vs. after all of week 7 | 82,985 → 86,711 req/s — **no measurable cost** |
+| Throughput, before vs. after all of week 7 | 82,985 → 86,711 req/s, **no measurable cost** |
 | Flow-control windows, swept | defaults kept: 96% of the best bulk throughput at ~28% of the memory |
-| jemalloc vs musl's allocator | **not adopted** — latency difference inside the noise, RSS **13× higher** |
+| jemalloc vs musl's allocator | **not adopted**: latency difference inside the noise, RSS **13× higher** |
 
 The last row is the one that took discipline: the through-proxy baseline was
 captured *before* any week-7 code landed, because once the guard is in the frame
 path the pre-hardening number is gone. Capturing it is also what found a
-release-only flow-control bug that six weeks of green tests had missed — the
+release-only flow-control bug that six weeks of green tests had missed. The
 whole suite ran in debug, and `RecvWindow::release` credited its window back
 inside a `debug_assert!`, which `--release` compiles away entirely.
 
 Every bug worth remembering here was found the same way: a feature that ran,
 passed its tests, and reported nothing. None was found by reading code or adding
-a unit test; all were found by measuring — which is why the harnesses are part of
+a unit test; all were found by measuring, which is why the harnesses are part of
 the project rather than notes in a terminal. The full list, and what the five of
 them have in common, is in [the retrospective](docs/retrospective.md).
 
 ### What is deliberately not claimed
 
-**The deployment did not happen.** The AWS stack in [`infra/`](infra/) — NLB
+**The deployment did not happen.** The AWS stack in [`infra/`](infra/), an NLB
 passing TCP through to a Graviton ASG, backends behind an internal NLB, a same-AZ
-load generator — is written, synthesizes with no AWS account, and is checked by
+load generator, is written, synthesizes with no AWS account, and is checked by
 template assertions on every push. **It has never been deployed**
 ([ADR 0022](docs/adr/0022-infrastructure-as-code.md)). What that costs is
 specific: no instance-level numbers, no view of the local-vs-deployed gap, and no
-first sight of real traffic shape to re-calibrate the abuse guard against — which
+first sight of real traffic shape to re-calibrate the abuse guard against, which
 is why every threshold is an environment variable and the container ships with
 the guard in observe-only mode.
 
 **Every performance figure here is loopback on a ten-core laptop** where the load
 generator competes with the proxy for CPU. The absolute numbers belong to this
-machine; the relative ones — before and after a change, one allocator against
-another, corrected against uncorrected — are the ones that travel.
+machine; the relative ones, before and after a change, one allocator against
+another, corrected against uncorrected, are the ones that travel.
 [Documentation/RESULTS.md](Documentation/RESULTS.md) labels every row with the
 environment that produced it.
 
@@ -361,4 +359,4 @@ being executed, and was wrong in three independent ways when it finally was.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
