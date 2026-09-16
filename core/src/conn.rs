@@ -212,6 +212,30 @@ pub const MAX_CONCURRENT_STREAMS: u32 = 256;
 /// latency that is whatever the overload decides.
 pub const MAX_PENDING: usize = 128;
 
+/// How the pool decides to open an *additional* connection to a backend.
+///
+/// This exists as a choice rather than a constant because the choice was made on
+/// a measurement, and a measurement nobody can re-run is an assertion. `Eager` is
+/// the policy this proxy shipped through week 8; `Queue` replaced it. Keeping
+/// both reachable from one binary is what lets `bench/confirm.sh` run them
+/// interleaved, which is the only way the difference between them can be
+/// separated from the machine they are measured on.
+///
+/// The same argument is why `H2PROXYD_GUARD_OBSERVE_ONLY` exists: a mitigation
+/// you cannot turn off is a mitigation whose cost you cannot state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PoolGrowth {
+    /// Open another connection only when every existing one is **failing to
+    /// cope** — a queue deep enough that it is not draining. The default.
+    #[default]
+    Queue,
+    /// Open another connection as soon as every existing one is at the backend's
+    /// `MAX_CONCURRENT_STREAMS`. Retained for measurement only: it treats a
+    /// protocol limit as a throughput signal, which is the defect
+    /// [`Pool::checkout`](crate::pool::Pool::checkout) documents.
+    Eager,
+}
+
 /// The sizes a deployment may tune, in one place.
 ///
 /// These three were compile-time constants through week 7, reasoned from the
@@ -243,6 +267,11 @@ pub struct Tuning {
     /// the others: the queue is only ever entered once the backend's concurrency
     /// limit is reached, so what this bounds is the overshoot past that limit.
     pub max_pending: usize,
+    /// When the pool opens an additional connection to a backend. Grouped here
+    /// with the rest because it is the same kind of knob: it trades sockets and
+    /// concurrency against latency, and the trade is only defensible with a
+    /// number attached.
+    pub growth: PoolGrowth,
 }
 
 impl Default for Tuning {
@@ -252,6 +281,7 @@ impl Default for Tuning {
             stream_window: STREAM_INITIAL_WINDOW,
             max_concurrent_streams: MAX_CONCURRENT_STREAMS,
             max_pending: MAX_PENDING,
+            growth: PoolGrowth::Queue,
         }
     }
 }

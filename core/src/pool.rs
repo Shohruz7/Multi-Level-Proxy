@@ -349,18 +349,32 @@ impl Pool {
         // giving it a sibling does not make it finish sooner. What it does is
         // admit another 200 streams to the same backend, and by Little's law
         // concurrency that buys no throughput is bought entirely with latency.
-        // Measured at 30,000 req/s on the dev box, raising the ceiling from 1 to
-        // 8 moved p99 from 21 ms to 297 ms while *lowering* delivered rate —
-        // worse on both axes, for more sockets.
         //
-        // So the question asked here is whether the existing connections are
-        // failing to cope, which is what a queue that will not drain looks like.
-        let threshold = self.queue_threshold();
-        let coping = pool.conns.iter().any(|record| !record.backed_up(threshold));
+        // How much that is worth is an open question at this commit, and the
+        // point of making the old policy reachable is to be able to answer it
+        // rather than assert it:
+        //
+        //     H2PROXYD_POOL_GROWTH=eager|queue
+        //
+        // An earlier version of these lines answered it from one pair of runs -
+        // "raising the ceiling from 1 to 8 moved p99 from 21 ms to 297 ms" - and
+        // that number is not quoted here until something can reproduce it.
+        //
         // The first connection is not a growth decision — there is nothing to
-        // reuse and nothing to have an opinion about yet.
+        // reuse and nothing to have an opinion about yet. Past that, `Queue`
+        // asks whether the existing connections are failing to cope, which is
+        // what a queue that will not drain looks like, and `Eager` asks only
+        // whether they are full.
         let first = pool.conns.is_empty();
-        if pool.conns.len() < self.max_conns_per_backend && (first || !coping) {
+        let grow = first
+            || match self.tuning.growth {
+                crate::conn::PoolGrowth::Eager => true,
+                crate::conn::PoolGrowth::Queue => {
+                    let threshold = self.queue_threshold();
+                    !pool.conns.iter().any(|record| !record.backed_up(threshold))
+                }
+            };
+        if pool.conns.len() < self.max_conns_per_backend && grow {
             let record = self.open(*backend, now_ms);
             pool.conns.push(Arc::clone(&record));
             return Ok(record.lease(now_ms));
@@ -508,6 +522,7 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conn::PoolGrowth;
 
     fn backend(port: u16) -> Backend {
         Backend::new(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
@@ -680,5 +695,72 @@ mod tests {
             "the ceiling still bounds connections",
         );
         drop(queued);
+    }
+
+    // ---------------------------------------------------------------------
+    // The growth policies, pinned against each other
+    // ---------------------------------------------------------------------
+    //
+    // `PoolGrowth::Eager` is not on any production path — it exists so that
+    // `bench/confirm.sh` can measure the default against the policy it replaced,
+    // from one binary with one flag different. That makes it exactly the kind of
+    // code that rots silently, so these two tests state the difference between
+    // the arms rather than merely exercising each. If they ever agree, the A/B
+    // in `bench/confirm.csv` is measuring nothing and the artifact is void.
+
+    fn pool_with_growth(growth: PoolGrowth) -> Pool {
+        Pool::new(Arc::new(ProxyStats::default()), 4).with_tuning(crate::conn::Tuning {
+            growth,
+            ..crate::conn::Tuning::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn eager_growth_gives_a_coping_connection_a_sibling() {
+        // The same situation as
+        // `a_full_connection_that_is_keeping_up_does_not_get_a_sibling`: full at
+        // the backend's limit, and draining. The default leaves it alone; the
+        // policy it replaced opens a socket, because the only question it asks
+        // is whether the connection is full.
+        let pool = pool_with_growth(PoolGrowth::Eager);
+        let first = pool.checkout(&backend(4)).expect("a lease");
+        first.record.set_max_concurrent(1);
+        first.record.set_queued(0);
+
+        let _second = pool.checkout(&backend(4)).expect("a second lease");
+        assert_eq!(
+            pool.connection_count(),
+            2,
+            "eager growth treats MAX_CONCURRENT_STREAMS as a throughput signal, \
+             which is the whole defect being measured",
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_growth_and_eager_growth_disagree_on_the_same_connection() {
+        // The arms stated side by side, so that a change to either is a change
+        // to a failing test rather than to a silently smaller effect.
+        let mut counts = Vec::new();
+        for growth in [PoolGrowth::Queue, PoolGrowth::Eager] {
+            let pool = pool_with_growth(growth);
+            let first = pool.checkout(&backend(5)).expect("a lease");
+            first.record.set_max_concurrent(1);
+            first.record.set_queued(0);
+            let _second = pool.checkout(&backend(5)).expect("a second lease");
+            counts.push(pool.connection_count());
+        }
+        assert_eq!(
+            counts,
+            vec![1, 2],
+            "queue growth must absorb where eager growth expands",
+        );
+    }
+
+    #[test]
+    fn the_default_growth_policy_is_queue() {
+        // The one that matters for anything shipped: a stray
+        // `H2PROXYD_POOL_GROWTH` in an environment file must be the only way to
+        // get the old policy.
+        assert_eq!(crate::conn::Tuning::default().growth, PoolGrowth::Queue);
     }
 }

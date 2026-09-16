@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use h2proxy_core::conn::{Connection, DrainPolicy, Tuning};
+use h2proxy_core::conn::{Connection, DrainPolicy, PoolGrowth, Tuning};
 use h2proxy_core::guard::Limits;
 use h2proxy_core::health;
 use h2proxy_core::lb::Backend;
@@ -567,6 +567,7 @@ fn tuning() -> Tuning {
         )
         .max(1),
         max_pending: env_num("H2PROXYD_MAX_PENDING", d.max_pending as i64).max(0) as usize,
+        growth: pool_growth(d.growth),
     };
     if tuning != d {
         info!(
@@ -574,10 +575,35 @@ fn tuning() -> Tuning {
             stream_window = tuning.stream_window,
             max_concurrent_streams = tuning.max_concurrent_streams,
             max_pending = tuning.max_pending,
+            growth = ?tuning.growth,
             "flow control tuned away from the defaults",
         );
     }
     tuning
+}
+
+/// `H2PROXYD_POOL_GROWTH=queue|eager` — when the pool opens another upstream
+/// connection. See [`PoolGrowth`]; `bench/confirm.sh` drives both arms.
+///
+/// An unrecognised value warns and keeps the default rather than refusing to
+/// start. A benchmark knob that can prevent the daemon from booting is a knob
+/// that will one day prevent it from booting in production, and the failure
+/// mode of guessing wrong here is a slower proxy rather than an unsafe one.
+fn pool_growth(fallback: PoolGrowth) -> PoolGrowth {
+    match std::env::var("H2PROXYD_POOL_GROWTH") {
+        Err(_) => fallback,
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "queue" => PoolGrowth::Queue,
+            "eager" => PoolGrowth::Eager,
+            other => {
+                warn!(
+                    value = other,
+                    "H2PROXYD_POOL_GROWTH must be 'queue' or 'eager'; keeping the default"
+                );
+                fallback
+            }
+        },
+    }
 }
 
 /// Health-checking and ejection policy (design doc §5.2).
