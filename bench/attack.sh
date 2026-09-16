@@ -115,4 +115,18 @@ curl -s "$METRICS" | grep -E "^h2proxy_(backends_healthy|backend_ejections_total
 kill $be1 $be2 $proxy_pid 2>/dev/null || true
 
 echo | tee -a "$OUT"
+
+# Promote, like every other harness here, so the resilience table in README.md
+# has a committed file behind it rather than a number someone transcribed.
+#
+# This was the one harness without a promotion step, and the cost of that was
+# concrete: the only attack artifact left on disk was a *pre-fix* run showing
+# 36,632 5xx, sitting two directories away from a table claiming zero. An
+# artifact that is never promoted is not neutral - it is a stale contradiction
+# waiting for a reader to find.
+if [ "${PROMOTE:-1}" = "1" ]; then
+  cp "$OUT" "$HERE/attack.txt"
+  echo "promoted to bench/attack.txt - the run behind the resilience table" >&2
+fi
+
 echo "written: $OUT" >&2

@@ -208,3 +208,11 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 echo "soak clean: nothing grew, everything settled to zero."
+
+# Only a clean soak is promoted. A failing one is a bug report, not evidence,
+# and the exit above has already taken us out of the script by the time we get
+# here — so reaching this line is itself the condition.
+if [ "${PROMOTE:-1}" = "1" ]; then
+  cp "$LOG" "$HERE/soak.txt"
+  echo "promoted to bench/soak.txt - the run behind the soak row" >&2
+fi
