@@ -425,6 +425,34 @@ fn spawn_stats_sampler(shared: &Arc<Shared>) {
                     .healthy_count(&shared.backends, Instant::now()) as f64,
             );
 
+            // Per-connection state, reduced to the extremes.
+            //
+            // The extremes rather than the mean, because the questions these
+            // answer are about the *worst* connection: one starved reader among
+            // eight healthy ones is invisible in an average and is exactly the
+            // failure being looked for. The pool's own `conn_snapshots` clears
+            // the high-water marks as it reads them, so each sample describes
+            // the last second rather than all of history.
+            let snaps = shared.pool.conn_snapshots();
+            if !snaps.is_empty() {
+                let worst_read_ratio = snaps
+                    .iter()
+                    .filter_map(|s| s.read_ratio())
+                    .fold(f64::INFINITY, f64::min);
+                // `INFINITY` means no connection ran a pass this second - every
+                // one of them was parked. That is an idle proxy, not a starved
+                // one, and publishing 0.0 for it would be a false alarm.
+                if worst_read_ratio.is_finite() {
+                    metrics::gauge!("h2proxy_upstream_read_ratio_min").set(worst_read_ratio);
+                }
+                metrics::gauge!("h2proxy_upstream_conn_queue_peak")
+                    .set(snaps.iter().map(|s| s.queued_peak).max().unwrap_or(0) as f64);
+                metrics::gauge!("h2proxy_upstream_conn_out_peak_bytes")
+                    .set(snaps.iter().map(|s| s.out_peak).max().unwrap_or(0) as f64);
+                metrics::gauge!("h2proxy_upstream_conn_streams_max")
+                    .set(snaps.iter().map(|s| s.live).max().unwrap_or(0) as f64);
+            }
+
             // Counters: monotonic totals. `absolute` rather than `increment`
             // because the engine owns the running value — this republishes it
             // rather than trying to track deltas, which would drift on every
@@ -692,6 +720,31 @@ fn init_metrics() {
         "h2proxy_upstream_streams_active",
         "Streams currently in flight to backends"
     );
+    // Per-connection state, reduced to the worst connection. These exist because
+    // the week-9 latency cliff was argued for a dozen experiments before it was
+    // measured, and most of what was being argued about is on this list.
+    //
+    // `read_ratio_min` is the one that settles the read-starvation question: a
+    // `biased` select that puts writes and the inbox ahead of the socket read
+    // starves reads only when there is always a write and always a message
+    // pending, which is a statement about a ratio and cannot be settled by
+    // reading the code.
+    metrics::describe_gauge!(
+        "h2proxy_upstream_read_ratio_min",
+        "Lowest fraction of I/O-loop passes spent reading, across upstream connections"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_upstream_conn_queue_peak",
+        "Deepest wait-for-a-slot queue on any one upstream connection in the last sample"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_upstream_conn_out_peak_bytes",
+        "Most octets queued for writing on any one upstream connection in the last sample"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_upstream_conn_streams_max",
+        "Most streams in flight on any one upstream connection"
+    );
     // The bounded-memory claim, as a number you can watch: response octets held
     // between a backend and a client because the client has not taken them yet.
     // Under a fast-upstream/slow-client mismatch this stays flat at roughly one
@@ -807,6 +860,14 @@ fn init_metrics() {
     metrics::counter!("h2proxy_requests_total").increment(0);
     metrics::gauge!("h2proxy_upstream_pool_connections").set(0.0);
     metrics::gauge!("h2proxy_upstream_streams_active").set(0.0);
+    // `h2proxy_upstream_read_ratio_min` is deliberately *not* seeded. Zero on
+    // that series means "some connection did no reading at all", which is the
+    // alarm condition; publishing it before any traffic exists would be a
+    // standing false alarm. Absent-until-there-is-data is the honest default for
+    // a gauge whose zero is meaningful.
+    metrics::gauge!("h2proxy_upstream_conn_queue_peak").set(0.0);
+    metrics::gauge!("h2proxy_upstream_conn_out_peak_bytes").set(0.0);
+    metrics::gauge!("h2proxy_upstream_conn_streams_max").set(0.0);
     metrics::gauge!("h2proxy_bridge_buffered_bytes").set(0.0);
     metrics::gauge!("h2proxy_bridge_buffered_bytes_peak").set(0.0);
     metrics::counter!("h2proxy_upstream_connects_total").absolute(0);

@@ -658,6 +658,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> UpstreamConnection<IO>
         };
 
         self.out.advance(wrote);
+        // One pass of the loop, recorded where every arm has already resolved so
+        // that `heard` means what it says: the read arm is the one that fired.
+        if let Some(record) = &self.record {
+            record.note_pass(heard, self.out.len());
+        }
         if heard {
             self.probe.heard(Instant::now());
         }

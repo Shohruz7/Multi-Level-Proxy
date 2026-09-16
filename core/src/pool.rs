@@ -96,6 +96,68 @@ pub struct UpstreamRecord {
     /// the protocol; this says whether the queue behind that limit is draining,
     /// which is the fact about throughput the pool actually needs.
     queued: AtomicUsize,
+
+    // --- observability ------------------------------------------------------
+    //
+    // These exist because the latency cliff took roughly a dozen experiments to
+    // explain, and most of them were spent establishing facts the connection
+    // task already knew and had no way to say. Six hypotheses were eliminated by
+    // measurement; four of those measurements would have been a glance at a
+    // gauge if these had existed.
+    //
+    // All relaxed, all written by the one task that owns the connection, and all
+    // read by a 1 s sampler. Nothing here is control flow - if these numbers are
+    // torn or stale, the proxy behaves identically.
+    /// Passes through the connection's select loop.
+    loop_passes: AtomicU64,
+    /// Passes in which the socket-read arm was the one that fired.
+    ///
+    /// The ratio of this to `loop_passes` is the number the read-starvation
+    /// argument was missing. A `biased` select that puts writes and the inbox
+    /// ahead of reads starves reads exactly when there is always a write and
+    /// always a message - and "exactly then" is a claim about a ratio, which is
+    /// why arguing about it went nowhere until it could be read off a gauge.
+    loop_reads: AtomicU64,
+    /// High-water queue depth since the last sample.
+    ///
+    /// A high-water mark rather than an instantaneous read, and **reset when
+    /// sampled**, matching `ProxyStats::peak_buffered`. A 1 s sampler against a
+    /// live value cannot see a 300 ms excursion; it aliases it away, and the
+    /// excursion is the whole phenomenon.
+    queued_peak: AtomicUsize,
+    /// High-water octets waiting in the connection's write buffer, same rule.
+    out_peak: AtomicUsize,
+}
+
+/// One upstream connection's counters, read at a moment.
+///
+/// A plain value rather than a borrow of the record: the caller is a metrics
+/// sampler holding the pool mutex for as short a time as it can manage, and
+/// handing out references would hold it for as long as the caller took to format
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnSnapshot {
+    pub live: usize,
+    pub queued: usize,
+    /// High-water queue depth since the previous snapshot.
+    pub queued_peak: usize,
+    /// High-water write-buffer occupancy since the previous snapshot, in octets.
+    pub out_peak: usize,
+    pub loop_passes: u64,
+    pub loop_reads: u64,
+}
+
+impl ConnSnapshot {
+    /// The fraction of loop passes in which this connection read its socket.
+    ///
+    /// `None` when the connection has not run a pass since the last sample,
+    /// which is different from a ratio of zero: an idle connection parked on its
+    /// sockets is healthy, and reporting it as 0.0 would make idleness look like
+    /// starvation. The distinction matters because the metric exists to find
+    /// starvation.
+    pub fn read_ratio(&self) -> Option<f64> {
+        (self.loop_passes > 0).then(|| self.loop_reads as f64 / self.loop_passes as f64)
+    }
 }
 
 impl UpstreamRecord {
@@ -108,6 +170,10 @@ impl UpstreamRecord {
             closed: AtomicBool::new(false),
             last_used_ms: AtomicU64::new(now_ms),
             queued: AtomicUsize::new(0),
+            loop_passes: AtomicU64::new(0),
+            loop_reads: AtomicU64::new(0),
+            queued_peak: AtomicUsize::new(0),
+            out_peak: AtomicUsize::new(0),
         }
     }
 
@@ -136,6 +202,38 @@ impl UpstreamRecord {
     /// connection task whenever the queue changes.
     pub fn set_queued(&self, depth: usize) {
         self.queued.store(depth, Ordering::Relaxed);
+        self.queued_peak.fetch_max(depth, Ordering::Relaxed);
+    }
+
+    /// Read the observability counters, clearing the high-water marks.
+    ///
+    /// `swap(0)` on the peaks is what makes them "since the last sample" rather
+    /// than "since the connection opened". A mark that never resets converges on
+    /// the worst moment of the process's life and then never moves again, which
+    /// tells you that something once happened and nothing about whether it still
+    /// does.
+    fn snapshot(&self) -> ConnSnapshot {
+        ConnSnapshot {
+            live: self.live.load(Ordering::Relaxed),
+            queued: self.queued.load(Ordering::Relaxed),
+            queued_peak: self.queued_peak.swap(0, Ordering::Relaxed),
+            out_peak: self.out_peak.swap(0, Ordering::Relaxed),
+            loop_passes: self.loop_passes.swap(0, Ordering::Relaxed),
+            loop_reads: self.loop_reads.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    /// Record one pass of the connection's I/O loop.
+    ///
+    /// Called by the connection task once per pass, after the select resolves.
+    /// Two relaxed increments and two `fetch_max`es on a path that has just done
+    /// a syscall, so the cost is not measurable against it.
+    pub fn note_pass(&self, read: bool, out_len: usize) {
+        self.loop_passes.fetch_add(1, Ordering::Relaxed);
+        if read {
+            self.loop_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.out_peak.fetch_max(out_len, Ordering::Relaxed);
     }
 
     fn queued(&self) -> usize {
@@ -462,6 +560,27 @@ impl Pool {
     }
 
     /// Warm connections currently held, for the pool-utilization gauge (§7).
+    /// One live sample per upstream connection.
+    ///
+    /// Sampled from the connections that exist *now*, never accumulated at
+    /// connection close. That distinction is not pedantry: it is the bug
+    /// `h2proxy_stream_concurrency_max` had, which set its value from a
+    /// connection's summary at teardown and therefore read `1` against a proxy
+    /// carrying thousands of streams. During a benchmark every connection is
+    /// still open, which is the entire point of HTTP/2, so a gauge that only
+    /// moves at teardown answers no question about steady state.
+    pub fn conn_snapshots(&self) -> Vec<ConnSnapshot> {
+        let now_ms = self.now_ms();
+        self.backends
+            .lock()
+            .expect("pool mutex poisoned")
+            .values()
+            .flat_map(|pool| pool.conns.iter())
+            .filter(|record| record.usable(now_ms, self.idle_timeout_ms))
+            .map(|record| record.snapshot())
+            .collect()
+    }
+
     pub fn connection_count(&self) -> usize {
         let now_ms = self.now_ms();
         self.backends
