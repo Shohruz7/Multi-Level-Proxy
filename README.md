@@ -279,13 +279,16 @@ corrections they have forced are in
 
 | | |
 |---|---|
-| **14,110 concurrent streams** | held in **74.9 MB** RSS, from a 5.6 MB idle process |
-| Marginal cost of a stream | **3,126 bytes**, least squares over a four-point sweep |
-| Response octets held in the bridge, ever | **4,096 bytes** — one page, under 20,000 in-flight requests |
+| **24,904 concurrent streams** | held in **103 MB** RSS, from a 5.6 MB idle process |
+| Failed requests and 5xx, across 18 runs from 959 to 30,702 streams | **0** |
+| Marginal cost of a stream | **2,865 bytes**, least squares over a six-point sweep |
+| Response octets held in the bridge, ever | **4,096 bytes** — one page, at 60,000 offered in-flight requests |
 
 500 connections held fixed while streams per connection are swept, so the cost
-of a connection and the cost of a stream are separated rather than averaged
-together. Three repeats, from [`bench/memory.csv`](bench/memory.csv).
+of a connection and the cost of a stream are separated rather than averaged.
+Medians of three repeats; the runs behind the headline range 21,691 to 30,702,
+since more offered concurrency means more queueing and more variance. From
+[`bench/memory.csv`](bench/memory.csv).
 
 ### Resilience, measured
 

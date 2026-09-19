@@ -131,11 +131,16 @@ run_one() {
   local settled; settled="$(rss_kb "$proxy_pid")"
 
   local m; m="$(curl -s --max-time 2 "http://$METRICS/metrics" || true)"
-  local streams_peak bridge_peak shed live
+  local streams_peak bridge_peak shed live fivexx
   streams_peak="$(metric h2proxy_client_streams_peak "$m")"
   bridge_peak="$(metric h2proxy_bridge_buffered_bytes_peak "$m")"
   shed="$(metric h2proxy_upstream_shed_total "$m")"
   live="$(metric h2proxy_client_streams_active "$m")"
+  # Recorded because shedding and *failing* are different events: a shed
+  # request that a retry carries to another connection costs latency and is
+  # invisible to the client, and the difference between those two is the whole
+  # bar this harness is measured against.
+  fivexx="$(awk '/^h2proxy_responses_total\{class="5xx"\}/{print $2; exit}' <<<"$m")"
 
   local completed failed achieved
   IFS=, read -r _ _ _ _ _ completed failed achieved _ <<<"$out"
@@ -143,10 +148,10 @@ run_one() {
   [ -n "${proxy_pid:-}" ] && kill "$proxy_pid" 2>/dev/null || true
   [ -n "${backend_pid:-}" ] && kill "$backend_pid" 2>/dev/null || true
 
-  echo "$CONNS,$streams,$repeat,${idle:-NA},${peak:-NA},${settled:-NA},${streams_peak:-NA},${bridge_peak:-NA},${live:-NA},${achieved:-NA},${completed:-NA},${failed:-NA},${shed:-0}"
+  echo "$CONNS,$streams,$repeat,${idle:-NA},${peak:-NA},${settled:-NA},${streams_peak:-NA},${bridge_peak:-NA},${live:-NA},${achieved:-NA},${completed:-NA},${failed:-NA},${shed:-0},${fivexx:-0}"
 }
 
-echo "conns,streams_per_conn,repeat,idle_rss_kb,peak_rss_kb,settled_rss_kb,peak_streams,peak_bridge_bytes,live_after,achieved_rps,completed,failed,shed" > "$CSV"
+echo "conns,streams_per_conn,repeat,idle_rss_kb,peak_rss_kb,settled_rss_kb,peak_streams,peak_bridge_bytes,live_after,achieved_rps,completed,failed,shed,responses_5xx" > "$CSV"
 
 echo "$CONNS connections, streams per connection: $STREAM_STEPS, $REPEATS repeats" >&2
 for repeat in $(seq 1 "$REPEATS"); do
@@ -181,6 +186,8 @@ awk -F, '
     streams[key, c[key]] = $7
     bridge[key, c[key]] = $8
     fail[key] += $12
+    shed[key] += $13
+    five[key] += $14
   }
   function median(key, series,   i, a, cnt, x, j) {
     cnt = c[key]
@@ -193,15 +200,16 @@ awk -F, '
     return a[int((cnt + 1) / 2)]
   }
   END {
-    printf "%8s %6s %10s %10s %11s %10s %12s %7s\n", \
-      "per-conn", "runs", "idle_MB", "peak_MB", "settled_MB", "streams", "bridge_B", "failed"
+    printf "%8s %6s %10s %10s %11s %10s %12s %7s %5s %8s\n", \
+      "per-conn", "runs", "idle_MB", "peak_MB", "settled_MB", "streams", \
+      "bridge_B", "failed", "5xx", "shed"
     for (i = 1; i <= n; i++) {
       k = order[i]
       mi = median(k, idle); mp = median(k, peak)
       ms = median(k, settled); mst = median(k, streams)
       mb = median(k, bridge)
-      printf "%8s %6d %10.1f %10.1f %11.1f %10d %12d %7d\n", \
-        k, c[k], mi/1024, mp/1024, ms/1024, mst, mb, fail[k]
+      printf "%8s %6d %10.1f %10.1f %11.1f %10d %12d %7d %5d %8d\n", \
+        k, c[k], mi/1024, mp/1024, ms/1024, mst, mb, fail[k], five[k], shed[k]
       sx += mst; sy += (mp - mi); sxx += mst * mst; sxy += mst * (mp - mi); np++
     }
     print ""

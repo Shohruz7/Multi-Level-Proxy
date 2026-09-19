@@ -487,46 +487,75 @@ in-flight requests buy queue depth, not throughput.
 The first goal in the README is bounded memory under any speed mismatch. It had
 a test behind it (`a_slow_client_throttles_a_fast_backend_instead_of_filling_memory`)
 and, until now, no number. [`bench/memory.sh`](../bench/memory.sh), promoted to
-[`bench/memory.csv`](../bench/memory.csv), 500 connections held fixed while
-streams per connection are swept, three repeats, sweep direction alternating:
+[`bench/memory.csv`](../bench/memory.csv): 500 connections held fixed while
+streams per connection are swept, three repeats, sweep direction alternating.
 
-| streams/conn | peak streams | idle RSS | peak RSS | bridge held, ever | failed |
-|---|---:|---:|---:|---:|---:|
-| 2 | 964 | 5.6 MB | 37.2 MB | 2,048 B | 0 |
-| 8 | 3,122 | 5.6 MB | 44.6 MB | 3,072 B | 0 |
-| 20 | 8,407 | 5.5 MB | 67.3 MB | 4,096 B | 15 |
-| 40 | **14,110** | 5.6 MB | **74.9 MB** | **4,096 B** | **0** |
+| streams/conn | peak streams | idle RSS | peak RSS | bridge held, ever | failed | 5xx | shed |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 959 | 5.6 MB | 37.1 MB | 2,048 B | 0 | 0 | 0 |
+| 8 | 3,102 | 5.5 MB | 44.4 MB | 3,072 B | 0 | 0 | 0 |
+| 20 | 8,102 | 5.6 MB | 66.1 MB | 3,072 B | 0 | 0 | 0 |
+| 40 | 14,103 | 5.6 MB | 78.7 MB | 3,072 B | 0 | 0 | 1,686 |
+| 80 | 18,120 | 5.5 MB | 86.8 MB | 4,096 B | 0 | 0 | 365 |
+| **120** | **24,904** | 5.5 MB | **103.3 MB** | 3,072 B | **0** | **0** | 8,367 |
 
-Least squares over the four points puts the marginal cost of a stream at
-**3,126 bytes**, on a fixed cost of 5.6 MB. Connections are held fixed and
-streams swept precisely so that those two can be separated: peak RSS divided by
-peak streams would fold 500 TLS connections and their record buffers into a
-number reported as the price of a stream, and would flatter or damn the proxy
-depending only on the shape picked.
+Medians of three. **Zero failed requests and zero 5xx in all eighteen runs.**
+Least squares over the six points puts the marginal cost of a stream at
+**2,865 bytes**, on a fixed cost of 5.6 MB.
 
-**The bridge never held more than one page.** Under 20,000 in-flight requests
-the high-water mark of response octets received from backends and not yet
-delivered to clients is 4,096 bytes. That is the bounded-memory claim stated as
-a measurement rather than as a test name. The complementary case - a client that
-stops reading entirely, where the bridge is *supposed* to fill to the window and
-stop - is the backpressure test, not this table.
+**The earlier ceiling was the harness, not the proxy.** Every concurrency figure
+in this project came from 500 x 40 or below, a shape described throughout as
+"overloaded". It is not: at 500 x 40 the proxy holds 14,103 streams and shows no
+client-visible failure, and it goes on doing that to 24,904. Nothing in the
+proxy changed to produce these numbers - no constant, no policy, not one line of
+`core/` or `h2proxyd/` - the load was simply never turned up far enough to find
+the edge. The old numbers were not wrong about what they measured; they were
+measurements of the benchmark.
+
+**Shedding is not failing, and the distinction is now recorded rather than
+inferred.** `shed` counts a request the pool refused because a connection's
+wait-for-a-slot queue was full; the retry path carries it to another connection.
+At 500 x 120 that happened 8,367 times and no client saw anything: `failed` and
+`responses_5xx` are both zero. Reading `shed` as an error rate would badly
+misreport this proxy, which is why the two sit in adjacent columns.
+
+**The spread widens with the load, and the medians hide it.** At 500 x 2 the
+three repeats read 959 / 977 / 949 streams, inside 3%. At 500 x 120 they read
+30,702 / 24,904 / 21,691 - a 41% spread around the median quoted above. More
+offered concurrency means more queueing and more variance in what is resident at
+any instant, so the honest form of the headline is *a median of 24,904 with runs
+between 21,691 and 30,702*, not a single figure.
+
+**Connections are held fixed and streams swept** precisely so the two costs
+separate: peak RSS over peak streams would fold 500 TLS connections and their
+record buffers into a number reported as the price of a stream, and would
+flatter or damn the proxy depending only on the shape picked. The intercept is
+the connections, the slope is the streams. The slope is not constant either -
+fitted over 2 to 40 it is 3,126 bytes and over 80 to 120 it is 1,691, so
+per-stream cost amortises as the table fills.
+
+**The bridge never held more than one page.** Across every shape, including
+60,000 offered in-flight requests at 500 x 120, the high-water mark of response
+octets received from backends and not yet delivered to clients is 4,096 bytes.
+That is the bounded-memory claim as a measurement rather than as a test name.
+The complementary case - a client that stops reading entirely, where the bridge
+is *supposed* to fill to the window and stop - is the backpressure test, not
+this table.
 
 **`settled` is not a leak check.** Resident memory after the load stops tracks
-the peak to within a few tens of KiB (74.9 -> 75.0 MB), because a
-general-purpose allocator keeps freed pages rather than returning them. Paired
-with the active-stream gauge reading 0, it says the process is holding address
-space, not request state. Growth *across* cycles is what a leak looks like, and
-that is `bench/soak.sh`: five minutes, a backend killed every 30 s, RSS
-plateaued at +1.9%.
+the peak to within tens of KiB, because a general-purpose allocator keeps freed
+pages rather than returning them. Paired with the active-stream gauge reading 0,
+it says the process is holding address space, not request state. Growth *across*
+cycles is what a leak looks like, and that is `bench/soak.sh`: five minutes, a
+backend killed every 30 s, RSS plateaued at +1.9%.
 
-**These numbers are quotable from this machine in a way the rates are not.**
-In the very same runs, achieved throughput at 500 x 2 varied 25,207 / 30,609 /
-37,501 req/s - a 48% spread - while peak streams read 964 / 964 / 989 and peak
-RSS 37.2 / 37.9 / 38.0 MB, both inside 3%. Resident memory is set by what the
-process is holding; a rate is set by how fast the cores are willing to run, and
-on this laptop that is a function of how long it has been running. Any figure
-in this file that is a rate carries the thermal caveat recorded in the
-2026-09-19 correction. The ones in this section do not.
+**These numbers are quotable from this machine in a way the rates are not.** In
+the same runs, achieved throughput at 500 x 2 varied 24,560 / 36,856 / 39,304
+req/s - a 60% spread - while peak RSS read 37.9 / 37.9 / 38.1 MB, inside 1%.
+Resident memory is set by what the process is holding; a rate is set by how fast
+the cores are willing to run, and on this laptop that is a function of how long
+it has been running. Every rate in this file carries the thermal caveat recorded
+in the 2026-09-19 correction. The memory column does not.
 
 ## Tuning pass 1 — flow-control windows
 
