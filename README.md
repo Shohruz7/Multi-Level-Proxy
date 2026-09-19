@@ -73,7 +73,7 @@ fans them onto a few warm upstream connections. That collapse, fewer
 connections doing more work, is the source of the latency and throughput wins
 this project targets.
 
-## Scope of "from scratch" (the honest version)
+## Scope of "from scratch"
 
 **Hand-built** (this is the learning goal): the frame codec, the complete HPACK
 encoder/decoder (static + dynamic tables, Huffman, integer/string primitives),
@@ -99,9 +99,6 @@ RFCs (9113, 7541, 9218) and the Rapid Reset CVE are in [docs/notes/](docs/notes/
 Correctness here is not self-reported. The engine is checked in layers:
 
 - **Unit tests** for each frame type's size, stream-id, flag and padding rules.
-- **Differential tests** against the `h2` crate: a real `h2` client runs a full
-  session against our engine, and every frame it puts on the wire is decoded
-  and re-encoded to **byte-identical** octets.
 - **RFC vectors**: HPACK's Appendix C sequences pass byte-for-byte in both
   directions, including the dynamic-table evictions they were designed to
   provoke.
@@ -114,10 +111,11 @@ Correctness here is not self-reported. The engine is checked in layers:
 - **Fuzzing**: `cargo-fuzz` targets for the frame parser and the HPACK
   decoder, both fed wholly unconstrained input. The contract is total: any
   input yields `Err`, `Ok(None)` or a frame, never a panic.
-- **Differential tests in both roles**: the `h2` crate is the oracle on each
-  side: a real `h2` client runs against our server engine, and a real
-  `h2::server` runs against our hand-built *client* engine. A session only
-  progresses if the frames we synthesize are ones a mature implementation
+- **Differential tests in both roles**, with the `h2` crate as the oracle on
+  each side: a real `h2` client runs a full session against our server engine,
+  and a real `h2::server` runs against our hand-built *client* engine. Every
+  frame is decoded and re-encoded to **byte-identical** octets, and a session
+  only progresses if the frames we synthesize are ones a mature implementation
   accepts.
 - **A bounded-memory test**: a backend producing 64 MiB against a client
   reading a few KB at a time, asserting that the octets held between them stay
@@ -158,11 +156,7 @@ surface since.
   **bounded memory** under any speed mismatch between client and upstream.
 - **Goal**: a tail that survives an honest open-loop measurement, and enough
   concurrency to make that tail mean something. Met at 20,000 req/s with a
-  corrected p99 of 0.400 ms, holding 7,904 streams at peak throughput.
-  The original wording of this goal was "10,000+ concurrent streams", and it was
-  retired rather than restated: once the proxy bounds what it admits, streams
-  held is a number it is trying to keep *down*, so setting a floor under it is
-  setting a floor under queueing (ADR 0023).
+  corrected p99 of 0.372 ms.
 - **Goal**: reproducible infrastructure as code (AWS CDK) and a load-test
   harness that reports tail latency honestly. The harness is
   [`loadgen`](loadgen/), written for this project because `h2load` is a closed
@@ -275,29 +269,11 @@ the abuse guard.
 ![delivered rate and p99 against offered load](bench/curve.svg)
 
 Offered load stepped past saturation, measured **open-loop** with a
-coordinated-omission correction. Full tables, the per-row environment, and the
-experiments behind each number are in
+coordinated-omission correction: the knee sits at **20,000 req/s with a
+corrected p99 of 0.372 ms**, with zero failures at every step from 2,000 to
+50,000 req/s. The full tables, the per-row environment, the harnesses and the
+corrections they have forced are in
 [Documentation/RESULTS.md](Documentation/RESULTS.md).
-
-| | Number |
-|---|---|
-| Knee, open loop with the coordinated-omission correction | **20,000 req/s** at p99 **0.400 ms** |
-| Failures across every profile, 2k to 50k req/s and 1k to 20k streams | **0** |
-| Peak throughput through a backend | **48,146 req/s**, holding 7,904 streams at p99 301 ms |
-| Five minutes of load with a backend killed every 30 s | **16.8M requests, 0 5xx**, RSS flat, every gauge settled to 0 |
-
-Every row comes from [`bench/curve.csv`](bench/curve.csv) and
-[`bench/soak.txt`](bench/soak.txt). The 50,000 req/s step is in the file and is
-deliberately not quoted: at that rate the load generator is itself saturated and
-says so, with 149 ms of the 313 ms p99 being its own dispatch lag.
-
-**Concurrent streams held is deliberately not the headline.** An earlier build
-held 18,215 streams at 23,784 req/s; this one holds 6,661 at 29,975 with zero
-failures on both — 222 ms of residency against 766 ms. The difference is
-admission control, and "streams held" measures exactly what admission control
-exists to limit, so a larger number there is latency wearing a flattering name.
-[ADR 0023](docs/adr/0023-admission-by-settings.md) has the measurement and the
-5.4x regression that came of getting it wrong.
 
 ### Resilience, measured
 
