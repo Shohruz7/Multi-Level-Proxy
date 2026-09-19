@@ -53,6 +53,113 @@ size of the correction is reported rather than asserted. It is small while the
 proxy is comfortable and grows into the dominant term as the knee approaches —
 which is exactly where a p99 gets quoted.
 
+> ## Correction (2026-09-19, later): every concurrency number in this file was undercounted, including the one used to retire the concurrency claim
+>
+> The fifth correction, and the first that makes the project look **better** than
+> it had recorded. It is here for the same reason as the other four: the number
+> was wrong.
+>
+> `h2proxy_client_streams_active` is a gauge, and the daemon publishes it once a
+> second. Every concurrency figure in this file was an external scraper's maximum
+> over a handful of one-second samples of an instantaneous quantity, so it could
+> not see any peak that opened and closed between two ticks. Polling it faster
+> does not help — the value on the other side of the scrape only changes at 1 Hz.
+>
+> The engine now counts the high-water mark at every stream open
+> (`h2proxy_client_streams_peak`, with `h2proxy_upstream_streams_peak` beside it
+> as an independently accounted second opinion). Measured in the *same run*:
+>
+> | 500 x 40, one run | sampled at 100 ms | counted at the open |
+> |---|---:|---:|
+> | peak client streams | 7,357 | **19,403** |
+>
+> A factor of 2.6, and always in the same direction: a sampled maximum is a lower
+> bound on the true one.
+>
+> **This invalidates the correction immediately below.** That correction retired
+> the concurrency headline on the finding that the corrected build held 6,661
+> streams where the pre-admission build held 18,215. Both figures came from the
+> sampling method above. The reasoning attached to them — that "concurrent
+> streams held" measures what admission control exists to limit, so the two
+> claims pull against each other — is still sound, and that is why the headline
+> is not simply reinstated. But the *number* it rested on was not measured, and
+> the conclusion that this build cannot hold five figures of streams was wrong.
+>
+> Measured exactly, at the shipping default of 8 upstream connections, three
+> alternating repeats per shape, fresh daemon per run
+> ([`bench/ceiling.csv`](../bench/ceiling.csv)):
+>
+> | offered | achieved req/s | peak streams | failed | 5xx | shed |
+> |---|---:|---:|---:|---:|---:|
+> | 500 x 12 | 47,081 | 4,666 | 0 | 0 | 1,214 |
+> | 500 x 20 | 48,373 | **8,018** | **0** | **0** | **0** |
+> | 500 x 30 | 48,577 | 8,833 | 0 | 0 | 1,878 |
+> | 500 x 40 | 47,085 | 14,051 | 0 | 0 | 37 |
+>
+> **This machine cannot produce a stable absolute number, and the size of the
+> instability is now measured rather than guessed.** The same code, the same
+> script and the same shapes, run earlier in the session as four separate
+> invocations with idle gaps between them, gave 53,711 / 57,569 / 59,913 /
+> 68,582 req/s for those four rows — 12% to 31% higher. The table above is the
+> back-to-back run, twenty-four loads with no time to cool. Nothing changed but
+> the thermal state of a laptop.
+>
+> Two consequences, and they point opposite ways:
+>
+> - **Absolute throughput here is not quotable.** A figure that moves 31% with
+>   nothing but elapsed time is a property of the box. Every absolute number in
+>   this file inherits that caveat; it was always true and is only now
+>   quantified. The fix is a quiet, dedicated machine — the deployment target —
+>   not another run here.
+> - **The stream counts are sturdier than the rates, and one is sturdy.** 500 x
+>   20 gave 8,004 streams in the cool set and 8,018 in the hot one, with zero
+>   failures in both: **the one concurrency figure in this file that has
+>   reproduced across independent runs in two different machine states.** 500 x
+>   40 held 14,115 and 14,051, also close, but it failed requests in one run of
+>   eight and so does not clear the bar. 500 x 30 is the fragile one, 12,974
+>   against 8,833 — because a slower box sheds more (1,878 against 504),
+>   admission halves on shedding, and a proxy that is protecting itself admits
+>   less. That is the control loop working, and it is why residency is not a
+>   number to chase.
+>
+> So the defensible concurrency claim from this machine is **8,018 concurrent
+> streams with zero failed requests**, not the larger figures also measured
+> here. The larger ones are real observations of a proxy on a cool box; they are
+> not reproducible on demand, which is what a quoted number has to be.
+>
+> **`H2PROXYD_MAX_UPSTREAM_CONNS` was raised to 16 and the change was rejected on
+> the measurement.** A first sweep had it roughly doubling streams and raising
+> throughput, but that sweep ran each arm once, in ascending order, back to back
+> on one box, and read concurrency off the 1 Hz gauge. Repeated with alternating
+> arm order, three repeats and exact counting, 16 wins at one shape and loses at
+> the rest:
+>
+> | offered | 8 conns req/s | 16 conns req/s |
+> |---|---:|---:|
+> | 500 x 12 | **53,711** | 35,359 |
+> | 500 x 20 | **57,569** | 53,286 |
+> | 500 x 30 | **59,913** | 58,290 |
+> | 500 x 40 | 68,582 | **83,806** |
+>
+> 34% slower at the shape the proxy is most comfortable at, where the pool does
+> not even reach its new ceiling (11 connections of 16). This is the same error
+> as the one corrected below — a change blessed at 500 x 40 alone — caught this
+> time because the harness now runs more than one shape by default.
+>
+> **A proxy that has already been hurt admits less, and the harness has to say
+> which one it measured.** Admission halves its budget on distress and climbs
+> back at about six percent per tick, so daemon history changes the answer. The
+> same 500 x 40 shape holds 14,115 streams on a freshly started proxy and 8,827
+> when it is reached through `bench/curve.sh`, where one daemon serves thirteen
+> steps in sequence and has been driven into overload by the time the
+> concurrency profile runs. Neither number is wrong. `bench/ceiling.sh` restarts
+> the daemon for every run and is the authority for a concurrency figure; the
+> `streams_peak` column in the curve table below is a floor, for that reason and
+> because its counter is cumulative across steps.
+>
+> The stream counts in every section below this line were produced by the old
+> sampling method and are **lower bounds**, not measurements.
+
 > ## Correction (2026-09-19): the fix for *that* was itself a 5.4x regression
 >
 > The fourth correction in this file, and the pattern is now the subject rather

@@ -265,3 +265,37 @@ refusal.
 - The claim "10,000+ concurrent streams" is once again reachable, and is once
   again a statement about what the proxy will *admit* rather than what it will
   queue.
+
+## Known holes (2026-09-19)
+
+Recorded here rather than left to be rediscovered. None of these is load-bearing
+for the decision above; all three are places where the implementation is weaker
+than the reasoning.
+
+**`MIN_ADMIT` defeats the total bound.** The controlled quantity is the total,
+but what each connection is told is `clamp(total / conns, MIN_ADMIT, ceiling)`.
+The lower clamp is unconditional, so at 10,000 connections the proxy advertises
+at least `10,000 x MIN_ADMIT = 20,000` streams no matter how low `admit_total`
+has been driven. The floor exists so that a connection is never advertised zero
+— which would be a functional deadlock, not a throttle — so it cannot simply be
+removed. The bound is therefore real only while `conns x MIN_ADMIT` is below the
+capacity the loop is steering toward, which is true at every load shape measured
+so far and stops being true in exactly the situation admission exists for.
+
+**A queued request holds its body.** `Tuning::max_pending` is described as a
+bound on overshoot, and it is, but the thing being bounded is not free:
+`upstream.rs` pushes body frames onto `Pending`, so the worst case is
+`conns x max_pending x body_size` rather than `conns x max_pending x header_size`.
+The GET-only benchmarks cannot see this. It is the reason additional capacity
+should be bought with upstream *connections* rather than with a deeper queue,
+and the reason `MAX_PENDING` is derived from the control period rather than
+raised until a benchmark stops complaining.
+
+**Admission is not the binding constraint at the shapes measured.** At 500
+client connections the ceiling is `256 x 500 = 128,000` streams, roughly an
+order of magnitude above anything the pool can hold. Everything the loop does at
+these shapes is therefore invisible, and the measured concurrency is set by pool
+capacity and pool growth instead. This is not an argument for capacity-targeted
+admission — see the rejection recorded in `Shared::recompute_admission`, which
+measured 22,000 req/s against 55,000 — but it does mean a benchmark at these
+shapes proves nothing about the loop, in either direction.
