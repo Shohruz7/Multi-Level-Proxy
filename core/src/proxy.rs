@@ -56,6 +56,11 @@ use tokio::time::Instant;
 pub struct ProxyStats {
     upstream_connections: AtomicUsize,
     upstream_streams: AtomicUsize,
+    /// High-water mark of the above, maintained on every open rather than
+    /// sampled. The independent second opinion on `peak_client_streams`: the
+    /// two count different sides of the same request through different code
+    /// paths, so a claim they disagree about is a claim neither supports.
+    peak_upstream_streams: AtomicUsize,
     connects: AtomicU64,
     connect_failures: AtomicU64,
     requests: AtomicU64,
@@ -70,6 +75,22 @@ pub struct ProxyStats {
     /// `h2proxy_active_streams` gauge, which was described and seeded and never
     /// once written to.
     client_streams: AtomicUsize,
+    /// High-water mark of the above. **This is the concurrency claim as a
+    /// number**, and it exists because the gauge alone could not support one.
+    ///
+    /// `h2proxy_client_streams_active` is published by the daemon's stats
+    /// sampler once per second, so every concurrency figure this project has
+    /// quoted was an external scraper's maximum over a handful of one-second
+    /// samples of an instantaneous value — blind to every peak that opened and
+    /// closed between two ticks. At 500x40 it read 7,310 while neither limit
+    /// that could have bound it was close: pool capacity was ~17,000 and the
+    /// admission budget 128,000. A sampled maximum is a lower bound on the
+    /// true one and cannot be turned into an upper bound by scraping faster.
+    ///
+    /// Updated under the same `fetch_update` as `peak_buffered`, for the same
+    /// reason: the only place that knows a new maximum happened is the
+    /// increment itself.
+    peak_client_streams: AtomicUsize,
     /// Live client connections, counted by `Proxy`'s construction and drop.
     ///
     /// Needed because admission is advertised *per connection* while capacity is
@@ -148,7 +169,12 @@ impl ProxyStats {
     }
 
     pub fn open_stream(&self) {
-        self.upstream_streams.fetch_add(1, Ordering::Relaxed);
+        let now = self.upstream_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ =
+            self.peak_upstream_streams
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |peak| {
+                    (now > peak).then_some(now)
+                });
     }
 
     pub fn close_stream(&self) {
@@ -190,6 +216,10 @@ impl ProxyStats {
         self.upstream_streams.load(Ordering::Relaxed)
     }
 
+    pub fn peak_upstream_streams(&self) -> usize {
+        self.peak_upstream_streams.load(Ordering::Relaxed)
+    }
+
     pub fn connects(&self) -> u64 {
         self.connects.load(Ordering::Relaxed)
     }
@@ -211,7 +241,12 @@ impl ProxyStats {
     }
 
     pub fn open_client_stream(&self) {
-        self.client_streams.fetch_add(1, Ordering::Relaxed);
+        let now = self.client_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ =
+            self.peak_client_streams
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |peak| {
+                    (now > peak).then_some(now)
+                });
     }
 
     pub fn close_client_stream(&self) {
@@ -224,6 +259,14 @@ impl ProxyStats {
 
     pub fn client_streams(&self) -> usize {
         self.client_streams.load(Ordering::Relaxed)
+    }
+
+    /// The largest number of client streams ever simultaneously in flight.
+    ///
+    /// Exact, not sampled. This is the number a concurrency claim may quote;
+    /// `client_streams` is the number an operator watches.
+    pub fn peak_client_streams(&self) -> usize {
+        self.peak_client_streams.load(Ordering::Relaxed)
     }
 
     pub fn client_connected(&self) {

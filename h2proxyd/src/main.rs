@@ -458,6 +458,13 @@ fn spawn_stats_sampler(shared: &Arc<Shared>) {
                 .set(stats.upstream_connections() as f64);
             metrics::gauge!("h2proxy_upstream_streams_active").set(stats.upstream_streams() as f64);
             metrics::gauge!("h2proxy_client_streams_active").set(stats.client_streams() as f64);
+            // The peaks are maintained by the engine on every open, not derived
+            // from the two gauges above. Publishing them on the same one-second
+            // tick is fine precisely because they do not decay: a scrape that
+            // misses a tick misses nothing.
+            metrics::gauge!("h2proxy_upstream_streams_peak")
+                .set(stats.peak_upstream_streams() as f64);
+            metrics::gauge!("h2proxy_client_streams_peak").set(stats.peak_client_streams() as f64);
             metrics::gauge!("h2proxy_bridge_buffered_bytes").set(stats.buffered() as f64);
             metrics::gauge!("h2proxy_bridge_buffered_bytes_peak").set(stats.peak_buffered() as f64);
             metrics::gauge!("h2proxy_backends_healthy").set(
@@ -761,6 +768,11 @@ fn init_metrics() {
         "h2proxy_upstream_streams_active",
         "Streams currently in flight to backends"
     );
+    metrics::describe_gauge!(
+        "h2proxy_upstream_streams_peak",
+        "High-water mark of h2proxy_upstream_streams_active, counted at every \
+         open rather than sampled"
+    );
     // Admission (ADR 0023). The pair to watch together: if shed_total moves
     // while this is above its floor, a client is ignoring SETTINGS.
     metrics::describe_gauge!(
@@ -824,6 +836,12 @@ fn init_metrics() {
     metrics::describe_gauge!(
         "h2proxy_client_streams_active",
         "Client streams currently being proxied (zero in built-in-responder mode)"
+    );
+    metrics::describe_gauge!(
+        "h2proxy_client_streams_peak",
+        "High-water mark of h2proxy_client_streams_active, counted at every open \
+         rather than sampled. The concurrency number: the active gauge is \
+         published once a second and cannot see a peak between two ticks"
     );
     metrics::describe_counter!(
         "h2proxy_upstream_requests_total",
@@ -915,6 +933,7 @@ fn init_metrics() {
     metrics::counter!("h2proxy_requests_total").increment(0);
     metrics::gauge!("h2proxy_upstream_pool_connections").set(0.0);
     metrics::gauge!("h2proxy_upstream_streams_active").set(0.0);
+    metrics::gauge!("h2proxy_upstream_streams_peak").set(0.0);
     // `h2proxy_upstream_read_ratio_min` is deliberately *not* seeded. Zero on
     // that series means "some connection did no reading at all", which is the
     // alarm condition; publishing it before any traffic exists would be a
@@ -930,6 +949,7 @@ fn init_metrics() {
     metrics::counter!("h2proxy_upstream_connects_total").absolute(0);
     metrics::counter!("h2proxy_upstream_connect_failures_total").absolute(0);
     metrics::gauge!("h2proxy_client_streams_active").set(0.0);
+    metrics::gauge!("h2proxy_client_streams_peak").set(0.0);
     metrics::counter!("h2proxy_upstream_requests_total").absolute(0);
     metrics::counter!("h2proxy_upstream_retries_total").absolute(0);
     metrics::counter!("h2proxy_upstream_shed_total").absolute(0);

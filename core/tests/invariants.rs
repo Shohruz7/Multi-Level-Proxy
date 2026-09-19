@@ -575,6 +575,91 @@ async fn a_client_that_hangs_up_mid_stream_does_not_leak_its_streams() {
     );
 }
 
+/// The concurrency number has to be counted, not sampled.
+///
+/// `h2proxy_client_streams_active` is published by the daemon once per second,
+/// so every concurrency figure this project has quoted was a scraper's maximum
+/// over a handful of one-second samples of an instantaneous value. Peaks that
+/// open and close between two ticks are invisible to it, which makes it a lower
+/// bound that no amount of faster scraping converts into a real one.
+///
+/// So the peak is maintained at the open, and the property that matters is that
+/// it does **not** decay: the gauge going back to zero is correct and expected,
+/// and a peak that follows it there would be a high-water mark that only ever
+/// reports the last quiet moment. Both halves are asserted below, because a
+/// peak wired to the wrong counter would pass either one alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stream_peak_is_counted_at_the_open_and_never_decays() {
+    let script = Script::new();
+    let backend = spawn_backend(Arc::clone(&script)).await;
+    let (socket, shared, _shutdown) = spawn_proxy(vec![backend]).await;
+
+    let mut peer = RawPeer::new(socket);
+    peer.client_handshake().await;
+    const OPEN: u32 = 24;
+    for n in 0..OPEN {
+        // Large responses, so all of these are still in flight together rather
+        // than completing one at a time and never overlapping.
+        peer.send_headers(n * 2 + 1, &request("/big"), true).await;
+    }
+
+    settles(|| {
+        (shared.stats.client_streams() < OPEN as usize).then(|| {
+            format!(
+                "only {} of {OPEN} streams ever became active",
+                shared.stats.client_streams(),
+            )
+        })
+    })
+    .await;
+
+    let peak = shared.stats.peak_client_streams();
+    assert!(
+        peak >= OPEN as usize,
+        "{OPEN} streams were live at once but the peak read {peak}; the peak is \
+         not being counted at the open",
+    );
+
+    // The independent second opinion. These count opposite ends of the same
+    // request through different code paths, so a concurrency claim the two
+    // disagree about is a claim neither of them supports on its own.
+    let upstream_peak = shared.stats.peak_upstream_streams();
+    assert!(
+        upstream_peak >= OPEN as usize,
+        "client peak {peak} but upstream peak {upstream_peak}; the two sides of \
+         the same {OPEN} streams disagree",
+    );
+    // Every upstream stream belongs to a client stream, so client >= upstream
+    // holds at every instant and therefore between the two maxima as well. It
+    // is the one relationship between these gauges that is true by construction
+    // rather than by workload, which makes it the one worth asserting: the gap
+    // between them is the work queued inside the proxy and is free to be
+    // anything, but the sign of the gap is not.
+    assert!(
+        peak >= upstream_peak,
+        "upstream peak {upstream_peak} exceeds client peak {peak}, which cannot \
+         happen unless one of the two is miscounted",
+    );
+
+    // Any ending will do, and a hang-up is the one already known to zero the
+    // active gauge (see the test above), so it isolates the question being
+    // asked here to whether the *peak* follows it down.
+    drop(peer);
+
+    settles(|| {
+        (shared.stats.client_streams() != 0)
+            .then(|| format!("{} streams still active", shared.stats.client_streams()))
+    })
+    .await;
+
+    assert!(
+        shared.stats.peak_client_streams() >= peak,
+        "the peak fell from {peak} to {} once the streams ended; a high-water \
+         mark that decays reports the last quiet moment, not the busiest one",
+        shared.stats.peak_client_streams(),
+    );
+}
+
 /// Per-connection and per-stream state has to stay small, because week 8's
 /// concurrency profile multiplies it by ten thousand.
 ///
