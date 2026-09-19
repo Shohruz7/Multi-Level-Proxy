@@ -39,6 +39,9 @@ DURATION="${DURATION:-10}"
 # precisely what this file exists to avoid.
 MIN_REQUESTS="${MIN_REQUESTS:-10000}"
 MIN_POOL="${MIN_POOL:-2}"
+# 512 MiB against an observed ~35 MiB at this shape. A leak check with two
+# orders of magnitude of headroom, not a memory budget.
+MAX_RSS_KB="${MAX_RSS_KB:-524288}"
 
 command -v h2load >/dev/null || { echo "h2load not found (brew install nghttp2 / apt install nghttp2-client)" >&2; exit 1; }
 
@@ -88,6 +91,11 @@ kill "$sampler" 2>/dev/null || true; wait "$sampler" 2>/dev/null || true
 pool_peak=$(cat "$peakfile" 2>/dev/null || echo 0); rm -f "$peakfile"
 metrics="$(curl -s --max-time 2 "http://$METRICS/metrics" || true)"
 shed=$(awk '/^h2proxy_upstream_shed_total /{print $2; exit}' <<<"$metrics")
+streams_peak=$(awk '/^h2proxy_client_streams_peak /{print $2; exit}' <<<"$metrics")
+streams_live=$(awk '/^h2proxy_client_streams_active /{print $2; exit}' <<<"$metrics")
+# The proxy's own resident set, not this script's. Portable between the macOS
+# dev box and a Linux runner, which /proc and smaps are not.
+rss_kb=$(ps -o rss= -p "$proxy_pid" 2>/dev/null | tr -d ' ')
 srv5xx=$(awk -F'[ }]' '/^h2proxy_responses_total\{class="5xx"\}/{print $NF; exit}' <<<"$metrics")
 
 read -r done_n succeeded failed errored < <(
@@ -108,6 +116,8 @@ printf 'requests  %s done, %s succeeded, %s failed, %s errored\n' "$done_n" "$su
 printf 'status    %s 5xx (client), %s 5xx (server counter)\n' "${codes_5xx:-0}" "${srv5xx:-0}"
 printf 'pool      %s connections at peak\n' "$pool_peak"
 printf 'shed      %s\n' "${shed:-0}"
+printf 'streams   %s peak, %s live at scrape\n' "${streams_peak:-0}" "${streams_live:-0}"
+printf 'rss       %s KiB\n' "${rss_kb:-0}"
 printf 'rate      %s (reported, never asserted)\n' "${rate:-unknown}"
 echo
 
@@ -148,6 +158,43 @@ check "no shedding" "${shed:-1}" "==" "0" \
 # would have caught it, and it needs no timing.
 check "the pool grows under load" "${pool_peak:-0}" ">=" "$MIN_POOL" \
   "upstream parallelism collapsed — the pool is not opening connections under load"
+
+# 2026-09-19: every concurrency figure this project quoted came from a gauge the
+# daemon publishes once a second, sampled by a scraper that could not see
+# between ticks. It read 7,310 where the engine counted 19,403. The counted peak
+# replaced it, and this asserts the replacement is actually wired: a peak that
+# reads zero after a run that served a million requests is the same class of
+# defect wearing the new name.
+check "the stream peak is counted" "${streams_peak:-0}" ">" "0" \
+  "the high-water stream gauge read zero through a run that served traffic"
+
+# The one relationship between these two that is true by construction rather
+# than by workload: every live stream was once a peak candidate, so the peak can
+# never be below a later instantaneous reading.
+check "the stream peak is not below live" "${streams_peak:-0}" ">=" "${streams_live:-0}" \
+  "the peak is lower than the instantaneous gauge, so one of them is miscounted"
+
+# 2026-09-19: ProxyStats::response was wired only to responses arriving from a
+# backend, so every 502 and 503 the proxy wrote *itself* reached clients
+# uncounted and h2proxy_responses_total{class="5xx"} read zero unconditionally.
+# Asserting "no 5xx" against a counter that cannot move is not a check at all.
+#
+# This run should shed nothing, so both are expected to be zero — the assertion
+# is on the *implication*: if the pool ever shed, the 5xx counter must have
+# moved with it. It costs nothing when both are zero and fails loudly if the
+# wiring is ever removed while shedding is happening.
+if [ "${shed:-0}" -gt 0 ] 2>/dev/null; then
+  check "shedding reaches the 5xx counter" "${srv5xx:-0}" ">" "0" \
+    "the pool shed requests but the 5xx counter did not move; it is disconnected"
+fi
+
+# Memory is the one quantity a shared runner can assert honestly: it is set by
+# what the process holds, not by how fast the cores run. The bound is
+# deliberately far above the ~35 MiB this shape actually uses — it is a leak
+# check, not a budget, and tightening it toward the observed value would turn it
+# into the flaky assertion this file exists to avoid.
+check "resident memory stays bounded" "${rss_kb:-0}" "<=" "$MAX_RSS_KB" \
+  "the proxy is holding far more memory than this shape can account for"
 
 echo
 if [ "$fail" -ne 0 ]; then
