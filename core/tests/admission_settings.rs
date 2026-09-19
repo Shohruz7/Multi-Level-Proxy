@@ -63,7 +63,7 @@ fn get(path: &str) -> Vec<h2proxy_core::hpack::Header> {
 /// `RawPeer::client_handshake` reads forward to the ack, which throws away every
 /// frame on the way — including the one under test here. The first SETTINGS is
 /// precisely where the budget has to appear, so this test cannot use it.
-async fn handshake_capturing_settings(peer: &mut RawPeer) -> Option<u32> {
+async fn handshake_capturing_settings(peer: &mut RawPeer, ack: bool) -> Option<u32> {
     peer.send_raw(h2proxy_core::conn::PREFACE).await;
     peer.send(&Settings::default().to_frame()).await;
     let advertised = next_advertised(peer).await;
@@ -73,6 +73,15 @@ async fn handshake_capturing_settings(peer: &mut RawPeer) -> Option<u32> {
     )
     .await
     .expect("our SETTINGS acknowledged");
+    // Acknowledging is what licenses the server to hold us to the limit. Whether
+    // we do is the variable in these tests, not an incidental of the handshake.
+    if ack {
+        peer.send(&Frame::Settings {
+            ack: true,
+            params: Vec::new(),
+        })
+        .await;
+    }
     advertised
 }
 
@@ -107,7 +116,7 @@ async fn the_handshake_advertises_the_budget_it_was_given() {
     let socket = TcpStream::connect(addr).await.expect("connect");
     let mut peer = RawPeer::new(socket);
     assert_eq!(
-        handshake_capturing_settings(&mut peer).await,
+        handshake_capturing_settings(&mut peer, true).await,
         Some(4),
         "the first SETTINGS must carry the budget, not the compiled-in default",
     );
@@ -122,7 +131,10 @@ async fn lowering_the_budget_is_pushed_to_an_open_connection() {
     let addr = spawn(Arc::clone(&budget)).await;
     let socket = TcpStream::connect(addr).await.expect("connect");
     let mut peer = RawPeer::new(socket);
-    assert_eq!(handshake_capturing_settings(&mut peer).await, Some(50));
+    assert_eq!(
+        handshake_capturing_settings(&mut peer, true).await,
+        Some(50)
+    );
 
     budget.store(3, Ordering::Relaxed);
     // Give the connection something to wake up for; the re-advertise happens on
@@ -150,7 +162,7 @@ async fn a_client_that_ignores_the_setting_is_still_bounded() {
     let addr = spawn(Arc::new(AtomicU32::new(2))).await;
     let socket = TcpStream::connect(addr).await.expect("connect");
     let mut peer = RawPeer::new(socket);
-    assert_eq!(handshake_capturing_settings(&mut peer).await, Some(2));
+    assert_eq!(handshake_capturing_settings(&mut peer, true).await, Some(2));
 
     // Three at once against a budget of two, none of them ended, so all three
     // want to be live simultaneously.
@@ -183,7 +195,7 @@ async fn raising_the_budget_lets_more_streams_in() {
     let addr = spawn(Arc::clone(&budget)).await;
     let socket = TcpStream::connect(addr).await.expect("connect");
     let mut peer = RawPeer::new(socket);
-    assert_eq!(handshake_capturing_settings(&mut peer).await, Some(2));
+    assert_eq!(handshake_capturing_settings(&mut peer, true).await, Some(2));
 
     budget.store(8, Ordering::Relaxed);
     peer.send(&Frame::Ping {
@@ -210,4 +222,46 @@ async fn raising_the_budget_lets_more_streams_in() {
         "stream 7 must be served once the budget has risen to eight",
     );
     let _ = StreamId::new(7);
+}
+
+#[tokio::test]
+async fn a_peer_that_has_not_acked_yet_is_not_refused() {
+    // The regression this pins produced 800 client-visible errors on a benchmark
+    // containing no attack and no overload: exactly 16 refusals on each of 50
+    // connections, every run, regardless of how long the run was.
+    //
+    // The cause was a race the client cannot win. RFC 9113 makes the initial
+    // SETTINGS_MAX_CONCURRENT_STREAMS *unlimited*, so a client is entitled to
+    // open streams before our first SETTINGS arrives. Enforcing a budget of two
+    // against a client that had already sent twenty is refusing it for not yet
+    // having heard a rule.
+    //
+    // So: same tiny budget, same over-budget burst, but the peer never
+    // acknowledges — and nothing may be refused.
+    let addr = spawn(Arc::new(AtomicU32::new(2))).await;
+    let socket = TcpStream::connect(addr).await.expect("connect");
+    let mut peer = RawPeer::new(socket);
+    assert_eq!(
+        handshake_capturing_settings(&mut peer, false).await,
+        Some(2)
+    );
+
+    for id in [1u32, 3, 5] {
+        peer.send_headers(id, &get("/bytes/8"), true).await;
+    }
+
+    // Stream 5 is the one the acking peer had refused. It must be served here.
+    let answered = tokio::time::timeout(
+        TIMEOUT,
+        peer.next_matching(
+            |f| matches!(f, Frame::Headers { stream_id, .. } if stream_id.get() == 5),
+        ),
+    )
+    .await
+    .expect("the third stream is answered within the timeout");
+    assert!(
+        answered.is_some(),
+        "a peer that has not acknowledged our SETTINGS has not been told the \
+         limit, and must not be held to it",
+    );
 }

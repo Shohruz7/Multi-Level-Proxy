@@ -328,15 +328,15 @@ impl ProxyStats {
 /// from looking like a stall.
 pub const MIN_ADMIT: u32 = 2;
 
-/// How many streams a connection wins back per sample once the level is known.
+/// The floor on the **total**, so an idle proxy is never throttled to nothing.
 ///
-/// **One**, and the reason is the difference between one flow and many. This
-/// budget is per connection, so a step of `n` admits `n x connections` more
-/// streams at once: at 500 clients a step of 8 was +4,000 streams in one sample,
-/// which overshot capacity every single time and left the loop shedding in a
-/// comfortable-looking sawtooth. Additive increase has to be additive in the
-/// quantity that is actually shared, and the shared quantity is the total.
-const ADMIT_STEP: u32 = 1;
+/// Separate from [`MIN_ADMIT`], which floors each connection's share. Note the
+/// two can disagree: with enough connections, `MIN_ADMIT x connections` exceeds
+/// whatever total the loop has settled on, and the per-connection floor wins.
+/// The controller loses authority at that point. It is recorded here rather than
+/// hidden because the failure is quiet - the proxy admits more than the loop
+/// intended and the gauge still reads whatever the loop decided.
+const MIN_TOTAL: u32 = 64;
 
 #[derive(Debug)]
 pub struct Shared {
@@ -358,13 +358,21 @@ pub struct Shared {
     /// knowing what a pool is. One relaxed load per I/O pass; a stale read costs
     /// one pass of over-commitment and nothing else.
     admission: Arc<std::sync::atomic::AtomicU32>,
+    /// The quantity the control loop actually steers: total streams admitted
+    /// across every client connection. `admission` above is this divided by the
+    /// number of claimants, and is only what gets advertised.
+    ///
+    /// Steering the per-connection number instead was a defect: distress is a
+    /// property of the whole proxy, so a budget of 2 meant 100 streams at 50
+    /// clients and 1,000 at 500. The loop had no idea what it was adding up to.
+    admit_total: AtomicU64,
+    /// The last total known to be servable - TCP's `ssthresh`. Recovery is
+    /// geometric below it and cautious above it.
+    ssthresh: AtomicU64,
     /// `stats.shed_total()` as of the previous admission sample, so the control
     /// loop can react to shedding *having happened* rather than to a proxy for
     /// it.
     last_shed: AtomicU64,
-    /// Whether admission is still doubling to find the level (see
-    /// [`Shared::recompute_admission`]).
-    slow_start: std::sync::atomic::AtomicBool,
     tuning: crate::conn::Tuning,
 }
 
@@ -420,9 +428,23 @@ impl Shared {
             // over-committed, which measured 54,000 shed requests before the
             // loop had taken its first sample. It is always safe to admit too
             // little for one sample; admitting too much cannot be taken back.
-            admission: Arc::new(std::sync::atomic::AtomicU32::new(MIN_ADMIT)),
+            // Opens at the ceiling and comes down on evidence, rather than
+            // opening at the floor and climbing. Starting low throttled every
+            // healthy workload: one brief distress event left the loop crawling
+            // back at one stream per second, so a three-second benchmark never
+            // recovered. Overshoot on a cold start is what the pending queue is
+            // sized to absorb.
+            admission: Arc::new(std::sync::atomic::AtomicU32::new(
+                tuning.max_concurrent_streams,
+            )),
+            // Unbounded until the first sample, which clamps it to
+            // `ceiling x connections`. The connection count is not knowable here,
+            // and seeding with the per-connection ceiling instead would advertise
+            // `ceiling / connections` — a throttle at start-up, on an idle proxy,
+            // for no reason.
+            admit_total: AtomicU64::new(u64::MAX),
+            ssthresh: AtomicU64::new(u64::MAX),
             last_shed: AtomicU64::new(0),
-            slow_start: std::sync::atomic::AtomicBool::new(true),
             tuning,
         })
     }
@@ -434,66 +456,96 @@ impl Shared {
 
     /// Recompute what one client connection may open, and return it.
     ///
-    /// **Additive increase, multiplicative decrease**, driven by whether the
-    /// upstream queues are draining - not by a capacity estimate. The first
-    /// version of this divided a capacity estimate by the connection count, and
-    /// it was wrong in a way worth recording: capacity was counted in upstream
-    /// *stream slots*, but a client stream spends most of its life not holding
-    /// one. Sizing admission to slot count left the upstream idle for every
-    /// client round trip, and measured 22,000 req/s where the same box did
-    /// 55,000 with no admission control at all - while latency got *worse*,
-    /// because the queue simply moved to the client.
+    /// **The controlled quantity is the total**, and what each connection is told
+    /// is that total divided by the number of claimants. Steering the
+    /// per-connection number directly was a defect: distress is a property of the
+    /// whole proxy, so the same budget meant 100 streams at 50 clients and 1,000
+    /// at 500, and the loop never knew what it was adding up to.
     ///
-    /// That is the general result, and it is why this reacts rather than
-    /// predicts: against a client with fixed demand, admission control cannot
-    /// reduce latency. It can only move the queue and, if it throttles below
-    /// what the system can serve, lose throughput. So the budget stays as
-    /// generous as it can be and only retreats from evidence of distress.
+    /// **Not a capacity estimate.** That was tried and measured 22,000 req/s
+    /// where the same box did 55,000 with no admission control at all, because a
+    /// client stream spends most of its life not holding an upstream slot, so
+    /// sizing admission to slot count leaves the upstream idle for every client
+    /// round trip. Against a client with fixed demand, admission control cannot
+    /// reduce latency - it can only move the queue, and if it throttles below
+    /// what the system can serve, lose throughput. So the loop stays as generous
+    /// as it can be and retreats only from evidence.
     ///
-    /// AIMD because it is the shape that is known to converge under exactly this
-    /// kind of shared-bottleneck feedback, and because neither constant needs to
-    /// be right for it to work - they set how fast it finds the level, not what
-    /// the level is.
+    /// The shape is TCP Reno's, for Reno's reason. The first version replaced
+    /// slow start with a permanent one-per-sample crawl, so a single distress
+    /// event cost 254 seconds of recovery and a three-second benchmark never came
+    /// back: a ratchet, not a controller. Remembering the last servable level and
+    /// returning to it geometrically is what makes recovery a property of the
+    /// load rather than of how long ago something went wrong.
     pub fn recompute_admission(&self) -> u32 {
-        let ceiling = self.tuning.max_concurrent_streams;
-        let current = self.admission.load(Ordering::Relaxed);
+        let conns = self.stats.client_conns().max(1) as u64;
+        let ceiling = u64::from(self.tuning.max_concurrent_streams);
+        let ceiling_total = ceiling.saturating_mul(conns);
 
-        // Two distress signals, and the first one is the one that matters.
+        // Shedding is not a proxy for trouble, it *is* the failure this exists to
+        // remove: a shed request is one the proxy accepted, charged itself for,
+        // and then refused. Reacting to queue depth alone was measured shedding
+        // 38,000 requests a second while the depth signal read clear between
+        // samples.
         //
-        // Shedding is not a proxy for trouble, it *is* the failure this exists
-        // to remove: a shed request is one the proxy accepted, charged itself
-        // for, and then refused. Reacting to queue depth alone was measured
-        // shedding 38,000 requests a second while the depth signal read clear
-        // between samples - the loop settled into a comfortable sawtooth around
-        // a level that was still refusing most of the offered work.
-        //
-        // Queue depth stays as the early warning: it trips before anything has
-        // been refused, which is where a control loop would rather act.
+        // The early warning is `near_shed_limit`, measured against the shed bound
+        // — deliberately not `backed_up`, which asks whether a connection wants a
+        // sibling. That predicate is permanently true once the pool is at its
+        // ceiling under load, so using it here made every sample look like
+        // distress and walked the budget down to the floor.
         let shed_now = self.stats.shed_total();
         let shed_before = self.last_shed.swap(shed_now, Ordering::Relaxed);
-        let shedding = shed_now > shed_before;
+        let distressed = shed_now > shed_before || self.pool.near_shed_limit();
 
-        let distressed = shedding || self.pool.backed_up();
+        let current = self
+            .admit_total
+            .load(Ordering::Relaxed)
+            .clamp(u64::from(MIN_TOTAL), ceiling_total)
+            .max(1);
 
-        // Slow start, for the same reason TCP has one: additive increase from
-        // the floor would take a hundred samples to find a level that doubling
-        // reaches in seven, and a proxy that needs two minutes to come up to
-        // speed after a quiet period is not usable. Doubling ends at the first
-        // sign of distress and never resumes - from then on the level is known
-        // to within a factor of two and AIMD refines it.
-        let next = if distressed {
-            self.slow_start.store(false, Ordering::Relaxed);
-            (current / 2).max(MIN_ADMIT)
-        } else if self.slow_start.load(Ordering::Relaxed) {
-            current.saturating_mul(2).min(ceiling)
+        let next_total = if distressed {
+            let half = (current / 2).max(u64::from(MIN_TOTAL));
+            self.ssthresh.store(half, Ordering::Relaxed);
+            half
+        } else if current < self.ssthresh.load(Ordering::Relaxed) {
+            // Below a level we know was servable: get back to it geometrically.
+            current.saturating_mul(2).min(ceiling_total)
         } else {
-            current.saturating_add(ADMIT_STEP).min(ceiling)
+            // Above the last known-good level, so probe — but the step has to be
+            // proportional to where we are, not a constant.
+            //
+            // A flat `+conns` per sample is the ratchet again in slower clothing.
+            // The range runs to `ceiling x connections`, which at 50 clients and a
+            // 256 ceiling is 12,800: traversing it at +50 a sample is 253 samples,
+            // which is the same defect this control loop was rewritten to remove.
+            // TCP gets away with a flat step because its clock is the round trip;
+            // ours is a fixed 200 ms, so the step must scale instead.
+            //
+            // A sixteenth per sample is ~6%, against an immediate halving on
+            // distress — so the response to being wrong is still far sharper than
+            // the approach to being right.
+            let step = conns.max(current / 16);
+            current.saturating_add(step).min(ceiling_total)
         };
 
-        if next != current {
-            self.admission.store(next, Ordering::Relaxed);
-        }
-        next
+        self.admit_total.store(next_total, Ordering::Relaxed);
+        let advertised = (next_total / conns).clamp(u64::from(MIN_ADMIT), ceiling) as u32;
+        self.admission.store(advertised, Ordering::Relaxed);
+        advertised
+    }
+
+    /// What one client connection is currently advertised, for the gauge.
+    pub fn admission_advertised(&self) -> u32 {
+        self.admission.load(Ordering::Relaxed)
+    }
+
+    /// The total the loop is currently steering, for the gauge.
+    ///
+    /// Published because this regression was partly invisible: only the derived
+    /// per-connection number had a gauge, so a loop steering the wrong quantity
+    /// looked healthy from outside.
+    pub fn admit_total(&self) -> u64 {
+        self.admit_total.load(Ordering::Relaxed)
     }
 
     /// Pick a backend to try, excluding any already attempted for this request.
@@ -1047,6 +1099,94 @@ impl Drop for Proxy {
 mod tests {
     use super::*;
     use crate::hpack::Header;
+
+    // ---------------------------------------------------------------------
+    // Admission control (ADR 0023)
+    // ---------------------------------------------------------------------
+
+    fn shared_with_conns(conns: usize) -> Arc<Shared> {
+        let shared = Shared::new(vec![Backend::new(([127, 0, 0, 1], 9).into())], 8);
+        for _ in 0..conns {
+            shared.stats.client_connected();
+        }
+        shared
+    }
+
+    #[test]
+    fn admission_recovers_from_distress_in_a_bounded_number_of_samples() {
+        // The regression this pins cost 5.4x throughput on load that was never
+        // overloaded, and it was pure arithmetic — it needed no socket and no
+        // benchmark to find, only someone asking how long recovery takes.
+        //
+        // The first version left slow start permanently at the first distress and
+        // then grew by one stream per connection per *one-second* sample. From
+        // the floor to a ceiling of 256 that is 254 seconds. The attack benchmark
+        // runs for three. So a single transient pinned the proxy for the entire
+        // run: a ratchet, not a controller.
+        let shared = shared_with_conns(50);
+
+        // One distress event. `shed_total` moving is the signal.
+        shared.stats.shed();
+        let after_distress = shared.recompute_admission();
+        assert!(
+            after_distress < shared.tuning.max_concurrent_streams,
+            "distress must actually reduce the budget, or this test proves nothing",
+        );
+
+        // Now quiet. Recovery must be measured in samples, not minutes.
+        let mut samples = 0;
+        while shared.recompute_admission() < shared.tuning.max_concurrent_streams {
+            samples += 1;
+            assert!(
+                samples < 32,
+                "recovery took more than 32 samples; at the loop's period that is \
+                 a ratchet rather than a controller (reached {})",
+                shared.admission_advertised(),
+            );
+        }
+    }
+
+    #[test]
+    fn admission_steers_the_total_not_the_per_connection_share() {
+        // The other half of the same defect. Distress is a property of the whole
+        // proxy, but the budget is advertised per connection — so steering the
+        // per-connection number meant the total silently scaled with the client
+        // count: the same budget was 100 streams at 50 clients and 1,000 at 500.
+        // The loop had no idea what it was adding up to.
+        //
+        // At full health every connection gets the ceiling and there is nothing
+        // to divide, so the property only has teeth once the loop has retreated.
+        let shared = shared_with_conns(10);
+        for _ in 0..6 {
+            shared.stats.shed();
+            shared.recompute_admission();
+        }
+        let constrained_total = shared.admit_total();
+        let share_of_ten = shared.admission_advertised();
+        assert!(
+            share_of_ten < shared.tuning.max_concurrent_streams,
+            "the loop must actually be constrained for this test to mean anything",
+        );
+
+        // Ninety more clients arrive to share the same constrained total.
+        for _ in 0..90 {
+            shared.stats.client_connected();
+        }
+        shared.stats.shed();
+        shared.recompute_admission();
+
+        assert!(
+            shared.admission_advertised() < share_of_ten,
+            "ten times the claimants on a total that did not grow must mean a \
+             smaller share each ({} -> {})",
+            share_of_ten,
+            shared.admission_advertised(),
+        );
+        assert!(
+            shared.admit_total() <= constrained_total,
+            "arriving connections must not inflate the total the loop settled on",
+        );
+    }
 
     fn request(path: &'static str) -> RequestHead {
         RequestHead::from_headers(&[

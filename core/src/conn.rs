@@ -210,26 +210,47 @@ pub const MAX_CONCURRENT_STREAMS: u32 = 256;
 ///
 /// 128 was the first value here, chosen as "a burst, not a backlog" and never
 /// measured. It is smaller than the 200-odd streams a backend typically admits,
-/// so the queue could not even hold one slot-turnover, and with the pool's eight
-/// connections the whole proxy could buffer 1,024 requests against a workload
-/// offering sixteen times that. Measured, it refused 93% of offered work.
+/// so the queue could not even hold one slot-turnover.
 ///
-/// The bound that matters is a *time*: how long overshoot must be absorbed
-/// before admission reacts to it. The control loop samples once a second, so the
-/// queue has to hold one second of arrivals at full rate, divided across the
-/// pool — at the ~50,000 req/s this proxy sustains over eight connections, about
-/// 6,000 each. 4,096 is that, rounded down to a power of two.
+/// Two bounds meet here, and the larger one wins.
 ///
-/// It is a memory bound, not a throughput control: a queued request holds a
-/// request head, not a body. Admission is what limits load now, and shedding
-/// past this bound should never happen against a conforming client — if
-/// `h2proxy_upstream_shed_total` moves, that is an alarm rather than a
-/// statistic.
+/// The first is a *time*: how long overshoot must be absorbed before admission
+/// reacts. The loop samples every 200 ms, and this proxy has been measured at
+/// 134,000 req/s, so one period is ~27,000 requests across a pool of eight —
+/// about 3,400 each.
 ///
-/// The other way to buy the same headroom is a faster control loop. That is the
-/// better lever and it is not taken here only because the one-second period is
-/// shared with the metrics sampler.
-pub const MAX_PENDING: usize = 4096;
+/// The second is the **concurrency the proxy is meant to hold**, and it is the
+/// one that is easy to set by accident. Total in-flight capacity is
+/// `connections x (live + max_pending)`, so this constant is what decides whether
+/// "10,000+ concurrent streams" is reachable at all. At 512 the ceiling is 5,696
+/// and the proxy sheds against a workload the commit before admission served with
+/// no failures at all; at 2,048 it is ~18,000, which matches what that commit
+/// held. An earlier revision of this comment derived ~1,250 per connection and
+/// then wrote 512 underneath it, which is simply less than the number it had just
+/// computed.
+///
+/// It is not free. `Pending` carries a `body` and `upstream.rs` pushes client
+/// DATA into it, so this multiplies against the stream window for any workload
+/// that sends request bodies. Raising it buys concurrency with memory, and that
+/// is the trade being made rather than an oversight.
+///
+/// It was briefly 4,096, sized for a one-second loop, and that number caused two
+/// separate problems worth recording — neither of which was its size:
+///
+/// - It silently disabled pool growth. The "is this connection coping" threshold
+///   used to be `max_pending / 2`, so widening the queue moved it from 64 to
+///   2,048 — past anything a real queue reaches. Upstream parallelism fell from
+///   five connections to one and throughput fell with it. The threshold no longer
+///   depends on this constant (see `UpstreamRecord::backed_up`), but the episode
+///   is the reason it does not.
+/// - The comment justifying it said a queued request "holds a request head, not a
+///   body", and that was simply false, which is why the real cost is stated
+///   above rather than waved away.
+///
+/// Admission is what limits load now; this only absorbs the overshoot between
+/// samples. Shedding past it should never happen against a conforming client — if
+/// `h2proxy_upstream_shed_total` moves, that is an alarm rather than a statistic.
+pub const MAX_PENDING: usize = 2048;
 
 /// How the pool decides to open an *additional* connection to a backend.
 ///
@@ -715,6 +736,37 @@ pub struct Connection<IO, S = Echo> {
     /// never moves from `local_settings`.
     admission: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
     advertised_streams: u32,
+    /// Whether the peer has acknowledged our SETTINGS (§6.5.3).
+    ///
+    /// Until it has, a reduced concurrency limit is **advertised but not
+    /// enforced**. The initial value of `SETTINGS_MAX_CONCURRENT_STREAMS` is
+    /// unlimited, so a client that opens streams before our first SETTINGS
+    /// arrives is within its rights; refusing those is refusing a peer for not
+    /// yet having heard a rule. Measured, that cost exactly 16 refusals on each
+    /// of 50 connections — 800 spurious errors on a benchmark with no attack and
+    /// no overload in it.
+    ///
+    /// The static ceiling still applies before the ack, so a peer that simply
+    /// never acknowledges is bounded like any other.
+    peer_acked_settings: bool,
+    /// SETTINGS frames we have sent and not yet seen acknowledged.
+    ///
+    /// A *count*, not a queue, because the only question is whether the peer is
+    /// still operating under an older value. While any of ours is outstanding we
+    /// keep enforcing what it last confirmed; when the count reaches zero the peer
+    /// is provably on the latest, and only then is a reduction applied.
+    ///
+    /// Gating on "has the peer ever acked" was not enough, and the residue was
+    /// measurable: it closed the handshake race but left the same race open on
+    /// every later reduction, which is 149 refusals on a benchmark that should
+    /// have none.
+    outstanding_settings: u32,
+    /// The limit the stream table is actually enforcing, which trails
+    /// `advertised_streams` whenever a reduction is in flight.
+    enforced_streams: u32,
+    /// The static limit to enforce before the peer has acked — the value the
+    /// connection was built with, independent of anything admission does.
+    stream_ceiling: u32,
     /// The peer's settings as applied. Bounds what we may send.
     peer_settings: Settings,
     /// Set while a header block is open — a HEADERS or CONTINUATION arrived
@@ -821,6 +873,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
             local_settings,
             admission: None,
             advertised_streams: local_settings.max_concurrent_streams.unwrap_or(u32::MAX),
+            peer_acked_settings: false,
+            outstanding_settings: 0,
+            enforced_streams: local_settings.max_concurrent_streams.unwrap_or(u32::MAX),
+            stream_ceiling: local_settings.max_concurrent_streams.unwrap_or(u32::MAX),
             peer_settings: defaults,
             open_header_block: None,
             open_header_end_stream: false,
@@ -897,7 +953,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
         let initial = budget.load(std::sync::atomic::Ordering::Relaxed);
         self.advertised_streams = initial;
         self.local_settings.max_concurrent_streams = Some(initial);
-        self.streams.set_max_concurrent(initial);
+        // Advertised now, enforced once the peer acks. The table stays at the
+        // static ceiling until then: a client may legally open streams before it
+        // has seen our first SETTINGS, and refusing those is refusing it for not
+        // yet having heard the rule.
+        self.streams.set_max_concurrent(self.stream_ceiling);
+        self.enforced_streams = self.stream_ceiling;
+        // The handshake SETTINGS will carry `initial`, and has not been acked.
+        self.outstanding_settings = 1;
         self.admission = Some(budget);
         self
     }
@@ -918,10 +981,15 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
         }
         self.advertised_streams = want;
         self.local_settings.max_concurrent_streams = Some(want);
-        // Lowering the local table immediately is correct even though the peer
-        // has not acked: §6.5.2 makes a reduced limit apply to *new* streams,
-        // and streams already open are never retroactively refused.
-        self.streams.set_max_concurrent(want);
+        self.outstanding_settings = self.outstanding_settings.saturating_add(1);
+        // Raising is safe to apply at once: a higher limit refuses nothing. A
+        // *reduction* waits for the acknowledgement, because until then the peer
+        // is entitled to keep opening streams under the value it last confirmed,
+        // and refusing those is refusing it for not yet having heard the rule.
+        if want > self.enforced_streams {
+            self.enforced_streams = want;
+            self.streams.set_max_concurrent(want);
+        }
         self.queue_frame(&Frame::Settings {
             ack: false,
             params: vec![(setting_id::MAX_CONCURRENT_STREAMS, want)],
@@ -1568,6 +1636,17 @@ impl<IO: AsyncRead + AsyncWrite + Unpin, S: Service> Connection<IO, S> {
                 // nothing to keep serving one, and the flood limits already
                 // bound the frames it can spend while not answering.
                 trace!("peer acknowledged our SETTINGS");
+                self.peer_acked_settings = true;
+                self.outstanding_settings = self.outstanding_settings.saturating_sub(1);
+                // Only once nothing of ours is still in flight is the peer
+                // provably operating under the latest value we sent.
+                if self.outstanding_settings == 0
+                    && self.admission.is_some()
+                    && self.advertised_streams != self.enforced_streams
+                {
+                    self.enforced_streams = self.advertised_streams;
+                    self.streams.set_max_concurrent(self.advertised_streams);
+                }
             }
             Frame::Ping { data, ack: false } => {
                 let pong = Frame::Ping {

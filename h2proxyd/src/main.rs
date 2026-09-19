@@ -73,6 +73,9 @@ struct ConnConfig {
 const DEFAULT_LISTEN: &str = "127.0.0.1:8443";
 
 /// Prometheus scrape address; override with `H2PROXYD_METRICS`.
+/// How often admission recomputes. See `spawn_admission_loop`.
+const ADMISSION_PERIOD: Duration = Duration::from_millis(200);
+
 const DEFAULT_METRICS: &str = "127.0.0.1:9090";
 
 #[tokio::main]
@@ -115,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
     };
     if let Some(shared) = &proxy {
         spawn_stats_sampler(shared);
+        spawn_admission_loop(shared);
     }
     let config = ConnConfig {
         drain: drain_policy(),
@@ -394,6 +398,34 @@ fn max_conns_per_backend() -> usize {
         .unwrap_or(8)
 }
 
+/// Drive the admission control loop (ADR 0023).
+///
+/// Its own task at its own period, rather than a few lines inside the metrics
+/// sampler. The two cadences answer to different things: metrics are read by
+/// dashboards and harnesses that expect one-second resolution, while admission is
+/// a feedback loop whose period *is* its reaction time.
+///
+/// Sharing the one-second tick is what made the first version a ratchet. Recovery
+/// moved one step per sample, so the sample period set how long a transient cost —
+/// and a three-second benchmark never got back to speed. 200 ms is five times the
+/// resolution for one timer, and it is also what lets `MAX_PENDING` come back down,
+/// since the queue only has to absorb one period of overshoot.
+fn spawn_admission_loop(shared: &Arc<Shared>) {
+    // `Weak` for the same reason the sampler uses one: a strong reference here
+    // would keep every upstream inbox sender alive and stop the drain finishing.
+    let shared = Arc::downgrade(shared);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(ADMISSION_PERIOD);
+        loop {
+            tick.tick().await;
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            shared.recompute_admission();
+        }
+    });
+}
+
 /// Publish the proxy's live counters once a second.
 ///
 /// Sampled rather than reported at connection close, because upstream
@@ -416,12 +448,9 @@ fn spawn_stats_sampler(shared: &Arc<Shared>) {
             };
             let stats = &shared.stats;
 
-            // Admission first: the budget every client connection advertises is
-            // recomputed here rather than on the request path, because it takes
-            // the pool mutex and the request path already contends for it
-            // (ADR 0023).
-            let budget = shared.recompute_admission();
-            metrics::gauge!("h2proxy_admission_streams_per_conn").set(budget as f64);
+            metrics::gauge!("h2proxy_admission_streams_per_conn")
+                .set(shared.admission_advertised() as f64);
+            metrics::gauge!("h2proxy_admission_total").set(shared.admit_total() as f64);
             metrics::gauge!("h2proxy_client_connections").set(stats.client_conns() as f64);
 
             // Gauges: quantities that go up and down.
@@ -738,6 +767,13 @@ fn init_metrics() {
         "h2proxy_admission_streams_per_conn",
         "Streams each client connection is currently advertised as able to open"
     );
+    // The quantity the loop actually steers. Published because the per-connection
+    // number alone hid a defect: a loop steering the wrong total looked healthy
+    // from outside while it throttled the proxy fivefold.
+    metrics::describe_gauge!(
+        "h2proxy_admission_total",
+        "Total streams admission is currently willing to admit across all clients"
+    );
     metrics::describe_gauge!("h2proxy_client_connections", "Live client connections");
     // Per-connection state, reduced to the worst connection. These exist because
     // the week-9 latency cliff was argued for a dozen experiments before it was
@@ -885,6 +921,7 @@ fn init_metrics() {
     // standing false alarm. Absent-until-there-is-data is the honest default for
     // a gauge whose zero is meaningful.
     metrics::gauge!("h2proxy_client_connections").set(0.0);
+    metrics::gauge!("h2proxy_admission_total").set(0.0);
     metrics::gauge!("h2proxy_upstream_conn_queue_peak").set(0.0);
     metrics::gauge!("h2proxy_upstream_conn_out_peak_bytes").set(0.0);
     metrics::gauge!("h2proxy_upstream_conn_streams_max").set(0.0);
