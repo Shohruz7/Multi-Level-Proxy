@@ -29,7 +29,15 @@ STREAMS="${STREAMS:-20}"
 DURATION="${DURATION:-10}"
 # Below this the run did not happen and the checks would pass vacuously, which is
 # worse than no check at all.
-MIN_REQUESTS="${MIN_REQUESTS:-50000}"
+#
+# Deliberately far below any plausible runner rather than just below this one.
+# It is an anti-vacuity check, not a performance check: 10,000 over ten seconds
+# is 1,000 req/s, which a shared two-core runner doing TLS, proxy, backend and
+# load generator on the same box will clear comfortably, while still catching a
+# run that never started. Tightening it toward what the dev machine achieves
+# would turn a correctness guard into a flaky throughput assertion, which is
+# precisely what this file exists to avoid.
+MIN_REQUESTS="${MIN_REQUESTS:-10000}"
 MIN_POOL="${MIN_POOL:-2}"
 
 command -v h2load >/dev/null || { echo "h2load not found (brew install nghttp2 / apt install nghttp2-client)" >&2; exit 1; }
