@@ -302,11 +302,19 @@ for shapes at or below 500 x 8.
 
 ### Resilience, measured
 
+The soak row below was read from a counter that could not see the 5xx this
+proxy writes *itself*: `ProxyStats::response` was wired only to responses
+arriving from a backend, so the 502 for a dead upstream and the 503 for a full
+queue reached clients uncounted. That is fixed and pinned by a test, and the
+soak is re-measured with a counter that works — the claim held, but it had never
+been tested. The attack rows were never affected, because their status counts
+come from `h2load` at the client rather than from the proxy's own metrics.
+
 | Claim | Number |
 |---|---|
 | Backend killed mid-load, 200k requests | **200,000 / 200,000 succeeded**, 0 5xx; 40 retries carried the in-flight requests to the surviving backend. The run is 1.5 s, too short for the health policy to eject, so this measures the retry path rather than ejection ([`bench/attack.txt`](bench/attack.txt)) |
 | Backend that accepts and then answers nothing | detected and ejected in ~2× `ping_idle`; the request gets an answer instead of hanging |
-| 5-minute soak, a backend killed and restarted every 30 s | **16.8M requests, 0 5xx**, 1,248 retries, 19 ejections; RSS plateaued (+1.9%) and every in-flight gauge settled to **0** ([`bench/soak.txt`](bench/soak.txt)) |
+| 5-minute soak, a backend killed and restarted every 30 s | **57.3M requests, 0 5xx**, 942 retries, 19 ejections; RSS plateaued (+0.1%) and every in-flight gauge settled to **0** ([`bench/soak.txt`](bench/soak.txt)). Re-measured after the 5xx counter was fixed — see below |
 | SIGTERM mid-load, 75k requests (manual run, see ADR 0018, not `just attack`) | **0 5xx**; a 20 MB response completed in full across it |
 | Rapid Reset flood beside ordinary load | attacker GOAWAYed; bystander p99 **11.65 ms → 8.11 ms** (unharmed) |
 | Abuse guard cost per frame | **below the noise floor** of frame dispatch: 5.6 / 5.4 / 0.59 ns per call, confidence intervals overlapping |
