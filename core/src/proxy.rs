@@ -381,6 +381,12 @@ pub const MIN_ADMIT: u32 = 2;
 /// intended and the gauge still reads whatever the loop decided.
 const MIN_TOTAL: u32 = 64;
 
+/// The smallest additive increase, in streams, so that growth cannot stall at a
+/// tiny budget. Deliberately a small constant: the step is meant to be a
+/// *proportion* of the current budget, and anything that scales with connection
+/// count displaces the proportion instead of bounding it below.
+const MIN_STEP: u64 = 32;
+
 #[derive(Debug)]
 pub struct Shared {
     pub pool: Pool,
@@ -567,7 +573,22 @@ impl Shared {
             // A sixteenth per sample is ~6%, against an immediate halving on
             // distress — so the response to being wrong is still far sharper than
             // the approach to being right.
-            let step = conns.max(current / 16);
+            //
+            // The floor is a small constant and **not** `conns`, which is what it
+            // used to be. That floor was meant to keep progress from stalling at
+            // a small budget, but it is an absolute number of streams while the
+            // thing it guards is a proportion, so at 500 client connections it
+            // stopped being a floor and became the whole step: with a budget near
+            // 3,000, `current / 16` is 187 and `conns` is 500, so the loop grew
+            // 17% a tick while its own comment claimed 6%.
+            //
+            // That is what produced the shedding this loop exists to prevent.
+            // Traced at 500 x 60: the budget sawtoothed between 2,000 and 8,000,
+            // each upswing drove some upstream connection's queue to `max_pending`
+            // exactly, and `h2proxy_upstream_shed_total` stepped up on precisely
+            // those samples. Overshoot in this loop is not paid in latency, it is
+            // paid in 503s.
+            let step = (current / 16).max(MIN_STEP);
             current.saturating_add(step).min(ceiling_total)
         };
 
