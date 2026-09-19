@@ -275,6 +275,18 @@ corrected p99 of 0.372 ms**, with zero failures at every step from 2,000 to
 corrections they have forced are in
 [Documentation/RESULTS.md](Documentation/RESULTS.md).
 
+### What concurrency costs
+
+| | |
+|---|---|
+| **14,110 concurrent streams** | held in **74.9 MB** RSS, from a 5.6 MB idle process |
+| Marginal cost of a stream | **3,126 bytes**, least squares over a four-point sweep |
+| Response octets held in the bridge, ever | **4,096 bytes** — one page, under 20,000 in-flight requests |
+
+500 connections held fixed while streams per connection are swept, so the cost
+of a connection and the cost of a stream are separated rather than averaged
+together. Three repeats, from [`bench/memory.csv`](bench/memory.csv).
+
 ### Resilience, measured
 
 | Claim | Number |

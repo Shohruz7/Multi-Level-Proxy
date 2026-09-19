@@ -482,6 +482,52 @@ proxy rather than asserted by the client. Delivered rate flattens at ~53k
 between the last two rows while concurrency doubles: past that point more
 in-flight requests buy queue depth, not throughput.
 
+## Memory profile — what concurrency costs
+
+The first goal in the README is bounded memory under any speed mismatch. It had
+a test behind it (`a_slow_client_throttles_a_fast_backend_instead_of_filling_memory`)
+and, until now, no number. [`bench/memory.sh`](../bench/memory.sh), promoted to
+[`bench/memory.csv`](../bench/memory.csv), 500 connections held fixed while
+streams per connection are swept, three repeats, sweep direction alternating:
+
+| streams/conn | peak streams | idle RSS | peak RSS | bridge held, ever | failed |
+|---|---:|---:|---:|---:|---:|
+| 2 | 964 | 5.6 MB | 37.2 MB | 2,048 B | 0 |
+| 8 | 3,122 | 5.6 MB | 44.6 MB | 3,072 B | 0 |
+| 20 | 8,407 | 5.5 MB | 67.3 MB | 4,096 B | 15 |
+| 40 | **14,110** | 5.6 MB | **74.9 MB** | **4,096 B** | **0** |
+
+Least squares over the four points puts the marginal cost of a stream at
+**3,126 bytes**, on a fixed cost of 5.6 MB. Connections are held fixed and
+streams swept precisely so that those two can be separated: peak RSS divided by
+peak streams would fold 500 TLS connections and their record buffers into a
+number reported as the price of a stream, and would flatter or damn the proxy
+depending only on the shape picked.
+
+**The bridge never held more than one page.** Under 20,000 in-flight requests
+the high-water mark of response octets received from backends and not yet
+delivered to clients is 4,096 bytes. That is the bounded-memory claim stated as
+a measurement rather than as a test name. The complementary case - a client that
+stops reading entirely, where the bridge is *supposed* to fill to the window and
+stop - is the backpressure test, not this table.
+
+**`settled` is not a leak check.** Resident memory after the load stops tracks
+the peak to within a few tens of KiB (74.9 -> 75.0 MB), because a
+general-purpose allocator keeps freed pages rather than returning them. Paired
+with the active-stream gauge reading 0, it says the process is holding address
+space, not request state. Growth *across* cycles is what a leak looks like, and
+that is `bench/soak.sh`: five minutes, a backend killed every 30 s, RSS
+plateaued at +1.9%.
+
+**These numbers are quotable from this machine in a way the rates are not.**
+In the very same runs, achieved throughput at 500 x 2 varied 25,207 / 30,609 /
+37,501 req/s - a 48% spread - while peak streams read 964 / 964 / 989 and peak
+RSS 37.2 / 37.9 / 38.0 MB, both inside 3%. Resident memory is set by what the
+process is holding; a rate is set by how fast the cores are willing to run, and
+on this laptop that is a function of how long it has been running. Any figure
+in this file that is a rate carries the thermal caveat recorded in the
+2026-09-19 correction. The ones in this section do not.
+
 ## Tuning pass 1 — flow-control windows
 
 The windows were *reasoned* from week 5 to week 8: 256 KiB per stream, a 1 MiB
