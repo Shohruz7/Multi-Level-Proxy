@@ -96,12 +96,64 @@ allocator="${allocator:-unknown}"
 
 echo "profile,offered_rps,achieved_rps,completed,failed,p50_ms,p90_ms,p99_ms,p999_ms,max_ms,closed_loop_p99_ms,dispatch_lag_p99_ms,streams_peak,allocator" > "$CSV"
 
+# The exact high-water mark of client streams, as counted by the engine at every
+# stream open rather than sampled.
+# The counter behind this is exact, but the daemon *publishes* it on a
+# one-second tick, so a scrape taken the instant a step ends can be up to one
+# tick stale and miss that step's own maximum. Waiting out a tick before reading
+# costs a second per step and removes the only way this number can be too low.
+peak_gauge() {
+  sleep 1.2
+  curl -s --max-time 2 "http://$METRICS/metrics" \
+    | awk '/^h2proxy_client_streams_peak /{print $2; exit}'
+}
+
+# **Two reasons the concurrency rows here are lower bounds.** One daemon serves
+# every step in this script, and that costs twice. The peak counter is
+# cumulative, so a step that stays under an earlier step's high falls back to
+# the sampled value below — and the throughput steps at 30k and above set a high
+# of ~6,600 that most concurrency steps never pass. And admission halves its
+# budget on distress, so by the time the concurrency profile runs the proxy has
+# already been driven into overload and admits less than a fresh one would:
+# 8,827 streams at 500 x 40 here against 14,115 from `bench/ceiling.sh`, which
+# restarts the daemon for every run.
+#
+# So `bench/ceiling.sh` is the authority for a concurrency number and this
+# column is a floor. Fixing it properly means restarting the daemon per step,
+# which is what `ceiling.sh` already does; duplicating that here would make this
+# script a slower copy of it.
+#
+# This step's peak, from the two sources that disagree in a known direction.
+#
+# The engine's peak is exact but **cumulative for the life of the daemon**, and
+# one daemon serves every step in this script, so it cannot be attributed to a
+# step by reading it once. The 200 ms sampler is per-step but undersampled: it
+# sees an instantaneous gauge a handful of times and misses every peak that
+# opens and closes between two looks.
+#
+# Combining them is exact where it matters. If the cumulative peak *moved* over
+# this step then this step set the all-time high, and the new value is precisely
+# this step's peak. If it did not move, this step stayed under some earlier
+# step's high and only the sampled lower bound is available. The headline — the
+# largest peak across all steps — therefore always comes from the exact branch,
+# because the step that sets the all-time high can only take that branch.
+step_peak() {
+  local before="$1" after="$2" sampled="$3"
+  if [ -n "${before:-}" ] && [ -n "${after:-}" ] \
+     && awk -v a="$after" -v b="$before" 'BEGIN{exit !(a>b)}'; then
+    echo "$after"
+  else
+    echo "${sampled:-NA}"
+  fi
+}
+
 step() {
   local profile="$1" rate="$2" conns="$3"
   echo "== $profile: $rate req/s over $conns connections ==" >&2
 
   # Sample the live concurrency *while the step runs*, and keep the maximum.
   #
+
   # The obvious gauge, `h2proxy_stream_concurrency_max`, is the wrong one: the
   # daemon sets it from a connection's summary when that connection *closes*, so
   # during a run — when every connection is still open, which is the entire point
@@ -109,9 +161,12 @@ step() {
   # reach. It read 1 against a proxy carrying thousands of streams. A gauge that
   # only moves at teardown cannot answer a question about steady state.
   #
-  # `h2proxy_client_streams_active` is sampled by the daemon every second and is
-  # the number the "10,000+ concurrent streams" claim is actually about. Watching
-  # it costs one curl per 200 ms against a local port.
+  # `h2proxy_client_streams_active` is sampled by the daemon every second, so
+  # watching it at 200 ms cannot see past that: it is a per-step *lower* bound,
+  # and `step_peak` above prefers the engine's exact count whenever this step is
+  # the one that set it.
+  local peak_before
+  peak_before=$(peak_gauge)
   local peakfile="$RESULTS/.peak.$$"
   echo 0 > "$peakfile"
   (
@@ -135,9 +190,11 @@ step() {
 
   kill "$sampler_pid" 2>/dev/null || true
   wait "$sampler_pid" 2>/dev/null || true
-  local peak
-  peak=$(cat "$peakfile" 2>/dev/null || echo NA)
+  local peak sampled peak_after
+  sampled=$(cat "$peakfile" 2>/dev/null || echo NA)
   rm -f "$peakfile"
+  peak_after=$(peak_gauge)
+  peak=$(step_peak "${peak_before:-}" "${peak_after:-}" "$sampled")
 
   # loadgen prints: label,mode,connections,rate_offered,duration,completed,
   # failed,achieved,p50,p90,p99,p999,max,closed_p99,lag_p99
@@ -165,6 +222,8 @@ concurrency_step() {
   local want=$((conns * streams))
   echo "== concurrency: $conns connections x $streams streams = $want in flight ==" >&2
 
+  local peak_before
+  peak_before=$(peak_gauge)
   local peakfile="$RESULTS/.peak.$$"
   echo 0 > "$peakfile"
   (
@@ -188,9 +247,11 @@ concurrency_step() {
 
   kill "$sampler_pid" 2>/dev/null || true
   wait "$sampler_pid" 2>/dev/null || true
-  local peak
-  peak=$(cat "$peakfile" 2>/dev/null || echo NA)
+  local peak sampled peak_after
+  sampled=$(cat "$peakfile" 2>/dev/null || echo NA)
   rm -f "$peakfile"
+  peak_after=$(peak_gauge)
+  peak=$(step_peak "${peak_before:-}" "${peak_after:-}" "$sampled")
 
   local completed failed achieved p50 p90 p99 p999 max closed lag
   IFS=, read -r _ _ _ _ _ completed failed achieved p50 p90 p99 p999 max closed lag <<<"$out"
@@ -217,7 +278,8 @@ if [ "$MODE" = "proxy" ] && { [ "$PROFILE" = "concurrency" ] || [ "$PROFILE" = "
   # So this profile is deliberately closed-loop, and its numbers are labelled
   # that way. Rate is secondary here — the question is whether the stream table,
   # the pool and the bookkeeping hold up with five figures of streams open, and
-  # the answer is the `streams_peak` column read off the proxy's own gauge.
+  # the answer is the `streams_peak` column, counted by the proxy at every
+  # stream open rather than sampled off a once-a-second gauge.
   for streams in ${CONCURRENCY_STREAMS:-2 8 20 40}; do
     concurrency_step "${CONCURRENCY_CONNECTIONS:-500}" "$streams"
   done
