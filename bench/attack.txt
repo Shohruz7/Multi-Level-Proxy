@@ -1,0 +1,33 @@
+h2proxy attack + failure measurement — 20260919T063548Z
+
+== control: 60s-scale load, no attack ==
+    finished in 721.11ms, 138675.68 req/s, 138.21MB/s
+    requests: 100000 total, 100000 started, 100000 done, 100000 succeeded, 0 failed, 0 errored, 0 timeout
+    status codes: 100000 2xx, 0 3xx, 0 4xx, 0 5xx
+    request     :      360us     50.89ms      5.07ms     8.70ms    20.67ms     5.52ms      3.11ms    92.01%
+
+== under attack: the same load, plus a Rapid Reset flood beside it ==
+    finished in 708.34ms, 141176.14 req/s, 140.70MB/s
+    requests: 100000 total, 100000 started, 100000 done, 100000 succeeded, 0 failed, 0 errored, 0 timeout
+    status codes: 100000 2xx, 0 3xx, 0 4xx, 0 5xx
+    request     :      490us     32.14ms      5.67ms     7.95ms    11.36ms     5.72ms      1.73ms    79.41%
+
+  guard peaks and terminations:
+    h2proxy_guard_peak_consecutive_empty 0
+    h2proxy_guard_peak_unanswered_rate 0
+    h2proxy_guard_peak_control_rate 5
+    h2proxy_guard_peak_reset_rate 0
+    h2proxy_guard_peak_continuations 0
+
+== backend failure: two backends, one killed mid-load ==
+  (killed the second backend mid-run)
+    finished in 1.47s, 136214.36 req/s, 135.76MB/s
+    requests: 200000 total, 200000 started, 200000 done, 200000 succeeded, 0 failed, 0 errored, 0 timeout
+    status codes: 200000 2xx, 0 3xx, 0 4xx, 0 5xx
+    request     :      362us     26.68ms      6.19ms     8.97ms    12.30ms     6.35ms      2.11ms    76.18%
+
+  health:
+    h2proxy_upstream_retries_total 40
+    h2proxy_backend_ejections_total 0
+    h2proxy_backends_healthy 2
+
