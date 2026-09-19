@@ -144,6 +144,13 @@ tune:
 confirm:
     bench/confirm.sh
 
+# The regressions this project has actually shipped, asserted. Structural
+# invariants only - no timing - so it runs the same on a shared CI runner as it
+# does here. Exits non-zero if the pool stops growing, if streams are refused on
+# healthy load, or if anything sheds. Runs on every push.
+regressions:
+    bench/regressions.sh
+
 # Admission control against the commit before it existed, at two shapes: one
 # overloaded and one not. The un-overloaded shape is the one that catches
 # regressions, because a throttle is nearly free on load that is already

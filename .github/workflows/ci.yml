@@ -180,6 +180,46 @@ jobs:
   # moment an engine signature changes, and it means nobody has fuzzed that
   # surface since. The cheap check keeps the expensive one available.
   # `just fuzz 60 <target>` is still how it is actually run.
+  # The regressions this project has actually shipped, asserted on every push.
+  #
+  # Every other job here checks that the proxy is *correct*. None of them noticed
+  # a 5.4x throughput loss that reached main, passed fmt, clippy, 271 tests,
+  # h2spec 146/146 in both modes, and the CDK assertions — and was found weeks
+  # later by comparing a benchmark against an artifact from August.
+  #
+  # The obvious fix, asserting throughput, is the one thing a shared CI runner
+  # cannot do. So this asserts the *structural* consequences instead: that same
+  # regression also collapsed the connection pool from five connections to one,
+  # and "did the pool grow past one under load" is a yes/no fact that holds on
+  # any hardware at any speed. The rate is printed and never compared.
+  #
+  # Verified against the commit that had the defect: the script exits 1 there,
+  # reporting 800 client-visible errors and a pool of 1.
+  regressions:
+    name: runtime invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # h2load, from the same nghttp2 suite the benchmarks use locally.
+      - name: Install h2load
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nghttp2-client
+          h2load --version
+
+      # Ten seconds of load at 50 connections x 20 streams. Not a benchmark: the
+      # duration exists so the pool gauge can be sampled at all, since at this
+      # proxy's rates a fixed request count is gone in under a second.
+      - name: Assert the runtime invariants
+        run: bench/regressions.sh
+
   fuzz-build:
     name: fuzz targets build
     runs-on: ubuntu-latest
