@@ -247,8 +247,22 @@ impl UpstreamRecord {
     /// stream limit *always* has a queue for as long as it is busy — that is
     /// what the limit means — and treating a transient one as distress is the
     /// mistake this predicate exists to avoid.
-    fn backed_up(&self, threshold: usize) -> bool {
-        self.queued() >= threshold
+    ///
+    /// The threshold is **one slot-turnover**: the peer's own advertised stream
+    /// limit. A connection holding 200 streams with 200 more waiting will take
+    /// two full turnovers to clear the queue, and a sibling is the only thing
+    /// that changes that. Below one turnover the queue drains on its own.
+    ///
+    /// This used to be `max_pending / 2`, and the coupling was a defect rather
+    /// than a shortcut. `max_pending` answers "how much overshoot may we absorb
+    /// before refusing", which is a memory and timing bound; this answers "is
+    /// this connection failing to keep up", which is about parallelism. Tying
+    /// them together meant raising the memory bound from 128 to 4096 silently
+    /// moved this threshold from 64 to 2048 — past anything the queue reaches in
+    /// practice — so the pool stopped growing. Measured on the same soak: five
+    /// upstream connections before, one after, and throughput fell with it.
+    fn backed_up(&self) -> bool {
+        self.queued() >= self.max_concurrent.load(Ordering::Relaxed).max(1)
     }
 
     /// Whether this connection is already holding every request it agreed to
@@ -398,15 +412,6 @@ impl Pool {
         self
     }
 
-    /// The queue depth at which a connection counts as failing to cope.
-    ///
-    /// Half the shed bound: deep enough that an ordinary burst does not trigger
-    /// a new socket, shallow enough that a connection genuinely falling behind
-    /// gets help well before it starts refusing requests.
-    fn queue_threshold(&self) -> usize {
-        (self.tuning.max_pending / 2).max(1)
-    }
-
     /// Millis since this pool was built.
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
@@ -485,8 +490,7 @@ impl Pool {
             || match self.tuning.growth {
                 crate::conn::PoolGrowth::Eager => true,
                 crate::conn::PoolGrowth::Queue => {
-                    let threshold = self.queue_threshold();
-                    !pool.conns.iter().any(|record| !record.backed_up(threshold))
+                    !pool.conns.iter().any(|record| !record.backed_up())
                 }
             };
         if pool.conns.len() < self.max_conns_per_backend && grow {
@@ -567,13 +571,47 @@ impl Pool {
     /// connection at the backend's stream limit is not in trouble - that is what
     /// the limit means - but one whose wait-for-a-slot queue keeps growing is.
     pub fn backed_up(&self) -> bool {
-        let threshold = self.queue_threshold();
         self.backends
             .lock()
             .expect("pool mutex poisoned")
             .values()
             .flat_map(|pool| pool.conns.iter())
-            .any(|record| record.backed_up(threshold))
+            .any(|record| record.backed_up())
+    }
+
+    /// Whether any connection's queue is close enough to the shed bound that
+    /// admission should retreat before anything is refused.
+    ///
+    /// **Not the same question as [`UpstreamRecord::backed_up`]**, and conflating
+    /// them cost a 5x loss of concurrency. `backed_up` asks "would a sibling
+    /// connection help", which is permanently true once the pool is at its
+    /// ceiling under real load — a deep queue there is the queue doing its job,
+    /// not distress. Feeding that into admission meant the loop saw distress on
+    /// every sample and halved its way to the floor: 3,679 streams held where the
+    /// same box held 18,317.
+    ///
+    /// Admission's job is to keep the proxy off the shed bound, so its early
+    /// warning is measured against that bound and nothing else.
+    ///
+    /// The margin is **one control period of arrivals**, not a round fraction.
+    /// Admission cannot react faster than its own sample, so the warning has to
+    /// fire far enough below the bound that a sample's worth of arrivals still
+    /// fits underneath. At the ~50,000 req/s this proxy sustains, a 200 ms sample
+    /// is ~1,250 requests per connection in a pool of eight — so with
+    /// `max_pending` at 2,048 the warning belongs at a third, leaving 1,366.
+    ///
+    /// Three quarters was tried and is too tight: 512 of margin against 1,250 of
+    /// arrivals, which held under an idle box and shed thousands of requests
+    /// under a loaded one. A threshold that only works when nothing else is
+    /// happening is not a threshold.
+    pub fn near_shed_limit(&self) -> bool {
+        let warn = self.tuning.max_pending / 3;
+        self.backends
+            .lock()
+            .expect("pool mutex poisoned")
+            .values()
+            .flat_map(|pool| pool.conns.iter())
+            .any(|record| record.queued() >= warn.max(1))
     }
 
     /// One live sample per upstream connection.
@@ -778,11 +816,11 @@ mod tests {
         let pool = Pool::new(Arc::clone(&stats), 4);
         let first = pool.checkout(&backend(3)).expect("a lease");
         first.record.set_max_concurrent(1);
-        // Derived from the bound rather than written as a number: the threshold
-        // is half of `MAX_PENDING`, and an earlier version of this test hardcoded
-        // 255 against a `MAX_PENDING` of 128. When that constant was re-derived
-        // the test started asserting the opposite of what it says.
-        first.record.set_queued(crate::conn::MAX_PENDING);
+        // One slot-turnover past the peer's limit, expressed in terms of that
+        // limit. An earlier version wrote a literal 255 against a threshold of
+        // `MAX_PENDING / 2`; when that constant was re-derived the test silently
+        // began asserting the opposite of what it says.
+        first.record.set_queued(4);
 
         let _second = pool.checkout(&backend(3)).expect("a second lease");
         assert_eq!(pool.connection_count(), 2);
@@ -910,6 +948,65 @@ mod tests {
             vec![1, 2],
             "queue growth must absorb where eager growth expands",
         );
+    }
+
+    #[tokio::test]
+    async fn growing_the_pool_does_not_depend_on_the_memory_bound() {
+        // The regression this pins cost 5.4x throughput and was invisible in
+        // every test and benchmark that existed at the time.
+        //
+        // Whether a connection earns a sibling is a question about parallelism.
+        // It used to be answered with `max_pending / 2`, which is a question
+        // about memory. Raising `MAX_PENDING` from 128 to 4096 to widen the queue
+        // therefore moved the growth threshold from 64 to 2048 — past anything a
+        // real queue reaches — so the pool stopped growing. Upstream parallelism
+        // fell from five connections to one on an unchanged workload, throughput
+        // fell with it, and nothing failed.
+        //
+        // Driven through `checkout`, not through the predicate, because the
+        // predicate is not where the bug was: the same *connection state* must
+        // produce the same *growth decision* under any memory bound.
+        for max_pending in [128usize, 4096] {
+            let pool =
+                Pool::new(Arc::new(ProxyStats::default()), 4).with_tuning(crate::conn::Tuning {
+                    max_pending,
+                    ..crate::conn::Tuning::default()
+                });
+            // Fill the connection to the backend's limit: the growth gate is
+            // only consulted once no warm connection has room, so a half-empty
+            // connection never reaches the decision under test.
+            let first = pool.checkout(&backend(9)).expect("a lease");
+            first.record.set_max_concurrent(100);
+            let _held: Vec<Lease> = (1..100)
+                .map(|_| pool.checkout(&backend(9)).expect("a lease"))
+                .collect();
+            // 150 waiting behind a limit of 100: one and a half turnovers of work
+            // this connection cannot clear alone. Deliberately between the two
+            // thresholds the old coupling produced — 150 is past `128/2` but far
+            // short of `4096/2` — so a version that still consults `max_pending`
+            // grows in one iteration of this loop and not the other.
+            first.record.set_queued(150);
+
+            let _second = pool.checkout(&backend(9)).expect("a second lease");
+            assert_eq!(
+                pool.connection_count(),
+                2,
+                "a connection a turnover-and-a-half behind must get a sibling, \
+                 whatever max_pending ({max_pending}) happens to be",
+            );
+        }
+
+        // The complement, so the assertion above is not vacuously true: half a
+        // turnover drains on its own and must not spawn a socket.
+        let pool = Pool::new(Arc::new(ProxyStats::default()), 4);
+        let first = pool.checkout(&backend(10)).expect("a lease");
+        first.record.set_max_concurrent(100);
+        let _held: Vec<Lease> = (1..100)
+            .map(|_| pool.checkout(&backend(10)).expect("a lease"))
+            .collect();
+        first.record.set_queued(50);
+        let _second = pool.checkout(&backend(10)).expect("a second lease");
+        assert_eq!(pool.connection_count(), 1);
     }
 
     #[test]
