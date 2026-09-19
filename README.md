@@ -277,18 +277,28 @@ corrections they have forced are in
 
 ### What concurrency costs
 
+The claim this project exists to make, measured where it could fail: with 64 KiB
+responses and 9,747 streams open, **639 MB of response body is in flight and
+under 1 MB of it is resident** — with nothing failed, nothing shed and no 5xx.
+
 | | |
 |---|---|
-| **24,904 concurrent streams** | held in **103 MB** RSS, from a 5.6 MB idle process |
-| Failed requests and 5xx, across 18 runs from 959 to 30,702 streams | **0** |
-| Marginal cost of a stream | **2,865 bytes**, least squares over a six-point sweep |
-| Response octets held in the bridge, ever | **4,096 bytes** — one page, at 60,000 offered in-flight requests |
+| Body in flight vs. held in the bridge | **639 MB** moving, **803 KB** held |
+| Delivered payload at that shape | **~360 MB/s** |
+| Concurrent streams, 1 KiB responses | **38,028** in 125 MB, from a 5.6 MB idle process |
+| Resident memory as offered load nearly doubles, 60k → 100k in flight | 102 → 125 MB, then refuses rather than grows |
 
 500 connections held fixed while streams per connection are swept, so the cost
-of a connection and the cost of a stream are separated rather than averaged.
-Medians of three repeats; the runs behind the headline range 21,691 to 30,702,
-since more offered concurrency means more queueing and more variance. From
-[`bench/memory.csv`](bench/memory.csv).
+of a connection and the cost of a stream separate rather than average. From
+[`bench/memory.csv`](bench/memory.csv) and
+[`bench/memory-64k.csv`](bench/memory-64k.csv).
+
+There is an **open defect** behind these numbers, written up in
+[RESULTS.md](Documentation/RESULTS.md): above 500 x 8, a small fraction of runs
+return client-visible stream refusals, and the rate does not rise with load —
+500 x 40 has failed twice while 500 x 200 has never failed. Until that is
+understood, the zero-failure claim here is made only for the 64 KiB sweep and
+for shapes at or below 500 x 8.
 
 ### Resilience, measured
 

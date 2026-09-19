@@ -492,16 +492,25 @@ streams per connection are swept, three repeats, sweep direction alternating.
 
 | streams/conn | peak streams | idle RSS | peak RSS | bridge held, ever | failed | 5xx | shed |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 959 | 5.6 MB | 37.1 MB | 2,048 B | 0 | 0 | 0 |
-| 8 | 3,102 | 5.5 MB | 44.4 MB | 3,072 B | 0 | 0 | 0 |
-| 20 | 8,102 | 5.6 MB | 66.1 MB | 3,072 B | 0 | 0 | 0 |
-| 40 | 14,103 | 5.6 MB | 78.7 MB | 3,072 B | 0 | 0 | 1,686 |
-| 80 | 18,120 | 5.5 MB | 86.8 MB | 4,096 B | 0 | 0 | 365 |
-| **120** | **24,904** | 5.5 MB | **103.3 MB** | 3,072 B | **0** | **0** | 8,367 |
+| 2 | 967 | 5.6 MB | 36.9 MB | 2,048 B | 0 | 0 | 0 |
+| 8 | 3,119 | 5.5 MB | 44.3 MB | 3,072 B | 0 | 0 | 0 |
+| 20 | 7,955 | 5.6 MB | 63.9 MB | 3,072 B | 0 | 0 | 0 |
+| 40 | 14,051 | 5.5 MB | 74.0 MB | 4,096 B | 746 | 0 | 746 |
+| 80 | 16,187 | 5.5 MB | 74.7 MB | 4,096 B | 0 | 0 | 515 |
+| 120 | 23,030 | 5.6 MB | 101.6 MB | 3,072 B | 0 | 0 | 0 |
+| 160 | 31,412 | 5.6 MB | 104.4 MB | 4,096 B | 0 | 0 | 1,285 |
+| **200** | **38,028** | 5.5 MB | **125.3 MB** | 3,072 B | 0 | 0 | 463 |
 
-Medians of three. **Zero failed requests and zero 5xx in all eighteen runs.**
-Least squares over the six points puts the marginal cost of a stream at
-**2,865 bytes**, on a fixed cost of 5.6 MB.
+Medians of two. Least squares over the eight points puts the marginal cost of a
+stream at **2,381 bytes**, on a fixed cost of 5.6 MB - quoted as a fit rather
+than a constant, because it is not one: over 2 to 40 it is 3,126 bytes and over
+80 to 120 it is 1,691, so per-stream cost amortises as the table fills.
+
+**Resident memory plateaus while offered load triples.** From 500 x 120 to
+500 x 200 the offered in-flight count goes 60,000 -> 100,000 and peak RSS moves
+101.6 -> 125.3 MB. The proxy stops growing and starts refusing, which is the
+bound doing its job rather than a number to be pushed. Note also that the
+highest shapes are not the ones that failed.
 
 **The earlier ceiling was the harness, not the proxy.** Every concurrency figure
 in this project came from 500 x 40 or below, a shape described throughout as
@@ -512,12 +521,30 @@ proxy changed to produce these numbers - no constant, no policy, not one line of
 the edge. The old numbers were not wrong about what they measured; they were
 measurements of the benchmark.
 
-**Shedding is not failing, and the distinction is now recorded rather than
-inferred.** `shed` counts a request the pool refused because a connection's
-wait-for-a-slot queue was full; the retry path carries it to another connection.
-At 500 x 120 that happened 8,367 times and no client saw anything: `failed` and
-`responses_5xx` are both zero. Reading `shed` as an error rate would badly
-misreport this proxy, which is why the two sit in adjacent columns.
+**Shedding sometimes reaches the client, and an earlier version of this section
+said it never did. That was wrong.** `shed` counts a request the pool refused
+because a connection's wait-for-a-slot queue was full. The handler for it
+(`ServiceEvent::Shed`) drops the route and closes the client stream, and its
+comment is explicit that a retry is pointless - the queue that refused this
+request is the queue every retry would land in. So a shed is *not* absorbed by
+the retry path, and the first write-up of this table claimed it was.
+
+The measurements say the relationship is real but not simple. Across the runs in
+`bench/results/`, `failed` equals `shed` exactly in several (15/15, 211/211,
+535/535) and is far below it in others (448 against 1,238; 149 against 817), and
+there are runs with thousands shed and nothing failed at all. `responses_5xx` is
+zero in every case, so whatever reaches the client is a stream-level refusal
+rather than a 503.
+
+**Client-visible failures are sporadic and not ordered by load**, which is the
+part worth chasing. 500 x 40 has come back clean in most runs this file is built
+on and failed 535 and 211 requests in two others; 500 x 200, five times the
+offered concurrency, has not failed once. A failure mode that does not worsen
+with load is not saturation, and the shape of it - a refusal issued for a stream
+the client had already opened - is the same class as the defect ADR 0023 records
+and ack-gating was meant to close. **It is an open defect, not a tuning
+artefact, and no zero-failure claim should be made above 500 x 8 until it is
+understood.**
 
 **The spread widens with the load, and the medians hide it.** At 500 x 2 the
 three repeats read 959 / 977 / 949 streams, inside 3%. At 500 x 120 they read
@@ -534,13 +561,38 @@ the connections, the slope is the streams. The slope is not constant either -
 fitted over 2 to 40 it is 3,126 bytes and over 80 to 120 it is 1,691, so
 per-stream cost amortises as the table fills.
 
-**The bridge never held more than one page.** Across every shape, including
-60,000 offered in-flight requests at 500 x 120, the high-water mark of response
-octets received from backends and not yet delivered to clients is 4,096 bytes.
-That is the bounded-memory claim as a measurement rather than as a test name.
-The complementary case - a client that stops reading entirely, where the bridge
-is *supposed* to fill to the window and stop - is the backpressure test, not
-this table.
+**At 1 KiB the bridge never held more than one page, and that says more about
+the benchmark than the proxy.** The high-water mark of response octets received
+from backends and not yet delivered to clients is 4,096 bytes at every shape
+above - but a kilobyte reaches a client about as fast as it arrives, so there is
+never anything to hold. Reporting that as the bounded-memory result would be
+measuring the response size.
+
+### Where the bridge actually has something to hold
+
+Same harness, `BODY_SIZE=65536`, three repeats:
+
+| streams/conn | peak streams | peak RSS | bridge held, ever | body in flight | failed | 5xx | shed |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 3,934 | 143.2 MB | 602 KB | 258 MB | 0 | 0 | 0 |
+| 20 | 7,837 | 170.0 MB | 754 KB | 514 MB | 0 | 0 | 0 |
+| 40 | **9,747** | **178.4 MB** | **803 KB** | **639 MB** | **0** | **0** | **0** |
+
+**639 MB of response body moving through the proxy, and under 1 MB of it
+resident at any instant** - three orders of magnitude between what is in flight
+and what is held. That is the claim this project was built to make, and at 1 KiB
+it could not be made at all, because nothing was ever in flight.
+
+Delivered payload at 500 x 40 is about 5,500 req/s of 64 KiB, or **~360 MB/s**.
+Nothing shed and nothing failed at any shape, which is the other half of the
+result: the bound is held by flow control coupling the two connections, not by
+refusing work.
+
+Per-stream cost rises to 6,470 bytes here against 2,865 at 1 KiB, which is the
+same fact from the other side - a stream carrying a 64 KiB response holds more
+of it mid-flight. The complementary case, a client that stops reading entirely
+and where the bridge is *supposed* to fill to the window and stop, is the
+backpressure test rather than this table.
 
 **`settled` is not a leak check.** Resident memory after the load stops tracks
 the peak to within tens of KiB, because a general-purpose allocator keeps freed

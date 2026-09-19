@@ -40,8 +40,9 @@
 # rather than within one. That is where a leak would show, and it does not.
 #
 # Usage:
-#   bench/memory.sh                                  # 4 shapes, 3 repeats
-#   SHAPES="500x40" REPEATS=5 bench/memory.sh
+#   bench/memory.sh                                  # 6 shapes, 3 repeats
+#   STREAM_STEPS="40 120" REPEATS=5 bench/memory.sh
+#   BODY_SIZE=65536 bench/memory.sh                  # where the bridge matters
 #   CONNS=200 bench/memory.sh
 set -euo pipefail
 
@@ -60,6 +61,16 @@ METRICS="${METRICS:-127.0.0.1:9090}"
 BACKEND="${BACKEND:-127.0.0.1:8080}"
 TARGET="${TARGET:-https://127.0.0.1:8443/}"
 SETTLE="${SETTLE:-5}"
+# Response size, sized at both ends together.
+#
+# The default of 1 KiB barely exercises the thing this harness is named after:
+# a kilobyte of response is delivered to the client almost as fast as it
+# arrives, so the bridge never has anything to hold and reports one page no
+# matter how many streams are open. The claim only becomes interesting when the
+# in-flight data is large enough that holding it would hurt - 25,000 streams of
+# 64 KiB is 1.6 GiB of response body that the proxy is moving and must not be
+# storing.
+BODY_SIZE="${BODY_SIZE:-1024}"
 
 mkdir -p "$RESULTS"
 (cd "$ROOT" && cargo build --release -p h2proxyd -p backend -p loadgen)
@@ -82,7 +93,7 @@ run_one() {
   stop_all
   sleep 2
 
-  "$ROOT/target/release/backend" >/dev/null 2>&1 &
+  BACKEND_BODY_SIZE="$BODY_SIZE" "$ROOT/target/release/backend" >/dev/null 2>&1 &
   local backend_pid=$!
   H2PROXYD_UPSTREAMS="$BACKEND" H2PROXYD_METRICS="$METRICS" \
     "$ROOT/target/release/h2proxyd" >/dev/null 2>&1 &
@@ -153,7 +164,7 @@ run_one() {
 
 echo "conns,streams_per_conn,repeat,idle_rss_kb,peak_rss_kb,settled_rss_kb,peak_streams,peak_bridge_bytes,live_after,achieved_rps,completed,failed,shed,responses_5xx" > "$CSV"
 
-echo "$CONNS connections, streams per connection: $STREAM_STEPS, $REPEATS repeats" >&2
+echo "$CONNS connections, streams per connection: $STREAM_STEPS, $REPEATS repeats, ${BODY_SIZE}-byte responses" >&2
 for repeat in $(seq 1 "$REPEATS"); do
   # Alternate the sweep direction, so a machine that drifts in one direction
   # cannot be read as a trend in the variable being swept.
@@ -167,7 +178,14 @@ for repeat in $(seq 1 "$REPEATS"); do
   done
 done
 
-cp "$CSV" "$HERE/memory.csv"
+# Promoted under a name that carries the response size, because the 1 KiB and
+# 64 KiB sweeps answer different questions and neither should quietly overwrite
+# the other: one measures what a stream costs, the other what the bridge holds.
+if [ "$BODY_SIZE" = "1024" ]; then
+  cp "$CSV" "$HERE/memory.csv"
+else
+  cp "$CSV" "$HERE/memory-$((BODY_SIZE / 1024))k.csv"
+fi
 
 echo >&2
 echo "== $CSV (promoted to bench/memory.csv) ==" >&2
