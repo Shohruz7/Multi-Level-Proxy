@@ -1,6 +1,87 @@
 # ADR 0023 — Admission control belongs in SETTINGS, not in 503s
 
-Status: accepted · Date: 2026-09-16 · Design doc: §5.3, §10.1 · Supersedes the shed path added for [0019](0019-abuse-mitigations.md)-adjacent overload handling
+Status: accepted, corrected 2026-09-19 · Date: 2026-09-16 · Design doc: §5.3, §10.1 · Supersedes the shed path added for [0019](0019-abuse-mitigations.md)-adjacent overload handling
+
+## Correction (2026-09-19): the first implementation was a 5.4x regression
+
+The reasoning below is unchanged and still holds. The implementation of it did
+not, and the gap between the two is the point of this section.
+
+Measured against `bench/results/attack-20260808T013308Z.txt`, the retained run
+from before any of this existed, on the same command (`h2load -c 50 -m 20`):
+
+| | Aug, pre-admission | As first shipped | After the correction |
+|---|---:|---:|---:|
+| control, no attack | 178,301 req/s | 32,756 req/s | 134,323 req/s |
+| control errors | 0 | 800 | **0** |
+
+Five defects, and only one of them was in the control loop proper.
+
+**1. `MAX_PENDING` silently disabled pool growth — the dominant cause.** The
+"is this connection coping" threshold was `max_pending / 2`, so raising the queue
+bound from 128 to 4,096 moved it from 64 to 2,048, past anything a real queue
+reaches. Upstream parallelism collapsed from five connections to one on an
+unchanged workload (`bench/results/soak-*.csv`, 48 samples at 5 against 51 at 1)
+and throughput went with it. A memory bound was setting parallelism policy.
+`UpstreamRecord::backed_up` now asks the peer's own advertised limit instead, and
+`growing_the_pool_does_not_depend_on_the_memory_bound` fails if that coupling
+ever returns.
+
+**2. The loop was a ratchet.** Slow start exited permanently at the first
+distress and then grew one stream per connection per one-second sample: 254
+seconds from floor to ceiling, against a three-second benchmark. Replaced with a
+remembered `ssthresh`, a 200 ms period of its own, and a probe step proportional
+to the current total — a flat step is the same ratchet in slower clothing, since
+the range runs to `ceiling x connections`.
+
+**3. It steered the wrong quantity.** The budget is advertised per connection
+while distress is global, so the same budget meant 100 streams at 50 clients and
+1,000 at 500. The loop now steers the total and divides for advertisement.
+
+**4. It refused streams the client was entitled to open.** `SETTINGS_MAX_CONCURRENT_STREAMS`
+is unlimited until the server says otherwise, so a client that opens twenty
+before our first SETTINGS lands has broken no rule. Enforcement now waits for the
+acknowledgement — and for *each* change, tracked as a count of outstanding
+SETTINGS, because gating only on "has it ever acked" closed the handshake race
+and left the identical race open on every later reduction, worth 149 refusals.
+
+**5. Admission reused the pool's distress signal.** `backed_up` asks whether a
+connection wants a sibling, which is permanently true once the pool is at its
+ceiling under load. Feeding it to admission made every sample look like distress
+and walked the budget down to the floor: 3,679 streams held where the same box
+held 18,317. Admission now measures against the shed bound it exists to avoid,
+one control period of arrivals below it — a margin that has to be derived rather
+than picked, because three quarters held on an idle box and shed thousands under
+a loaded one.
+
+### Why none of this was caught
+
+The A/B that blessed the original ran a single shape, 500 connections x 40
+streams. That workload is already overloaded, and a throttle is nearly free when
+everything is queueing anyway — so the arms looked equal. The regression lived
+entirely in the un-overloaded regime, which was never measured. `bench/admission-ab.sh`
+now runs both shapes and records `pool_conns`, the variable that collapsed while
+nothing was looking at it.
+
+Its verdict was wrong twice in the same way, which is worth recording separately:
+it first compared only throughput and printed "no regression" for a run in which
+concurrency had fallen 4.4x and 3,248 requests had failed, and then flagged the
+fixed build being 1.26x *faster* as a defect. A benchmark that reports the number
+you were watching while a different number moves is how this class of defect
+survives.
+
+### What this changes about the concurrency claim
+
+At 500 x 40 the corrected build holds **6,661** streams where the pre-admission
+build held **18,215** — and serves 29,975 req/s against 23,784, with zero
+failures on both. By Little's law that is 222 ms of residency against 766 ms.
+
+Holding less work is the feature. The pre-admission build held 18,215 because it
+had no bound and queued everything, and "concurrent streams held" measures
+exactly what admission control exists to limit. The two claims are mutually
+exclusive, and the honest headline is the throughput-and-latency pair rather than
+the stream count. `bench/admission-ab.sh` therefore *reports* concurrency and
+asserts only throughput and failures.
 
 ## Context
 

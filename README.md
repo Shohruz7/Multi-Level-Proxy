@@ -156,8 +156,13 @@ surface since.
 - **Goal**: a correct HTTP/2 intermediary that negotiates `h2` over TLS via
   ALPN, multiplexes streams, honors flow control in both directions, and keeps
   **bounded memory** under any speed mismatch between client and upstream.
-- **Goal**: 10,000+ concurrent streams and a tail that survives an honest
-  open-loop measurement, two figures from two test profiles. Met at 17,872.
+- **Goal**: a tail that survives an honest open-loop measurement, and enough
+  concurrency to make that tail mean something. Met at 20,000 req/s with a
+  corrected p99 of 0.400 ms, holding 7,904 streams at peak throughput.
+  The original wording of this goal was "10,000+ concurrent streams", and it was
+  retired rather than restated: once the proxy bounds what it admits, streams
+  held is a number it is trying to keep *down*, so setting a floor under it is
+  setting a floor under queueing (ADR 0023).
 - **Goal**: reproducible infrastructure as code (AWS CDK) and a load-test
   harness that reports tail latency honestly. The harness is
   [`loadgen`](loadgen/), written for this project because `h2load` is a closed
@@ -276,18 +281,31 @@ experiments behind each number are in
 
 | | Number |
 |---|---|
-| Concurrent streams held open, measured at the proxy's own gauge | **17,872** at 53,600 req/s, **0 failed** |
-| Peak throughput, closed loop through a backend | **76,919 req/s** (10 connections × 100 streams) |
-| …at the standard 50-connection shape | 52,967 req/s |
-| Upstream connections at 10,000 req/s, after the pool fix | **1**, at p99 **0.39 ms** (median of 6, 0.21-0.63) |
+| Knee, open loop with the coordinated-omission correction | **20,000 req/s** at p99 **0.400 ms** |
+| Failures across every profile, 2k to 50k req/s and 1k to 20k streams | **0** |
+| Peak throughput through a backend | **48,146 req/s**, holding 7,904 streams at p99 301 ms |
+| Five minutes of load with a backend killed every 30 s | **16.8M requests, 0 5xx**, RSS flat, every gauge settled to 0 |
+
+Every row comes from [`bench/curve.csv`](bench/curve.csv) and
+[`bench/soak.txt`](bench/soak.txt). The 50,000 req/s step is in the file and is
+deliberately not quoted: at that rate the load generator is itself saturated and
+says so, with 149 ms of the 313 ms p99 being its own dispatch lag.
+
+**Concurrent streams held is deliberately not the headline.** An earlier build
+held 18,215 streams at 23,784 req/s; this one holds 6,661 at 29,975 with zero
+failures on both — 222 ms of residency against 766 ms. The difference is
+admission control, and "streams held" measures exactly what admission control
+exists to limit, so a larger number there is latency wearing a flattering name.
+[ADR 0023](docs/adr/0023-admission-by-settings.md) has the measurement and the
+5.4x regression that came of getting it wrong.
 
 ### Resilience, measured
 
 | Claim | Number |
 |---|---|
-| Backend killed mid-load, 200k requests | **0 5xx**, 2 ejections, 247 retries rescued |
+| Backend killed mid-load, 200k requests | **200,000 / 200,000 succeeded**, 0 5xx; 40 retries carried the in-flight requests to the surviving backend. The run is 1.5 s, too short for the health policy to eject, so this measures the retry path rather than ejection ([`bench/attack.txt`](bench/attack.txt)) |
 | Backend that accepts and then answers nothing | detected and ejected in ~2× `ping_idle`; the request gets an answer instead of hanging |
-| 5-minute soak, a backend killed and restarted every 30 s | 13.0M requests, **0 5xx**, 1,177 retries, 16 ejections, 126 probes / 0 probe failures; RSS plateaued and every in-flight gauge settled to **0** |
+| 5-minute soak, a backend killed and restarted every 30 s | **16.8M requests, 0 5xx**, 1,248 retries, 19 ejections; RSS plateaued (+1.9%) and every in-flight gauge settled to **0** ([`bench/soak.txt`](bench/soak.txt)) |
 | SIGTERM mid-load, 75k requests (manual run, see ADR 0018, not `just attack`) | **0 5xx**; a 20 MB response completed in full across it |
 | Rapid Reset flood beside ordinary load | attacker GOAWAYed; bystander p99 **11.65 ms → 8.11 ms** (unharmed) |
 | Abuse guard cost per frame | **below the noise floor** of frame dispatch: 5.6 / 5.4 / 0.59 ns per call, confidence intervals overlapping |

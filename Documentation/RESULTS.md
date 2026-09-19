@@ -53,6 +53,98 @@ size of the correction is reported rather than asserted. It is small while the
 proxy is comfortable and grows into the dominant term as the knee approaches —
 which is exactly where a p99 gets quoted.
 
+> ## Correction (2026-09-19): the fix for *that* was itself a 5.4x regression
+>
+> The fourth correction in this file, and the pattern is now the subject rather
+> than an embarrassment: every number here that was measured in one regime and
+> quoted in another has been wrong.
+>
+> The admission control added on 2026-09-16 was blessed by an A/B at 500
+> connections x 40 streams. That workload is already overloaded, and a throttle
+> is nearly free when everything is queueing anyway, so the arms looked equal. It
+> was never measured on load the proxy was *not* struggling with. There:
+>
+> | `bench/attack.sh`, control section | Aug, pre-admission | As shipped | Corrected |
+> |---|---:|---:|---:|
+> | throughput | 178,301 req/s | 32,756 req/s | 134,323 req/s |
+> | errors | 0 | 800 | **0** |
+>
+> Five separate defects, detailed in [ADR 0023](../docs/adr/0023-admission-by-settings.md).
+> The dominant one was not in the control loop at all: `MAX_PENDING` and the
+> pool's "is this connection coping" threshold shared a constant, so widening the
+> queue from 128 to 4,096 moved the growth threshold from 64 to 2,048 and the
+> pool stopped growing. Upstream parallelism fell from five connections to one —
+> visible directly in the soak CSVs, 48 samples at 5 against 51 at 1 — and
+> throughput fell with it. A memory bound was quietly setting parallelism policy.
+>
+> **The concurrency headline does not survive this, and should not.** At 500 x 40
+> the corrected build holds 6,661 streams where the pre-admission build held
+> 18,215, while serving 29,975 req/s against 23,784 with zero failures on both —
+> 222 ms of residency against 766 ms by Little's law.
+>
+> Holding less work is the feature. "Concurrent streams held" measures precisely
+> what admission control exists to limit, so that number and this proxy's current
+> behaviour are mutually exclusive claims. The 18,792 figure quoted below was
+> measured on a build with no admission control; it was true of that build and is
+> not true of this one. The honest pair is throughput and latency.
+>
+> Two of the five defects were in the measurement rather than the code — a
+> single-shape A/B, and a verdict that compared only throughput and so reported
+> "no regression" for a run in which concurrency had fallen 4.4x and 3,248
+> requests had failed. `bench/admission-ab.sh` now runs both an overloaded and an
+> un-overloaded shape, records `pool_conns`, and asserts throughput and failures
+> while *reporting* concurrency.
+
+> ## Correction (2026-09-16, later): the fix for the cliff was a 7x regression, and it contaminated the numbers below
+>
+> The bounded upstream queue added on 2026-09-15 (`a58cd21`) was never measured
+> against the code it replaced. Measured now — interleaved against `f77ec11`, the
+> commit before it, three pairs at 500 connections x 40 streams:
+>
+> | Arm | Served | Failed | Peak client streams |
+> |---|---:|---:|---:|
+> | before the bound | 52,324-59,459 req/s | 0 | 17,809-17,863 |
+> | after the bound | 6,209-8,662 req/s | ~1.4M | 5,073-10,359 |
+>
+> A 7x throughput regression, disjoint across all three pairs. The mechanism is
+> in the counters: the bounded build produced **more** responses than the
+> unbounded one, ~113,000/s against ~55,000/s, and **93% of them were 503s**. It
+> was not overloaded by requests. It was overloaded by its own refusals.
+>
+> Against a client holding a fixed number of requests in flight, a refusal that
+> is cheaper than a service completes sooner, which frees the client to re-offer
+> sooner. Rejection cheaper than service is positive feedback, and no depth bound
+> breaks that loop — it only moves where the loop starts.
+>
+> **Fixed** by moving admission to where HTTP/2 already provides for it: the
+> advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is now a control loop rather than
+> a constant, so a conforming client waits for a slot instead of being refused
+> (ADR 0023). Re-measured on the same box: 32,880-61,520 req/s, 17,817-17,861
+> peak streams — within 1% of the pre-admission concurrency, arms overlapping
+> with no effect to report. `bench/admission-ab.csv`.
+>
+> **What this contaminates.** The correction immediately below retracts the
+> ">=210,000 req/s" headline and replaces it with 52,967 and 76,919 req/s from a
+> closed-loop re-measurement. Those runs were taken on **2026-09-15, after
+> `a58cd21` landed** — that is, on the regressed build. They are therefore a
+> lower bound on a proxy that was refusing most of its offered work, not a
+> measurement of this one.
+>
+> The retraction of 210,000 still stands on its own evidence: it was never
+> reproducible and never had an artifact, which is why it was retracted. But the
+> *replacement* numbers are not trustworthy either, and are re-measured in the
+> table at the top of this file rather than carried forward. The 18,792 figure
+> this paragraph originally quoted has since been superseded twice over — see the
+> 2026-09-19 correction above, which retires the concurrency headline entirely.
+>
+> Three defects were found inside the fix itself, each by measurement rather than
+> reasoning, and each is recorded in ADR 0023 because the reasoning that produced
+> them was plausible every time: sizing admission to upstream *slot count*
+> (measured 22,000 req/s — worse than no admission control at all); reacting to
+> queue depth rather than to shedding (shed 38,000/s while the depth gauge read
+> clear between samples); and an AIMD additive step of 8 on a *per-connection*
+> budget, which is +4,000 streams per sample across 500 clients.
+
 > ## Correction (2026-09-16): the pool-fix numbers below are a single run, and they do not reproduce
 >
 > This is the third correction in this file and it follows the same pattern as
