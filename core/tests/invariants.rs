@@ -660,6 +660,57 @@ async fn the_stream_peak_is_counted_at_the_open_and_never_decays() {
     );
 }
 
+/// A 5xx the proxy writes itself still has to reach the 5xx counter.
+///
+/// `ProxyStats::response` was called from exactly one place - an upstream
+/// `Head` passing through to the client - so every answer the proxy produced
+/// *without* a backend was invisible to it. Those are written inside
+/// `Connection::reject_stream`, and the engine owns no metrics dependency by
+/// design, so 502s and 503s went to clients while
+/// `h2proxy_responses_total{class="5xx"}` sat at zero.
+///
+/// It was found by instrumenting the load generator to record *what* a client
+/// saw rather than that something failed: the client reported thousands of
+/// non-2xx responses in runs where the proxy reported 100% 2xx. Both were
+/// reading their own counters correctly and one of them was not connected.
+///
+/// This is the second instrument in this project caught lying while the proxy
+/// itself behaved correctly, which is why it is pinned here rather than fixed
+/// and forgotten: nothing else in the suite would have noticed, because every
+/// assertion about 5xx was reading the same broken counter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_5xx_the_proxy_writes_itself_is_counted_as_a_5xx() {
+    // A backend address that nothing is listening on: bind to get a real port,
+    // then drop the listener so connecting to it is refused rather than hanging.
+    let dead = {
+        let probe = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        probe.local_addr().expect("addr")
+    };
+    let (socket, shared, _shutdown) = spawn_proxy(vec![dead]).await;
+
+    let mut peer = RawPeer::new(socket);
+    peer.client_handshake().await;
+    peer.send_headers(1, &request("/"), true).await;
+
+    settles(|| {
+        (shared.stats.responses(5) == 0).then(|| {
+            format!(
+                "the client was answered but the 5xx counter reads {}; a status \
+                 the engine writes is still a status the client received",
+                shared.stats.responses(5),
+            )
+        })
+    })
+    .await;
+
+    // And it must not be double counted as a success on the way past.
+    assert_eq!(
+        shared.stats.responses(2),
+        0,
+        "an unreachable backend produced a 2xx, which it cannot have",
+    );
+}
+
 /// Per-connection and per-stream state has to stay small, because week 8's
 /// concurrency profile multiplies it by ten thousand.
 ///

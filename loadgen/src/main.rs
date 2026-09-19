@@ -70,7 +70,105 @@ struct Sample {
     /// How late dispatch was: `corrected_us - service_us`, which is the
     /// generator's own queueing delay.
     lag_us: u64,
-    ok: bool,
+    outcome: Outcome,
+}
+
+/// What the client actually saw, rather than merely that something went wrong.
+///
+/// This exists because `ok: bool` could not answer the question it was being
+/// asked. A sporadic failure appeared above 500x8 that did not scale with
+/// offered load - 500x40 failed twice in a session while 500x200, five times
+/// the concurrency, never failed - and a boolean cannot distinguish a stream
+/// the proxy refused from a connection that broke from a body that died
+/// halfway. Those have different causes and different fixes, and conclusions
+/// drawn from the count alone were guesswork.
+///
+/// `Refused` is the one the investigation turns on: RST_STREAM(REFUSED_STREAM)
+/// on a stream the client had already opened is the signature of admission
+/// clamping down on work it had implicitly accepted, which is the defect class
+/// ADR 0023 records.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Outcome {
+    Ok,
+    /// A response arrived and was not 2xx.
+    Status,
+    /// RST_STREAM with REFUSED_STREAM: nothing was processed, and the peer
+    /// promises so (RFC 9113 SS5.1.2).
+    Refused,
+    /// RST_STREAM with any other code.
+    Reset,
+    /// The stream died with no HTTP/2 reason attached: the connection itself
+    /// failed, so there is no frame to read a code from.
+    Transport,
+}
+
+impl Outcome {
+    fn label(self) -> &'static str {
+        match self {
+            Outcome::Ok => "ok",
+            Outcome::Status => "status",
+            Outcome::Refused => "refused",
+            Outcome::Reset => "reset",
+            Outcome::Transport => "transport",
+        }
+    }
+
+    /// Read the outcome off an `h2` error.
+    ///
+    /// `reason()` is `Some` only when the peer sent RST_STREAM or GOAWAY with a
+    /// code; a local or transport failure has none, which is exactly the
+    /// distinction being drawn.
+    fn from_h2(err: &h2::Error) -> Self {
+        match err.reason() {
+            Some(h2::Reason::REFUSED_STREAM) => Outcome::Refused,
+            Some(_) => Outcome::Reset,
+            None => Outcome::Transport,
+        }
+    }
+}
+
+/// Failures counted by what the client saw.
+///
+/// Kept as counters rather than as a per-sample string because a run produces
+/// millions of samples and the question only ever needs the totals.
+#[derive(Default, Clone, Copy)]
+struct Tally {
+    status: u64,
+    refused: u64,
+    reset: u64,
+    transport: u64,
+}
+
+impl Tally {
+    fn add(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Ok => {}
+            Outcome::Status => self.status += 1,
+            Outcome::Refused => self.refused += 1,
+            Outcome::Reset => self.reset += 1,
+            Outcome::Transport => self.transport += 1,
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.status + self.refused + self.reset + self.transport
+    }
+
+    /// The non-zero kinds, for the human line. Empty when nothing failed, which
+    /// is the common case and should not print a row of zeroes.
+    fn breakdown(&self) -> String {
+        [
+            (Outcome::Status.label(), self.status),
+            (Outcome::Refused.label(), self.refused),
+            (Outcome::Reset.label(), self.reset),
+            (Outcome::Transport.label(), self.transport),
+        ]
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(name, n)| format!("{name} {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
 }
 
 struct Config {
@@ -212,18 +310,17 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // and including a truncated value would flatter the tail in the one place
     // this program exists to be honest about. The count of them is reported.
     let mut samples = Vec::new();
-    let mut failures = 0u64;
+    let mut tally = Tally::default();
     while let Ok(sample) = rx.try_recv() {
-        if sample.ok {
+        tally.add(sample.outcome);
+        if sample.outcome == Outcome::Ok {
             samples.push(sample);
-        } else {
-            failures += 1;
         }
     }
     report(
         &config,
         &mut samples,
-        failures,
+        &tally,
         dispatched.load(Ordering::Relaxed),
     );
     Ok(())
@@ -411,13 +508,13 @@ async fn one_request(
     intended: Instant,
 ) -> Sample {
     let sent = Instant::now();
-    let finish = |ok: bool| {
+    let finish = |outcome: Outcome| {
         let done = Instant::now();
         Sample {
             corrected_us: done.duration_since(intended).as_micros() as u64,
             service_us: done.duration_since(sent).as_micros() as u64,
             lag_us: sent.duration_since(intended).as_micros() as u64,
-            ok,
+            outcome,
         }
     };
 
@@ -426,20 +523,25 @@ async fn one_request(
     // span: a proxy that admits fewer streams makes requests wait, and hiding
     // that would be measuring the proxy's convenience rather than the client's
     // experience.
-    let Ok(mut sender) = sender.ready().await else {
-        return finish(false);
+    let mut sender = match sender.ready().await {
+        Ok(sender) => sender,
+        Err(err) => return finish(Outcome::from_h2(&err)),
     };
     let request = match Request::builder().method("GET").uri(uri).body(()) {
         Ok(request) => request,
-        Err(_) => return finish(false),
+        // Building a GET from a parsed URI cannot fail in practice; it is not a
+        // network outcome and must not be filed as one.
+        Err(_) => return finish(Outcome::Transport),
     };
-    let Ok((response, _)) = sender.send_request(request, true) else {
-        return finish(false);
+    let (response, _) = match sender.send_request(request, true) {
+        Ok(pair) => pair,
+        Err(err) => return finish(Outcome::from_h2(&err)),
     };
-    let Ok(response) = response.await else {
-        return finish(false);
+    let response = match response.await {
+        Ok(response) => response,
+        Err(err) => return finish(Outcome::from_h2(&err)),
     };
-    let ok = response.status().is_success();
+    let status_ok = response.status().is_success();
     let mut body = response.into_body();
     while let Some(chunk) = body.data().await {
         match chunk {
@@ -449,20 +551,26 @@ async fn one_request(
                 // backpressure.
                 let _ = body.flow_control().release_capacity(chunk.len());
             }
-            Err(_) => return finish(false),
+            Err(err) => return finish(Outcome::from_h2(&err)),
         }
     }
-    finish(ok)
+    finish(if status_ok {
+        Outcome::Ok
+    } else {
+        Outcome::Status
+    })
 }
 
 /// Print the run as one CSV row plus a human summary on stderr.
-fn report(config: &Config, samples: &mut [Sample], failures: u64, dispatched: u64) {
+fn report(config: &Config, samples: &mut [Sample], tally: &Tally, dispatched: u64) {
+    let failures = tally.total();
     if samples.is_empty() {
         eprintln!("no samples — target unreachable?");
         println!(
             "label,mode,connections,rate_offered,duration_s,completed,failed,\
              achieved_rps,p50_ms,p90_ms,p99_ms,p999_ms,max_ms,\
-             closed_loop_p99_ms,dispatch_lag_p99_ms"
+             closed_loop_p99_ms,dispatch_lag_p99_ms,\
+             failed_status,failed_refused,failed_reset,failed_transport"
         );
         return;
     }
@@ -488,13 +596,18 @@ fn report(config: &Config, samples: &mut [Sample], failures: u64, dispatched: u6
     };
     let offered = config.rate.map_or(0, |r| r);
 
+    // The four failure columns are **appended**, never inserted: bench/*.sh read
+    // this row positionally, and a column added in the middle would silently
+    // shift every number they quote.
     println!(
         "label,mode,connections,rate_offered,duration_s,completed,failed,\
          achieved_rps,p50_ms,p90_ms,p99_ms,p999_ms,max_ms,\
-         closed_loop_p99_ms,dispatch_lag_p99_ms"
+         closed_loop_p99_ms,dispatch_lag_p99_ms,\
+         failed_status,failed_refused,failed_reset,failed_transport"
     );
     println!(
-        "{},{},{},{},{:.0},{},{},{:.0},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        "{},{},{},{},{:.0},{},{},{:.0},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},\
+         {},{},{},{}",
         config.label,
         mode,
         config.connections,
@@ -510,12 +623,19 @@ fn report(config: &Config, samples: &mut [Sample], failures: u64, dispatched: u6
         corrected[corrected.len() - 1] as f64 / 1000.0,
         quantile(&service, 0.99),
         quantile(&lag, 0.99),
+        tally.status,
+        tally.refused,
+        tally.reset,
+        tally.transport,
     );
 
     eprintln!(
         "  completed {completed}, failed {failures}, dispatched {dispatched}, \
          achieved {achieved:.0} req/s",
     );
+    if failures > 0 {
+        eprintln!("  failures by what the client saw: {}", tally.breakdown());
+    }
     eprintln!(
         "  corrected p99 {:.3} ms vs closed-loop p99 {:.3} ms — the correction is {:.3} ms",
         quantile(&corrected, 0.99),

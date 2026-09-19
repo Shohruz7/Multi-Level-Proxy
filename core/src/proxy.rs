@@ -940,6 +940,39 @@ impl Proxy {
         // way the client hears something and nothing hangs.
         true
     }
+
+    /// Record a status the **engine** will write for us, which nothing else
+    /// counts.
+    ///
+    /// [`ProxyStats::response`] is called in exactly one other place: when an
+    /// upstream `Head` passes through on its way to the client. Every answer
+    /// the proxy produces *without* a backend — 502 when the upstream died,
+    /// 503 when the queue refused the request — is synthesized inside
+    /// `Connection::reject_stream`, and the engine deliberately owns no metrics
+    /// dependency. So those responses reached clients while
+    /// `h2proxy_responses_total` recorded only the 2xx.
+    ///
+    /// That is not a cosmetic gap. `h2proxy_responses_total{class="5xx"}` is
+    /// the "E" of RED, and it is the number every claim of "zero 5xx" in this
+    /// project was read from — including a soak that kills a backend every 30
+    /// seconds, which is precisely the workload that produces 502s. A counter
+    /// that reads zero because nothing is wired to it is worse than no counter
+    /// at all, and this is the second instrument here found lying while the
+    /// proxy itself worked correctly.
+    ///
+    /// The engine chooses between a status and a bare RST_STREAM on whether a
+    /// `:status` is already on the wire, so this mirrors that: a route whose
+    /// response has already started gets an abort, which is not a response and
+    /// must not be counted as one.
+    fn synthesized(&self, id: StreamId, status: u16) {
+        let started = self
+            .routes
+            .get(&id)
+            .is_some_and(|route| route.response_started);
+        if !started {
+            self.shared.stats.response(status);
+        }
+    }
 }
 
 impl Service for Proxy {
@@ -1072,6 +1105,9 @@ impl Service for Proxy {
                 if self.retry(*id) {
                     return None;
                 }
+                // The retry is spent, so this ends as an answer the engine
+                // writes itself and nothing else records.
+                self.synthesized(*id, 502);
                 Some(event)
             }
             ServiceEvent::Shed { id } => {
@@ -1079,6 +1115,7 @@ impl Service for Proxy {
                 // one — the opposite of `Gone` directly above. Retrying is
                 // pointless for the same reason: the queue that refused this is
                 // the queue every retry would land in.
+                self.synthesized(*id, 503);
                 if self.routes.remove(id).is_some() {
                     self.shared.stats.close_client_stream();
                 }
