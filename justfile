@@ -144,6 +144,15 @@ tune:
 confirm:
     bench/confirm.sh
 
+# Admission control against the commit before it existed, at two shapes: one
+# overloaded and one not. The un-overloaded shape is the one that catches
+# regressions, because a throttle is nearly free on load that is already
+# queueing - which is how a 5.4x regression once passed an A/B. Records
+# pool_conns, the variable that collapsed while nothing was watching it.
+# Promotes bench/admission-ab.csv.
+admission-ab:
+    bench/admission-ab.sh
+
 # The ADR 0010 allocator A/B: system vs jemalloc, interleaved, inside the musl
 # container — the only environment where the claim means anything. Needs Docker.
 allocator:
